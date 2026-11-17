@@ -58,7 +58,10 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
 
         // A selected line with no test, or a missing file, fails the whole run or file.
         // Drop those selectors and run the rest again.
-        let parsed = parse(&json, selected_lines.as_deref());
+        let cwd = runner.cwd_in(req.worktree);
+        let mut roots = vec![cwd.clone()];
+        roots.extend(cwd.canonicalize().ok());
+        let parsed = parse(&json, selected_lines.as_deref(), &roots);
         let mut bad: Vec<String> = parsed.bad_lines.clone();
         for caps in MISSING_FILE.captures_iter(&text) {
             let missing = &caps[1];
@@ -135,14 +138,28 @@ struct Parsed {
     bad_lines: Vec<String>,
 }
 
-fn parse(json: &str, selected: Option<&[(String, u32)]>) -> Parsed {
+/// `path` relative to the runner cwd and marked exact (`./`), when it lies under one of
+/// `roots`; otherwise unchanged.
+fn relative_to(path: &str, roots: &[std::path::PathBuf]) -> String {
+    roots
+        .iter()
+        .find_map(|root| {
+            std::path::Path::new(path)
+                .strip_prefix(root)
+                .ok()
+                .map(|rel| format!("./{}", rel.display()))
+        })
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn parse(json: &str, selected: Option<&[(String, u32)]>, roots: &[std::path::PathBuf]) -> Parsed {
     let mut parsed = Parsed::default();
     let Ok(root) = serde_json::from_str::<Value>(json) else {
         return parsed;
     };
     let empty = Vec::new();
     for file in root["testResults"].as_array().unwrap_or(&empty) {
-        let path = file["name"].as_str().unwrap_or_default().to_string();
+        let path = relative_to(file["name"].as_str().unwrap_or_default(), roots);
         let message = strip_ansi(file["message"].as_str().unwrap_or_default());
         let assertions = file["assertionResults"].as_array().unwrap_or(&empty);
         let line_errors: Vec<_> = NO_TEST_AT_LINE.captures_iter(&message).collect();

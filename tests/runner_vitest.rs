@@ -198,3 +198,28 @@ fn files_and_suite_select_whole_files() {
     assert_eq!(suite.executed(), 4);
     assert_eq!(suite.file_errors.len(), 1);
 }
+
+#[test]
+fn a_file_error_never_lands_on_a_test_in_another_file_with_the_same_name() {
+    let repo = fixture();
+    // web/x.test.ts is a path suffix of web/src/x.test.ts, which fails to load.
+    repo.write("web/x.test.ts", &TESTS.replace("./math", "./src/math"))
+        .write("web/src/x.test.ts", BROKEN);
+    let runner = runner();
+    let cases = vec![
+        case(&runner, "web/x.test.ts", &["outer"], "works", 13),
+        case(&runner, "web/src/x.test.ts", &[], "b", 4),
+    ];
+
+    let run = run(&repo, &runner, Selection::Tests(&cases), false);
+
+    assert_eq!(
+        run.result_for(&cases[0], "web"),
+        CaseResult::Passed,
+        "{run:?}"
+    );
+    assert!(matches!(
+        run.result_for(&cases[1], "web"),
+        CaseResult::Failed(_)
+    ));
+}
