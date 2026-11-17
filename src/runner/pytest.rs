@@ -223,6 +223,7 @@ fn finish(case: Case, parsed: &mut Parsed) {
         None => case.name.clone(),
     };
     parsed.outcomes.push(TestOutcome {
+        id: None,
         suite: suite_from(&case.classname, &file),
         file,
         name,

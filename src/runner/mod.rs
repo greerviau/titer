@@ -1,6 +1,7 @@
 //! Runner adapters: select tests, run them through the repo's own command, and parse results.
 
 pub mod pytest;
+pub mod unittest;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -61,7 +62,10 @@ pub enum Status {
 /// One executed or skipped test as the runner reported it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestOutcome {
-    /// The path as the runner reported it; any of repo-, cwd-, or rootdir-relative, or absolute.
+    /// The runner-native id, when the runner reports one that matches [`TestCase::id`].
+    pub id: Option<String>,
+    /// The path as the runner reported it (repo-, cwd-, or rootdir-relative, or absolute), or
+    /// cwd-relative with a leading `./`.
     pub file: String,
     pub suite: Vec<String>,
     /// The test name without parameters.
@@ -74,7 +78,7 @@ pub struct TestOutcome {
 /// A failure that stopped a whole file from loading, such as an import error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileError {
-    /// The path as the runner reported it.
+    /// The path as the runner reported it, or cwd-relative with a leading `./`.
     pub file: String,
     pub failure: Failure,
 }
@@ -113,7 +117,10 @@ impl TestRun {
         let mut matched = self
             .outcomes
             .iter()
-            .filter(|o| o.name == case.name && o.suite == case.suite && same_file(&o.file, &rel))
+            .filter(|o| match &o.id {
+                Some(id) => id == &case.id,
+                None => o.name == case.name && o.suite == case.suite && same_file(&o.file, &rel),
+            })
             .collect::<Vec<_>>();
         // Duplicate titles in one file: the reported line picks the test.
         if matched.len() > 1 && matched.iter().all(|o| o.line.is_some()) {
@@ -196,7 +203,8 @@ impl Runner {
         let rel = cwd_relative(file, &self.config.cwd);
         match self.config.kind {
             RunnerKind::Pytest => pytest::node_id(&rel, suite, name),
-            RunnerKind::Unittest | RunnerKind::Vitest => {
+            RunnerKind::Unittest => unittest::test_id(&rel, &self.config.start_dir, suite, name),
+            RunnerKind::Vitest => {
                 let _ = line;
                 unimplemented!("adapter not yet available")
             }
@@ -207,7 +215,8 @@ impl Runner {
     pub fn run(&self, req: &RunRequest) -> anyhow::Result<TestRun> {
         match self.config.kind {
             RunnerKind::Pytest => pytest::run(self, req),
-            RunnerKind::Unittest | RunnerKind::Vitest => {
+            RunnerKind::Unittest => unittest::run(self, req),
+            RunnerKind::Vitest => {
                 anyhow::bail!("{} adapter not yet available", self.config.kind.name())
             }
         }
@@ -252,11 +261,14 @@ pub fn cwd_relative(file: &str, cwd: &str) -> String {
         .to_string()
 }
 
-/// True when two paths name the same file, allowing one to be relative to a parent of the
-/// other's root. Runners report paths relative to different roots.
+/// True when two paths name the same file. A reported path that starts with `./` is
+/// cwd-relative and must match exactly. Other reported paths may be relative to another
+/// root, such as pytest's rootdir, or absolute, so they match by whole-component suffix.
 pub fn same_file(reported: &str, expected: &str) -> bool {
-    let reported = reported.trim_start_matches("./");
     let expected = expected.trim_start_matches("./");
+    if let Some(exact) = reported.strip_prefix("./") {
+        return exact == expected;
+    }
     reported == expected
         || reported.ends_with(&format!("/{expected}"))
         || expected.ends_with(&format!("/{reported}"))
@@ -281,6 +293,8 @@ mod tests {
         assert!(same_file("/abs/repo/tests/test_a.py", "tests/test_a.py"));
         assert!(!same_file("tests/test_ab.py", "tests/test_a.py"));
         assert!(!same_file("xtests/test_a.py", "tests/test_a.py"));
+        assert!(same_file("./src/a.test.ts", "src/a.test.ts"));
+        assert!(!same_file("./src/sub/a.test.ts", "a.test.ts"));
     }
 
     #[test]

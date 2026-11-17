@@ -126,6 +126,13 @@ impl TryFrom<RawRunner> for RunnerConfig {
         if raw.start_dir.is_some() && raw.kind != RunnerKind::Unittest {
             return Err("start_dir applies only to unittest runners".to_string());
         }
+        if raw.kind == RunnerKind::Unittest && raw.command.iter().any(|a| a == "discover") {
+            return Err(
+                "a unittest command is the prefix that accepts test names, such as \
+                 [\"python\", \"-m\", \"unittest\"]; drop `discover` and set start_dir"
+                    .to_string(),
+            );
+        }
         let cwd = normalize_rel(&raw.cwd)?;
         Ok(RunnerConfig {
             name: raw.name.unwrap_or_else(|| raw.kind.name().to_string()),
@@ -374,6 +381,10 @@ mod tests {
             (
                 "[[runner]]\nkind = \"pytest\"\ncommand = [\"x\"]\nstart_dir = \"t\"",
                 "only to unittest",
+            ),
+            (
+                "[[runner]]\nkind = \"unittest\"\ncommand = [\"python\", \"-m\", \"unittest\", \"discover\"]",
+                "drop `discover`",
             ),
             (
                 "[[runner]]\nkind = \"pytest\"\ncommand = [\"x\"]\n[mutate]\nbudget = \"soon\"",
