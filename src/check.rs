@@ -126,6 +126,11 @@ pub fn run(cwd: &Path, options: &CheckOptions) -> anyhow::Result<Report> {
             report.timing.mutate_ms = Some(elapsed_ms(tier_started));
         }
     }
+    if ctx.wants(Tier::Crap) && report.gate.status != crate::report::GateStatus::Error {
+        let tier_started = Instant::now();
+        crap_tier(&ctx, &mut report)?;
+        report.timing.crap_ms = Some(elapsed_ms(tier_started));
+    }
     let touches_source = !ctx.detection.sources.is_empty();
     gate::evaluate(&mut report, &ctx.session.config.gate, touches_source);
     report.timing.total_ms = elapsed_ms(started);
@@ -190,6 +195,64 @@ fn head_tier(
         red.join(", ")
     ));
     Ok(None)
+}
+
+/// Scores changed functions from `--coverage`, or from the configured coverage command run
+/// in a head worktree.
+fn crap_tier(ctx: &Context, report: &mut Report) -> anyhow::Result<()> {
+    if ctx.detection.functions.is_empty() {
+        return Ok(());
+    }
+    let config = &ctx.session.config.crap;
+    let text = if let Some(path) = &ctx.options.coverage {
+        Some(
+            std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("cannot read --coverage {}: {e}", path.display()))?,
+        )
+    } else if let (Some(command), Some(file)) = (&config.coverage_command, &config.coverage_file) {
+        let worktree = Worktree::create(
+            &ctx.session.git,
+            &ctx.session.head_tree,
+            &ctx.session.run_dir.join("coverage"),
+            &ctx.session.config.runners,
+        )?;
+        let mut cmd = Command::new(&command[0]);
+        cmd.args(&command[1..])
+            .current_dir(&worktree.path)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("NO_COLOR", "1");
+        let out = process::run(
+            cmd,
+            Some(ctx.budget.max(Duration::from_secs(300))),
+            &ctx.session.run_dir.join("logs"),
+        )?;
+        if !out.success() {
+            report.warnings.push(format!(
+                "the coverage command exited with {:?}; CRAP scores have no coverage",
+                out.exit_code
+            ));
+        }
+        std::fs::read_to_string(worktree.path.join(file)).ok()
+    } else {
+        None
+    };
+    let coverage = match text.as_deref().map(crate::crap::Coverage::parse) {
+        Some(Ok(c)) => Some(c),
+        Some(Err(e)) => {
+            report.warnings.push(format!("cannot read coverage: {e:#}"));
+            None
+        }
+        // Without configured coverage, CRAP reports complexity alone; a null score says why.
+        None => None,
+    };
+    let read = |p: &str| crate::detect::read_head(&ctx.session, p).ok();
+    report.crap = crate::crap::scores(
+        &ctx.detection.functions,
+        &read,
+        coverage.as_ref(),
+        config.threshold,
+    );
+    Ok(())
 }
 
 fn elapsed_ms(since: Instant) -> u64 {
