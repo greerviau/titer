@@ -1,6 +1,7 @@
 //! Runner adapters: select tests, run them through the repo's own command, and parse results.
 
 pub mod pytest;
+pub mod unittest;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -61,6 +62,8 @@ pub enum Status {
 /// One executed or skipped test as the runner reported it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestOutcome {
+    /// The runner-native id, when the runner reports one that matches [`TestCase::id`].
+    pub id: Option<String>,
     /// The path as the runner reported it; any of repo-, cwd-, or rootdir-relative, or absolute.
     pub file: String,
     pub suite: Vec<String>,
@@ -113,7 +116,10 @@ impl TestRun {
         let mut matched = self
             .outcomes
             .iter()
-            .filter(|o| o.name == case.name && o.suite == case.suite && same_file(&o.file, &rel))
+            .filter(|o| match &o.id {
+                Some(id) => id == &case.id,
+                None => o.name == case.name && o.suite == case.suite && same_file(&o.file, &rel),
+            })
             .collect::<Vec<_>>();
         // Duplicate titles in one file: the reported line picks the test.
         if matched.len() > 1 && matched.iter().all(|o| o.line.is_some()) {
@@ -196,7 +202,8 @@ impl Runner {
         let rel = cwd_relative(file, &self.config.cwd);
         match self.config.kind {
             RunnerKind::Pytest => pytest::node_id(&rel, suite, name),
-            RunnerKind::Unittest | RunnerKind::Vitest => {
+            RunnerKind::Unittest => unittest::test_id(&rel, &self.config.start_dir, suite, name),
+            RunnerKind::Vitest => {
                 let _ = line;
                 unimplemented!("adapter not yet available")
             }
@@ -207,7 +214,8 @@ impl Runner {
     pub fn run(&self, req: &RunRequest) -> anyhow::Result<TestRun> {
         match self.config.kind {
             RunnerKind::Pytest => pytest::run(self, req),
-            RunnerKind::Unittest | RunnerKind::Vitest => {
+            RunnerKind::Unittest => unittest::run(self, req),
+            RunnerKind::Vitest => {
                 anyhow::bail!("{} adapter not yet available", self.config.kind.name())
             }
         }
