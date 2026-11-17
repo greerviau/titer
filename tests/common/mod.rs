@@ -180,3 +180,25 @@ pub fn assert_schema_valid(report: &serde_json::Value) {
         "report violates schema: {errors:#?}\n{report:#}"
     );
 }
+
+/// The Python with pytest that `scripts/setup-fixture-deps.sh` installs.
+pub fn fixture_python() -> String {
+    let python = repo_root().join(".fixture-deps/venv/bin/python");
+    assert!(
+        python.exists(),
+        "missing {}; run scripts/setup-fixture-deps.sh",
+        python.display()
+    );
+    python.to_string_lossy().into_owned()
+}
+
+/// The node_modules with vitest that `scripts/setup-fixture-deps.sh` installs.
+pub fn fixture_node_modules() -> PathBuf {
+    let dir = repo_root().join(".fixture-deps/node/node_modules");
+    assert!(
+        dir.join(".bin/vitest").exists(),
+        "missing {}; run scripts/setup-fixture-deps.sh",
+        dir.display()
+    );
+    dir
+}
