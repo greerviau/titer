@@ -9,6 +9,7 @@ pub mod exit;
 pub mod gate;
 pub mod git;
 pub mod imports;
+pub mod init;
 pub mod lang;
 pub mod mutate;
 pub mod process;

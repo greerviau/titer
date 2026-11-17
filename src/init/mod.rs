@@ -1,0 +1,428 @@
+//! `titer init`: opt a repo in. It detects runners, writes `titer.toml`, pins titer as a dev
+//! dependency, and writes the repo skill where Claude Code and Codex find it.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, bail};
+
+use crate::config::{self, Config};
+use crate::git::Git;
+
+const SKILL: &str = include_str!("SKILL.md");
+pub const SKILL_PATHS: [&str; 2] = [
+    ".agents/skills/titer/SKILL.md",
+    ".claude/skills/titer/SKILL.md",
+];
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Dirs never searched for runners.
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    "target",
+    ".tox",
+    ".nox",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    "coverage",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedRunner {
+    pub name: String,
+    pub kind: &'static str,
+    /// Repo-relative dir, `.` for the root.
+    pub cwd: String,
+    pub command: Vec<String>,
+    pub start_dir: Option<String>,
+}
+
+/// Every file `init` writes, with its new contents.
+#[derive(Debug, Default)]
+pub struct Plan {
+    pub writes: Vec<(PathBuf, String)>,
+    pub notes: Vec<String>,
+}
+
+pub fn run(cwd: &Path, dry_run: bool, update: bool) -> anyhow::Result<Plan> {
+    let git = Git::discover(cwd)?;
+    let root = git.root().to_path_buf();
+    let config_path = root.join(config::FILE_NAME);
+    let mut plan = Plan::default();
+    if update {
+        if !config_path.is_file() {
+            bail!("no {} here; run `titer init` first", config::FILE_NAME);
+        }
+        let config = Config::load(&root)?;
+        let dirs: Vec<String> = config.runners.iter().map(|r| r.cwd.clone()).collect();
+        pin_dependencies(&root, &dirs, &mut plan)?;
+    } else {
+        if config_path.is_file() {
+            bail!(
+                "{} already exists; run `titer init --update` to refresh the skill and the pinned version",
+                config::FILE_NAME
+            );
+        }
+        let runners = detect_runners(&root)?;
+        if runners.is_empty() {
+            bail!(
+                "found no pytest, unittest, or vitest project; write titer.toml by hand (see the README)"
+            );
+        }
+        let text = render_config(&runners);
+        Config::parse(&text).context("the generated titer.toml does not parse")?;
+        plan.writes.push((config_path, text));
+        let dirs: Vec<String> = runners.iter().map(|r| r.cwd.clone()).collect();
+        pin_dependencies(&root, &dirs, &mut plan)?;
+    }
+    let skill = SKILL.replace("{version}", VERSION);
+    for path in SKILL_PATHS {
+        plan.writes.push((root.join(path), skill.clone()));
+    }
+    if !dry_run {
+        for (path, contents) in &plan.writes {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, contents)
+                .with_context(|| format!("cannot write {}", path.display()))?;
+        }
+    }
+    Ok(plan)
+}
+
+/// The titer version stamped in the repo skill, if the skill exists.
+pub fn skill_version(root: &Path) -> Option<String> {
+    SKILL_PATHS.iter().find_map(|p| {
+        let text = std::fs::read_to_string(root.join(p)).ok()?;
+        let start = text.find("<!-- titer-version: ")? + "<!-- titer-version: ".len();
+        let end = text[start..].find(" -->")? + start;
+        Some(text[start..end].to_string())
+    })
+}
+
+/// The warning `check` adds when the skill was written by another titer version.
+pub fn stamp_warning(root: &Path) -> Option<String> {
+    let stamped = skill_version(root)?;
+    (stamped != VERSION).then(|| {
+        format!(
+            "the repo skill was written by titer {stamped}, and this is titer {VERSION}; run `titer init --update`"
+        )
+    })
+}
+
+pub fn detect_runners(root: &Path) -> anyhow::Result<Vec<DetectedRunner>> {
+    let mut dirs = Vec::new();
+    collect_dirs(root, root, 0, &mut dirs);
+    let mut runners = Vec::new();
+    for dir in dirs {
+        let rel = rel_dir(root, &dir);
+        if let Some(r) = detect_vitest(&dir, &rel) {
+            runners.push(r);
+        }
+        if let Some(r) = detect_python(&dir, &rel) {
+            runners.push(r);
+        }
+    }
+    if runners.len() > 1 {
+        for r in &mut runners {
+            let base = if r.cwd == "." {
+                "root".to_string()
+            } else {
+                r.cwd.replace('/', "-")
+            };
+            r.name = format!("{base}-{}", r.kind);
+        }
+        let names: Vec<String> = runners.iter().map(|r| r.name.clone()).collect();
+        // Prefer the dir name alone when it is unique.
+        for r in &mut runners {
+            let short = r.cwd.rsplit('/').next().unwrap_or(&r.cwd).to_string();
+            let clash = names
+                .iter()
+                .filter(|n| n.starts_with(&format!("{short}-")) || **n == short)
+                .count()
+                > 1;
+            if r.cwd != "." && !clash {
+                r.name = short;
+            }
+        }
+    }
+    Ok(runners)
+}
+
+fn collect_dirs(root: &Path, dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    out.push(dir.to_path_buf());
+    if depth >= 3 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut subdirs: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            !SKIP_DIRS.contains(&name.as_ref()) && !name.starts_with('.')
+        })
+        .map(|e| e.path())
+        .collect();
+    subdirs.sort();
+    for sub in subdirs {
+        let _ = root;
+        collect_dirs(root, &sub, depth + 1, out);
+    }
+}
+
+fn rel_dir(root: &Path, dir: &Path) -> String {
+    let rel = dir
+        .strip_prefix(root)
+        .unwrap_or(dir)
+        .to_string_lossy()
+        .into_owned();
+    if rel.is_empty() { ".".to_string() } else { rel }
+}
+
+fn detect_vitest(dir: &Path, rel: &str) -> Option<DetectedRunner> {
+    let text = std::fs::read_to_string(dir.join("package.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let has = |section: &str| {
+        json[section]
+            .as_object()
+            .is_some_and(|m| m.contains_key("vitest"))
+    };
+    if !has("devDependencies") && !has("dependencies") {
+        return None;
+    }
+    Some(DetectedRunner {
+        name: "vitest".to_string(),
+        kind: "vitest",
+        cwd: rel.to_string(),
+        command: vec![
+            "npx".into(),
+            "--no-install".into(),
+            "vitest".into(),
+            "run".into(),
+        ],
+        start_dir: None,
+    })
+}
+
+fn detect_python(dir: &Path, rel: &str) -> Option<DetectedRunner> {
+    let pyproject = std::fs::read_to_string(dir.join("pyproject.toml")).unwrap_or_default();
+    let is_project =
+        !pyproject.is_empty() || dir.join("setup.py").is_file() || dir.join("setup.cfg").is_file();
+    if !is_project {
+        return None;
+    }
+    let pytest = pyproject.contains("[tool.pytest")
+        || pyproject.contains("\"pytest")
+        || pyproject.contains("'pytest")
+        || dir.join("pytest.ini").is_file()
+        || dir.join("conftest.py").is_file()
+        || dir.join("tests/conftest.py").is_file()
+        || std::fs::read_to_string(dir.join("setup.cfg"))
+            .is_ok_and(|s| s.contains("[tool:pytest]"));
+    let tests_dir = ["tests", "test"].into_iter().find(|t| dir.join(t).is_dir());
+    let unittest = !pytest && tests_dir.is_some_and(|t| uses_unittest(&dir.join(t)));
+    if !pytest && !unittest {
+        return None;
+    }
+    let module = if pytest { "pytest" } else { "unittest" };
+    let mut command: Vec<String> = if dir.join("uv.lock").is_file() {
+        vec![
+            "uv".into(),
+            "run".into(),
+            "--no-sync".into(),
+            "python".into(),
+        ]
+    } else if dir.join(".venv/bin/python").exists() {
+        vec![".venv/bin/python".into()]
+    } else {
+        vec!["python3".into()]
+    };
+    command.extend(["-m".to_string(), module.to_string()]);
+    Some(DetectedRunner {
+        name: module.to_string(),
+        kind: module,
+        cwd: rel.to_string(),
+        command,
+        start_dir: unittest.then(|| tests_dir.unwrap_or(".").to_string()),
+    })
+}
+
+fn uses_unittest(tests: &Path) -> bool {
+    std::fs::read_dir(tests)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with("test")
+                && name.ends_with(".py")
+                && std::fs::read_to_string(e.path()).is_ok_and(|s| s.contains("unittest"))
+        })
+}
+
+pub fn render_config(runners: &[DetectedRunner]) -> String {
+    let mut out = String::from(
+        "# titer configuration. See https://github.com/greerviau/titer for every option.\n\n",
+    );
+    for r in runners {
+        out.push_str("[[runner]]\n");
+        if runners.len() > 1 {
+            out.push_str(&format!("name = {}\n", quote(&r.name)));
+        }
+        out.push_str(&format!("kind = {}\n", quote(r.kind)));
+        if r.cwd != "." {
+            out.push_str(&format!("cwd = {}\n", quote(&r.cwd)));
+        }
+        let command: Vec<String> = r.command.iter().map(|c| quote(c)).collect();
+        out.push_str(&format!("command = [{}]\n", command.join(", ")));
+        if let Some(start) = &r.start_dir {
+            out.push_str(&format!("start_dir = {}\n", quote(start)));
+        }
+        out.push('\n');
+    }
+    out.push_str("[gate]\n# fail_on_survivors = false\n# fail_on_passes_on_base = false\n# fail_on_scan = false\n# fail_on_crap = false\n");
+    out
+}
+
+fn quote(text: &str) -> String {
+    toml_edit::Value::from(text).to_string().trim().to_string()
+}
+
+/// Pins titer in the root manifest when there is one, otherwise in each runner dir's
+/// manifest: package.json devDependencies, or pyproject.toml's dev dependency group.
+fn pin_dependencies(root: &Path, dirs: &[String], plan: &mut Plan) -> anyhow::Result<()> {
+    let root_manifest =
+        root.join("package.json").is_file() || root.join("pyproject.toml").is_file();
+    let mut targets: Vec<PathBuf> = if root_manifest {
+        vec![root.to_path_buf()]
+    } else {
+        dirs.iter().map(|d| root.join(d)).collect()
+    };
+    targets.dedup();
+    for dir in targets {
+        let package = dir.join("package.json");
+        let pyproject = dir.join("pyproject.toml");
+        if package.is_file() {
+            let text = std::fs::read_to_string(&package)?;
+            plan.writes.push((package.clone(), pin_npm(&text)?));
+            plan.notes.push(format!(
+                "run `npm install` in {} to install the pinned titer",
+                rel_dir(root, &dir)
+            ));
+        } else if pyproject.is_file() {
+            let text = std::fs::read_to_string(&pyproject)?;
+            plan.writes.push((pyproject.clone(), pin_python(&text)?));
+            plan.notes.push(format!(
+                "run `uv lock` in {} to lock the pinned titer",
+                rel_dir(root, &dir)
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn pin_npm(text: &str) -> anyhow::Result<String> {
+    let mut json: serde_json::Value =
+        serde_json::from_str(text).context("package.json is not valid JSON")?;
+    let object = json
+        .as_object_mut()
+        .context("package.json is not an object")?;
+    let dev = object
+        .entry("devDependencies")
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    dev.as_object_mut()
+        .context("devDependencies is not an object")?
+        .insert(
+            "titer".to_string(),
+            serde_json::Value::String(VERSION.to_string()),
+        );
+    let indent = detect_indent(text);
+    let mut out = Vec::new();
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, formatter);
+    serde::Serialize::serialize(&json, &mut ser)?;
+    Ok(format!("{}\n", String::from_utf8(out)?))
+}
+
+fn detect_indent(text: &str) -> String {
+    text.lines()
+        .find_map(|l| {
+            let trimmed = l.trim_start();
+            (trimmed.len() < l.len() && trimmed.starts_with('"'))
+                .then(|| l[..l.len() - trimmed.len()].to_string())
+        })
+        .unwrap_or_else(|| "  ".to_string())
+}
+
+pub fn pin_python(text: &str) -> anyhow::Result<String> {
+    let mut doc: toml_edit::DocumentMut =
+        text.parse().context("pyproject.toml is not valid TOML")?;
+    let groups = doc
+        .entry("dependency-groups")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_like_mut()
+        .context("dependency-groups is not a table")?;
+    let dev = groups
+        .entry("dev")
+        .or_insert(toml_edit::Item::Value(toml_edit::Value::Array(
+            toml_edit::Array::new(),
+        )));
+    let array = dev
+        .as_array_mut()
+        .context("dependency-groups.dev is not an array")?;
+    array.retain(|v| {
+        v.as_str().is_none_or(|s| {
+            !s.split(['=', '<', '>', '~', '!', ' ', '[', ';'])
+                .next()
+                .is_some_and(|n| n == "titer")
+        })
+    });
+    array.push(format!("titer=={VERSION}"));
+    Ok(doc.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pins_npm_dev_dependencies_and_keeps_key_order() {
+        let text = "{\n    \"name\": \"web\",\n    \"devDependencies\": {\n        \"vitest\": \"^5.1.0\"\n    },\n    \"scripts\": {}\n}\n";
+        let out = pin_npm(text).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{{\n    \"name\": \"web\",\n    \"devDependencies\": {{\n        \"vitest\": \"^5.1.0\",\n        \"titer\": \"{VERSION}\"\n    }},\n    \"scripts\": {{}}\n}}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn pins_python_dev_group_and_replaces_an_old_pin() {
+        let text = "[project]\nname = \"api\"\n\n[dependency-groups]\ndev = [\"pytest>=8\", \"titer==0.0.1\"]\n";
+        let out = pin_python(text).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "[project]\nname = \"api\"\n\n[dependency-groups]\ndev = [\"pytest>=8\", \"titer=={VERSION}\"]\n"
+            )
+        );
+        let added = pin_python("[project]\nname = \"api\"\n").unwrap();
+        assert!(
+            added.contains(&format!(
+                "[dependency-groups]\ndev = [\"titer=={VERSION}\"]"
+            )),
+            "{added}"
+        );
+    }
+}
