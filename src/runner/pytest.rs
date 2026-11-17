@@ -89,16 +89,27 @@ fn unique() -> u64 {
 }
 
 static UNRESOLVED: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^ERROR: (?:not found:|found no collectors for) (\S+)$").unwrap()
+    Regex::new(
+        r"(?m)^ERROR: (not found:|found no collectors for|file or directory not found:) (\S+)$",
+    )
+    .unwrap()
 });
 
 /// Selectors that pytest reported as not found or uncollectable.
 fn unresolved_selectors(text: &str, selectors: &[String]) -> Vec<String> {
     let mut bad = Vec::new();
     for caps in UNRESOLVED.captures_iter(text) {
-        let reported = &caps[1];
+        // A missing file names only its first selector, but every selector in it is bad.
+        let whole_file = caps[1].starts_with("file or directory");
+        let reported = &caps[2];
         for selector in selectors {
-            if same_selector(reported, selector) && !bad.contains(selector) {
+            let matches = if whole_file {
+                let path = |s: &str| s.split_once("::").map_or(s, |(p, _)| p).to_string();
+                same_file(&path(reported), &path(selector))
+            } else {
+                same_selector(reported, selector)
+            };
+            if matches && !bad.contains(selector) {
                 bad.push(selector.clone());
             }
         }

@@ -84,6 +84,7 @@ fn reports_green_red_skipped_and_not_run_per_test() {
         case(&runner, "tests/test_a.py", &[], "test_param"),
         case(&runner, "tests/test_a.py", &[], "test_missing"),
         case(&runner, "tests/test_b.py", &[], "test_b"),
+        case(&runner, "tests/test_gone.py", &[], "test_gone"),
     ];
     let scratch = repo.scratch().join("run");
 
