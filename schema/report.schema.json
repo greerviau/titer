@@ -1,0 +1,549 @@
+{
+  "$defs": {
+    "CrapScore": {
+      "additionalProperties": false,
+      "properties": {
+        "complexity": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "coverage": {
+          "description": "Covered fraction of the function's coverable lines, 0 to 1. Absent without coverage data.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "file": {
+          "description": "Repo-relative path.",
+          "type": "string"
+        },
+        "flagged": {
+          "description": "The score is above the configured threshold.",
+          "type": "boolean"
+        },
+        "function": {
+          "type": "string"
+        },
+        "line": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "score": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "file",
+        "function",
+        "line",
+        "complexity",
+        "flagged"
+      ],
+      "type": "object"
+    },
+    "Finding": {
+      "additionalProperties": false,
+      "properties": {
+        "file": {
+          "description": "Repo-relative path.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/FindingKind"
+        },
+        "line": {
+          "description": "1-based line in head, or in base when the line no longer exists.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "message": {
+          "type": "string"
+        },
+        "test": {
+          "description": "The test the finding is about, when there is one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "file",
+        "line",
+        "message"
+      ],
+      "type": "object"
+    },
+    "FindingKind": {
+      "enum": [
+        "test_deleted",
+        "assertion_removed",
+        "skip_added",
+        "matcher_loosened",
+        "snapshot_changed"
+      ],
+      "type": "string"
+    },
+    "Gate": {
+      "additionalProperties": false,
+      "properties": {
+        "exit_code": {
+          "description": "The process exit code: 0 pass, 1 fail, 2 error.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reasons": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "status": {
+          "$ref": "#/$defs/GateStatus"
+        }
+      },
+      "required": [
+        "status",
+        "exit_code",
+        "reasons"
+      ],
+      "type": "object"
+    },
+    "GateStatus": {
+      "enum": [
+        "pass",
+        "fail",
+        "error"
+      ],
+      "type": "string"
+    },
+    "HeadStatus": {
+      "oneOf": [
+        {
+          "enum": [
+            "green",
+            "red",
+            "skipped"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "no_result",
+          "description": "The selection executed nothing.",
+          "type": "string"
+        }
+      ]
+    },
+    "Mutant": {
+      "additionalProperties": false,
+      "properties": {
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "end_line": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "file": {
+          "description": "Repo-relative path.",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "killed_by": {
+          "description": "The test that killed the mutant, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "operator": {
+          "$ref": "#/$defs/Operator"
+        },
+        "original": {
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/MutantOutcome"
+        },
+        "replacement": {
+          "type": "string"
+        },
+        "runner": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/MutantSource"
+        }
+      },
+      "required": [
+        "id",
+        "runner",
+        "file",
+        "line",
+        "end_line",
+        "operator",
+        "source",
+        "original",
+        "replacement",
+        "outcome"
+      ],
+      "type": "object"
+    },
+    "MutantOutcome": {
+      "oneOf": [
+        {
+          "enum": [
+            "timed_out"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "killed",
+          "description": "A selected test failed with an assertion or exception.",
+          "type": "string"
+        },
+        {
+          "const": "survived",
+          "description": "The selected tests passed and the line runs under them.",
+          "type": "string"
+        },
+        {
+          "const": "not_executed",
+          "description": "A survivor whose line no green selected test runs (the sentinel survived).",
+          "type": "string"
+        },
+        {
+          "const": "caught_by_other",
+          "description": "A survivor that other tests in the changed test files kill.",
+          "type": "string"
+        },
+        {
+          "const": "no_result",
+          "description": "Zero tests executed or every test skipped.",
+          "type": "string"
+        },
+        {
+          "const": "not_run",
+          "description": "The budget ran out before the mutant ran.",
+          "type": "string"
+        }
+      ]
+    },
+    "MutantSource": {
+      "enum": [
+        "generated",
+        "agent"
+      ],
+      "type": "string"
+    },
+    "Operator": {
+      "oneOf": [
+        {
+          "enum": [
+            "swap_comparison",
+            "swap_boolean",
+            "swap_arithmetic",
+            "flip_bool",
+            "increment_int",
+            "remove_not",
+            "return_none",
+            "remove_call",
+            "remove_raise",
+            "negate_if",
+            "jsx_attribute_undefined"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "agent",
+          "description": "A mutant from `--mutants`.",
+          "type": "string"
+        }
+      ]
+    },
+    "TestResult": {
+      "additionalProperties": false,
+      "properties": {
+        "exception_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file": {
+          "description": "Repo-relative path.",
+          "type": "string"
+        },
+        "head": {
+          "$ref": "#/$defs/HeadStatus"
+        },
+        "id": {
+          "description": "The runner-native id: a pytest node id, a unittest dotted id, or `file:line` for vitest.",
+          "type": "string"
+        },
+        "line": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The test name, with enclosing classes or `describe` titles joined by \" > \".",
+          "type": "string"
+        },
+        "runner": {
+          "type": "string"
+        },
+        "verdict": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Verdict"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Absent when the test is not green on head."
+        }
+      },
+      "required": [
+        "id",
+        "runner",
+        "file",
+        "line",
+        "name",
+        "head"
+      ],
+      "type": "object"
+    },
+    "Tier": {
+      "enum": [
+        "scan",
+        "prove",
+        "mutate",
+        "crap"
+      ],
+      "type": "string"
+    },
+    "Timing": {
+      "additionalProperties": false,
+      "properties": {
+        "crap_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mutate_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "prove_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "scan_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "total_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "workers": {
+          "description": "Mutation workers used.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "total_ms"
+      ],
+      "type": "object"
+    },
+    "Verdict": {
+      "oneOf": [
+        {
+          "const": "assertion",
+          "description": "Fails an assertion on base. Proof.",
+          "type": "string"
+        },
+        {
+          "const": "exception",
+          "description": "Raises another exception from the code under test on base. Proof.",
+          "type": "string"
+        },
+        {
+          "const": "missing_symbol",
+          "description": "Fails on base because a name exists only in head. Not proof.",
+          "type": "string"
+        },
+        {
+          "const": "passes_on_base",
+          "description": "Green on base. Informational.",
+          "type": "string"
+        },
+        {
+          "const": "skipped",
+          "description": "Skipped on head or on base. Not proof.",
+          "type": "string"
+        },
+        {
+          "const": "no_result",
+          "description": "Zero tests executed. Not proof.",
+          "type": "string"
+        },
+        {
+          "const": "timeout",
+          "description": "Timed out on base. Not proof.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "base_ref": {
+      "description": "The `--base` ref as given or resolved from the remote default branch.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "base_sha": {
+      "description": "The merge-base of head and the base ref.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "crap": {
+      "items": {
+        "$ref": "#/$defs/CrapScore"
+      },
+      "type": "array"
+    },
+    "findings": {
+      "items": {
+        "$ref": "#/$defs/Finding"
+      },
+      "type": "array"
+    },
+    "gate": {
+      "$ref": "#/$defs/Gate"
+    },
+    "head_tree": {
+      "description": "The tree object of the working-tree snapshot.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "mutants": {
+      "items": {
+        "$ref": "#/$defs/Mutant"
+      },
+      "type": "array"
+    },
+    "not_analyzed": {
+      "description": "Changed files in languages titer does not parse.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "type": "string"
+    },
+    "tests": {
+      "items": {
+        "$ref": "#/$defs/TestResult"
+      },
+      "type": "array"
+    },
+    "tiers": {
+      "description": "The tiers that ran.",
+      "items": {
+        "$ref": "#/$defs/Tier"
+      },
+      "type": "array"
+    },
+    "timing": {
+      "$ref": "#/$defs/Timing"
+    },
+    "titer_version": {
+      "type": "string"
+    },
+    "warnings": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "titer_version",
+    "gate",
+    "tiers",
+    "warnings",
+    "not_analyzed",
+    "findings",
+    "tests",
+    "mutants",
+    "crap",
+    "timing"
+  ],
+  "title": "Report",
+  "type": "object"
+}
