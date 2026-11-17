@@ -373,8 +373,8 @@ impl Gen<'_> {
     fn increment(&mut self, node: Node) {
         let raw = text(node, self.source);
         let digits = raw.replace('_', "");
-        if let Ok(n) = digits.parse::<u64>() {
-            self.push(node, Operator::IncrementInt, (n + 1).to_string());
+        if let Some(n) = digits.parse::<u64>().ok().and_then(|n| n.checked_add(1)) {
+            self.push(node, Operator::IncrementInt, n.to_string());
         }
     }
 }

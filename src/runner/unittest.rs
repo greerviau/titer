@@ -212,6 +212,31 @@ fn parse(stderr: &str, start_dir: &str) -> Parsed {
         let Some(status) = statuses.get(&id).map(String::as_str) else {
             continue;
         };
+        // A class or module fixture that fails, such as setUpClass, fails every test of its
+        // module; unittest reports it under the fixture's name.
+        let fixture = [
+            "setUpClass",
+            "tearDownClass",
+            "setUpModule",
+            "tearDownModule",
+        ]
+        .iter()
+        .find(|f| id.ends_with(&format!(".{f}")));
+        if let Some(name) = fixture {
+            if let Some((_, failure, _)) = failures.iter().find(|(fid, _, _)| fid == &id) {
+                let mut module = id.trim_end_matches(&format!(".{name}")).to_string();
+                if name.ends_with("Class") {
+                    module = module
+                        .rsplit_once('.')
+                        .map_or(module.clone(), |(m, _)| m.to_string());
+                }
+                parsed.file_errors.push(FileError {
+                    file: module_path(&module, start_dir),
+                    failure: failure.clone(),
+                });
+            }
+            continue;
+        }
         if id.starts_with("unittest.loader._FailedTest.") {
             if let Some((_, failure, body)) = failures.iter().find(|(fid, _, _)| fid == &id) {
                 if let Some(caps) = IMPORT_FAILURE.captures(body) {

@@ -266,16 +266,21 @@ pub fn run_jobs(
                     let job = &jobs[i];
                     let plan = &plans[&job.runner];
                     let fits = deadline.is_none_or(|d| Instant::now() + plan.head_duration <= d);
-                    let result = if fits {
+                    let (result, healthy) = if fits {
                         run_job(ctx, worktree, plan, job)
                     } else {
-                        JobResult {
+                        let skipped = JobResult {
                             outcome: MutantOutcome::NotRun,
                             killed_by: None,
                             duration: None,
-                        }
+                        };
+                        (skipped, true)
                     };
                     results.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(result);
+                    if !healthy {
+                        // The worktree may still hold a mutant; later jobs must not run in it.
+                        return;
+                    }
                 }
             });
         }
@@ -294,21 +299,25 @@ pub fn run_jobs(
         .collect()
 }
 
-fn run_job(ctx: &Context, worktree: &Worktree, plan: &RunnerPlan, job: &Job) -> JobResult {
+/// Runs one job and restores the file. The flag is false when the original could not be
+/// restored, so the worktree must not take more jobs.
+fn run_job(ctx: &Context, worktree: &Worktree, plan: &RunnerPlan, job: &Job) -> (JobResult, bool) {
     let runner = &ctx.runners[job.runner];
     let selection = match &plan.plan {
         Plan::Tests(cases) => Selection::Tests(cases),
         Plan::Suite => Selection::Suite,
         Plan::Nothing => {
-            return JobResult {
+            let nothing = JobResult {
                 outcome: MutantOutcome::NoResult,
                 killed_by: None,
                 duration: None,
             };
+            return (nothing, true);
         }
     };
     if let Err(e) = worktree.write(&job.file, job.mutated.as_bytes()) {
-        return error_result(e);
+        let restored = worktree.restore(&job.file, job.original.as_bytes()).is_ok();
+        return (error_result(e), restored);
     }
     let run = runner.run(&RunRequest {
         worktree: &worktree.path,
@@ -320,17 +329,23 @@ fn run_job(ctx: &Context, worktree: &Worktree, plan: &RunnerPlan, job: &Job) -> 
             .run_dir
             .join(&format!("logs-{}", worktree_name(worktree))),
     });
-    let restored = worktree.write(&job.file, job.original.as_bytes());
-    let run = match (run, restored) {
-        (Ok(run), Ok(())) => run,
-        (Err(e), _) | (_, Err(e)) => return error_result(e),
+    if let Err(e) = worktree.restore(&job.file, job.original.as_bytes()) {
+        return (
+            error_result(e.context("cannot restore the mutated file")),
+            false,
+        );
+    }
+    let run = match run {
+        Ok(run) => run,
+        Err(e) => return (error_result(e), true),
     };
     let (outcome, killed_by) = classify(&run, &plan.plan, &runner.config.cwd);
-    JobResult {
+    let result = JobResult {
         outcome,
         killed_by,
         duration: Some(run.duration),
-    }
+    };
+    (result, true)
 }
 
 fn worktree_name(worktree: &Worktree) -> String {
@@ -365,6 +380,19 @@ pub fn classify(run: &TestRun, plan: &Plan, cwd: &str) -> (MutantOutcome, Option
                 .find(|(_, r)| matches!(r, CaseResult::Failed(_)))
             {
                 return (MutantOutcome::Killed, Some(case.id.clone()));
+            }
+            // A file-level failure in a selected file, such as a throwing afterAll or a failed
+            // setUpClass, fails those tests even when their bodies passed.
+            let rel = |c: &TestCase| crate::runner::cwd_relative(&c.file, cwd);
+            if let Some(e) = run.file_errors.iter().find(|e| {
+                cases
+                    .iter()
+                    .any(|c| crate::runner::same_file(&e.file, &rel(c)))
+            }) {
+                return (
+                    MutantOutcome::Killed,
+                    Some(e.file.trim_start_matches("./").to_string()),
+                );
             }
             if results.iter().any(|(_, r)| *r == CaseResult::Passed) {
                 return (MutantOutcome::Survived, None);
@@ -420,14 +448,25 @@ pub fn canaries(
         return Ok(Vec::new());
     }
     let results = run_jobs(ctx, workers, plans, &jobs, None);
+    let unconfirmed: Vec<&str> = jobs
+        .iter()
+        .zip(&results)
+        .filter(|(_, r)| !matches!(r.outcome, MutantOutcome::Killed | MutantOutcome::Survived))
+        .map(|(j, _)| j.file.as_str())
+        .collect();
+    if !unconfirmed.is_empty() {
+        bail!(
+            "the canary neither failed nor passed the selected tests in {}: titer cannot confirm that the worktree loads the code it mutates",
+            unconfirmed.join(", ")
+        );
+    }
     let survived: Vec<String> = jobs
         .iter()
         .zip(&results)
         .filter(|(_, r)| r.outcome == MutantOutcome::Survived)
         .map(|(j, _)| j.file.clone())
         .collect();
-    if survived.len() == jobs.len() && results.iter().all(|r| r.outcome == MutantOutcome::Survived)
-    {
+    if survived.len() == jobs.len() {
         bail!(
             "the canary survived in every mutated module ({}): the worktree is not loading the code titer mutates. \
              An editable install or a PYTHONPATH that points at the checkout can cause this.",
@@ -447,6 +486,7 @@ pub fn run(
     let mut warnings = Vec::new();
     let mut pairs = generate(ctx)?;
     pairs.extend(extra);
+    let pairs = operators::budget_order(pairs, |(m, _)| (m.file.clone(), m.line));
     if pairs.is_empty() {
         return Ok(Mutation {
             mutants: Vec::new(),

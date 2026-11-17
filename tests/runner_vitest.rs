@@ -255,3 +255,24 @@ fn an_each_table_is_one_test_selected_by_its_call_line() {
         CaseResult::Failed(_)
     ));
 }
+
+#[test]
+fn a_throwing_after_all_hook_is_a_file_error() {
+    let repo = fixture();
+    repo.write(
+        "web/src/hook.test.ts",
+        "import { it, expect, afterAll } from \"vitest\";\n\nafterAll(() => {\n  throw new Error(\"hook\");\n});\n\nit(\"passes\", () => {\n  expect(1).toBe(1);\n});\n",
+    );
+    let runner = runner();
+    let test = case(&runner, "web/src/hook.test.ts", &[], "passes", 7);
+
+    let run = run(
+        &repo,
+        &runner,
+        Selection::Tests(std::slice::from_ref(&test)),
+        false,
+    );
+
+    assert_eq!(run.result_for(&test, "web"), CaseResult::Passed, "{run:?}");
+    assert_eq!(run.file_errors.len(), 1, "{run:?}");
+}

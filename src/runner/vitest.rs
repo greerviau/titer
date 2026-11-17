@@ -49,6 +49,9 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
         if req.fail_fast {
             args.push("--bail=1".to_string());
         }
+        // vitest's result cache and module cache live in node_modules, which is linked from
+        // the user's checkout and shared by every worker.
+        args.extend(cache_flags(runner, req.worktree));
         args.extend(selectors.iter().cloned());
         let cmd = runner.command(req.worktree, &args);
         let out = runner.exec(cmd, req)?;
@@ -94,6 +97,34 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
             runner_error,
         });
     }
+}
+
+/// The flags that turn off vitest's on-disk caches, for the vitest version the runner's
+/// command runs. Older versions reject flags they do not know, so `--help` decides.
+fn cache_flags(runner: &Runner, worktree: &std::path::Path) -> Vec<String> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static KNOWN: LazyLock<Mutex<HashMap<String, Vec<String>>>> = LazyLock::new(Default::default);
+    let key = runner.config.command.join(" ");
+    if let Some(flags) = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return flags.clone();
+    }
+    let help = crate::process::output(runner.command(worktree, &["--help".to_string()]))
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let flags: Vec<String> = [
+        ("--cache ", "--cache=false"),
+        ("--fsModuleCache ", "--fsModuleCache=false"),
+    ]
+    .iter()
+    .filter(|(probe, _)| help.contains(probe))
+    .map(|(_, flag)| flag.to_string())
+    .collect();
+    KNOWN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, flags.clone());
+    flags
 }
 
 fn empty_run(out: &crate::process::RunOutput) -> TestRun {
@@ -174,12 +205,15 @@ fn parse(json: &str, selected: Option<&[(String, u32)]>, roots: &[std::path::Pat
         let ran_any = assertions
             .iter()
             .any(|a| matches!(a["status"].as_str(), Some("passed" | "failed")));
-        if file["status"] == "failed" && !message.trim().is_empty() && !ran_any {
+        if file["status"] == "failed" && !message.trim().is_empty() {
+            // A load error, or a hook such as afterAll that threw after the tests ran.
             parsed.file_errors.push(FileError {
                 file: path.clone(),
                 failure: failure_from(&message),
             });
-            continue;
+            if !ran_any {
+                continue;
+            }
         }
         for a in assertions {
             let line = a["location"]["line"].as_u64().map(|l| l as u32);

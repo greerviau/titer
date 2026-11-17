@@ -70,6 +70,23 @@ impl Worktree {
             .with_context(|| format!("cannot write {}", target.display()))
     }
 
+    /// Puts back a file's original contents, even if a test made it read-only or replaced it.
+    pub fn restore(&self, path: &str, contents: &[u8]) -> anyhow::Result<()> {
+        self.check_inside(path)?;
+        let target = self.path.join(path);
+        if self.write(path, contents).is_ok() && std::fs::read(&target).is_ok_and(|c| c == contents)
+        {
+            return Ok(());
+        }
+        if let Some(parent) = target.parent() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
+        }
+        let _ = std::fs::remove_file(&target);
+        std::fs::write(&target, contents)
+            .with_context(|| format!("cannot restore {}", target.display()))
+    }
+
     /// Fails when a dir on the way to `path` is a symlink, which could lead outside the
     /// worktree.
     fn check_inside(&self, path: &str) -> anyhow::Result<()> {
@@ -127,4 +144,28 @@ fn link_deps(root: &Path, dest: &Path, runners: &[RunnerConfig]) -> anyhow::Resu
             .with_context(|| format!("cannot link {} to {}", target.display(), source.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_recovers_a_file_a_test_made_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let wt = Worktree {
+            path: dir.path().to_path_buf(),
+        };
+        wt.write("a.py", b"mutant").unwrap();
+        std::fs::set_permissions(
+            dir.path().join("a.py"),
+            std::fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
+
+        wt.restore("a.py", b"original").unwrap();
+
+        assert_eq!(std::fs::read(dir.path().join("a.py")).unwrap(), b"original");
+    }
 }

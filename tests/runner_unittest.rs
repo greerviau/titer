@@ -245,3 +245,21 @@ fn a_non_import_error_while_loading_a_module_fails_its_tests() {
     assert_eq!(failure.exception_type.as_deref(), Some("TypeError"));
     assert_eq!(failure.kind, FailureKind::Exception);
 }
+
+#[test]
+fn a_failing_set_up_class_fails_the_tests_of_its_module() {
+    let repo = fixture();
+    repo.write(
+        "api/tests/test_cls.py",
+        "import unittest\n\n\nclass A(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls):\n        raise ValueError(\"boom\")\n\n    def test_a(self):\n        pass\n",
+    );
+    let runner = runner();
+    let cases = vec![case(&runner, "api/tests/test_cls.py", "A", "test_a")];
+
+    let run = run(&repo, &runner, Selection::Tests(&cases), false);
+
+    let CaseResult::Failed(failure) = run.result_for(&cases[0], "api") else {
+        panic!("{run:?}")
+    };
+    assert_eq!(failure.exception_type.as_deref(), Some("ValueError"));
+}
