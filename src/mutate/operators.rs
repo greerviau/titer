@@ -423,6 +423,49 @@ pub fn canary(lang: Lang, source: &str) -> String {
     }
 }
 
+/// Inserts a raise or throw before the statement that encloses `line`, so a run that stays
+/// green shows that no selected test executes that statement. Returns None when no
+/// statement encloses the line or the result does not parse.
+pub fn sentinel(lang: Lang, source: &str, line: u32) -> Option<String> {
+    let tree = lang.parse(source)?;
+    let row = line.checked_sub(1)? as usize;
+    let text_line = source.lines().nth(row)?;
+    let column = text_line.len() - text_line.trim_start().len();
+    let point = tree_sitter::Point { row, column };
+    let mut node = tree.root_node().descendant_for_point_range(point, point)?;
+    let containers: &[&str] = if lang.is_python() {
+        &["block", "module"]
+    } else {
+        &[
+            "statement_block",
+            "program",
+            "switch_case",
+            "switch_default",
+        ]
+    };
+    loop {
+        let parent = node.parent()?;
+        if containers.contains(&parent.kind()) {
+            break;
+        }
+        node = parent;
+    }
+    let start = node.start_byte();
+    let indent = &source[source[..start].rfind('\n').map_or(0, |i| i + 1)..start];
+    if !indent.chars().all(char::is_whitespace) {
+        // Another statement shares the line; a sentinel there would not isolate this one.
+        return None;
+    }
+    let raise = match lang {
+        Lang::Python => "raise RuntimeError(\"titer sentinel\")",
+        Lang::TypeScript | Lang::Tsx => "throw new Error(\"titer sentinel\");",
+    };
+    let out = format!("{}{raise}\n{indent}{}", &source[..start], &source[start..]);
+    let had_errors = tree.root_node().has_error();
+    let parses = lang.parse(&out).is_some_and(|t| !t.root_node().has_error());
+    (had_errors || parses).then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +583,32 @@ def g():
                 &[]
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn sentinels_go_before_the_enclosing_statement() {
+        let py = "def f(x):\n    if x > 1:\n        return 2\n    elif x < 0:\n        return 3\n    return x\n";
+        assert_eq!(
+            sentinel(Lang::Python, py, 3).unwrap(),
+            "def f(x):\n    if x > 1:\n        raise RuntimeError(\"titer sentinel\")\n        return 2\n    elif x < 0:\n        return 3\n    return x\n"
+        );
+        // An elif condition belongs to the whole if statement.
+        assert!(
+            sentinel(Lang::Python, py, 4)
+                .unwrap()
+                .contains("    raise RuntimeError(\"titer sentinel\")\n    if x > 1:")
+        );
+        let ts = "export function f(x: number) {\n  const y = x > 1\n    ? 2\n    : 3;\n  return <a href={y} />;\n}\n";
+        assert!(
+            sentinel(Lang::Tsx, ts, 3)
+                .unwrap()
+                .contains("  throw new Error(\"titer sentinel\");\n  const y")
+        );
+        assert!(
+            sentinel(Lang::Tsx, ts, 5)
+                .unwrap()
+                .contains("  throw new Error(\"titer sentinel\");\n  return")
         );
     }
 

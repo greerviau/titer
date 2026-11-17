@@ -24,6 +24,8 @@ use operators::{CallFilter, Candidate};
 #[derive(Debug, Clone)]
 pub enum Plan {
     Tests(Vec<TestCase>),
+    /// Whole files, for the other-tests rerun of survivors.
+    Files(Vec<String>),
     Suite,
     /// The runner has changed tests but none is green on head.
     Nothing,
@@ -324,6 +326,7 @@ fn run_job(ctx: &Context, worktree: &Worktree, plan: &RunnerPlan, job: &Job) -> 
     let runner = &ctx.runners[job.runner];
     let selection = match &plan.plan {
         Plan::Tests(cases) => Selection::Tests(cases),
+        Plan::Files(files) => Selection::Files(files),
         Plan::Suite => Selection::Suite,
         Plan::Nothing => {
             let nothing = JobResult {
@@ -417,18 +420,20 @@ pub fn classify(run: &TestRun, plan: &Plan, cwd: &str) -> (MutantOutcome, Option
                 return (MutantOutcome::Survived, None);
             }
         }
-        Plan::Suite => {
+        Plan::Suite | Plan::Files(_) => {
             if let Some(o) = run
                 .outcomes
                 .iter()
                 .find(|o| matches!(o.status, Status::Failed(_)))
             {
-                let mut name = o.suite.clone();
-                name.push(o.name.clone());
-                return (
-                    MutantOutcome::Killed,
-                    Some(format!("{} {}", o.file, name.join("::"))),
-                );
+                // The runner's own id when it reports one (unittest), else file::suite::name.
+                let killer = o.id.clone().unwrap_or_else(|| {
+                    let mut parts = vec![o.file.trim_start_matches("./").to_string()];
+                    parts.extend(o.suite.iter().cloned());
+                    parts.push(o.name.clone());
+                    parts.join("::")
+                });
+                return (MutantOutcome::Killed, Some(killer));
             }
             if let Some(e) = run.file_errors.first() {
                 return (MutantOutcome::Killed, Some(e.file.clone()));
@@ -559,6 +564,15 @@ pub fn run(
     for i in skipped {
         mutants[i].outcome = MutantOutcome::NotExecuted;
     }
+    follow_up(
+        ctx,
+        &worktrees,
+        &plans,
+        &pairs,
+        &mut mutants,
+        deadline,
+        &mut warnings,
+    )?;
     for (runner, plan) in &plans {
         if matches!(plan.plan, Plan::Nothing) {
             warnings.push(format!(
@@ -572,6 +586,129 @@ pub fn run(
         workers,
         warnings,
     })
+}
+
+/// Survivor follow-up. First the sentinel: a raise before the statement that encloses each
+/// surviving line. If the selected tests still pass, no green selected test runs that line,
+/// and its survivors are not executed. Then the other tests: the remaining survivors run
+/// against the whole changed test files, and a kill there is caught by other tests.
+fn follow_up(
+    ctx: &Context,
+    workers: &[Worktree],
+    plans: &BTreeMap<usize, RunnerPlan>,
+    pairs: &[(Mutant, Job)],
+    mutants: &mut [Mutant],
+    deadline: Instant,
+    warnings: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let survivors = |mutants: &[Mutant]| -> Vec<usize> {
+        (0..mutants.len())
+            .filter(|i| mutants[*i].outcome == MutantOutcome::Survived)
+            .collect()
+    };
+    // One sentinel per surviving line.
+    let mut lines: Vec<(usize, String, u32)> = Vec::new();
+    for i in survivors(mutants) {
+        let key = (pairs[i].1.runner, mutants[i].file.clone(), mutants[i].line);
+        if !lines.contains(&key) {
+            lines.push(key);
+        }
+    }
+    let mut jobs = Vec::new();
+    let mut job_lines = Vec::new();
+    for (runner, file, line) in &lines {
+        let original = &pairs
+            .iter()
+            .find(|(m, _)| &m.file == file)
+            .expect("a survivor has a job")
+            .1
+            .original;
+        let Some(lang) = Lang::of(file) else { continue };
+        if let Some(mutated) = operators::sentinel(lang, original, *line) {
+            jobs.push(Job {
+                runner: *runner,
+                file: file.clone(),
+                original: original.clone(),
+                mutated,
+            });
+            job_lines.push((file.clone(), *line));
+        }
+    }
+    let results = run_jobs(ctx, workers, plans, &jobs, Some(deadline));
+    for ((file, line), result) in job_lines.iter().zip(&results) {
+        if result.outcome != MutantOutcome::Survived {
+            continue;
+        }
+        for m in mutants.iter_mut() {
+            if &m.file == file && m.line == *line && m.outcome == MutantOutcome::Survived {
+                m.outcome = MutantOutcome::NotExecuted;
+            }
+        }
+    }
+
+    // The other tests in the changed test files, for runners that ran only changed tests.
+    let remaining = survivors(mutants);
+    let mut file_plans: BTreeMap<usize, RunnerPlan> = BTreeMap::new();
+    for (runner, plan) in plans {
+        if !matches!(plan.plan, Plan::Tests(_))
+            || !remaining.iter().any(|i| pairs[*i].1.runner == *runner)
+        {
+            continue;
+        }
+        let files: Vec<String> = ctx
+            .detection
+            .test_files
+            .iter()
+            .filter(|(r, _)| r == runner)
+            .map(|(_, f)| f.clone())
+            .collect();
+        if files.is_empty() || Instant::now() >= deadline {
+            continue;
+        }
+        let r = &ctx.runners[*runner];
+        let head = r.run(&RunRequest {
+            worktree: &workers[0].path,
+            selection: Selection::Files(&files),
+            fail_fast: false,
+            timeout: Some(plan.timeout()),
+            scratch: &ctx.session.run_dir.join("logs"),
+        })?;
+        let red = head.timed_out
+            || head.runner_error.is_some()
+            || !head.file_errors.is_empty()
+            || head
+                .outcomes
+                .iter()
+                .any(|o| matches!(o.status, Status::Failed(_)));
+        if red {
+            warnings.push(format!(
+                "the changed test files of runner {:?} are not green on head, so survivors were not rerun against their other tests",
+                r.name()
+            ));
+            continue;
+        }
+        file_plans.insert(
+            *runner,
+            RunnerPlan {
+                plan: Plan::Files(files),
+                head_duration: head.duration,
+                peak_rss: head.max_rss_bytes,
+            },
+        );
+    }
+    let rerun: Vec<usize> = remaining
+        .into_iter()
+        .filter(|i| file_plans.contains_key(&pairs[*i].1.runner))
+        .collect();
+    let jobs: Vec<Job> = rerun.iter().map(|i| pairs[*i].1.clone()).collect();
+    let results = run_jobs(ctx, workers, &file_plans, &jobs, Some(deadline));
+    for (i, result) in rerun.iter().zip(results) {
+        if result.outcome == MutantOutcome::Killed {
+            mutants[*i].outcome = MutantOutcome::CaughtByOther;
+            mutants[*i].killed_by = result.killed_by;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
