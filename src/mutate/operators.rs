@@ -457,7 +457,9 @@ pub fn sentinel(lang: Lang, source: &str, line: u32) -> Option<String> {
         return None;
     }
     let raise = match lang {
-        Lang::Python => "raise RuntimeError(\"titer sentinel\")",
+        // SystemExit is not an Exception, so `except Exception` in the code under test
+        // cannot swallow the sentinel; pytest and unittest both report it as a failure.
+        Lang::Python => "raise SystemExit(\"titer sentinel\")",
         Lang::TypeScript | Lang::Tsx => "throw new Error(\"titer sentinel\");",
     };
     let out = format!("{}{raise}\n{indent}{}", &source[..start], &source[start..]);
@@ -591,13 +593,13 @@ def g():
         let py = "def f(x):\n    if x > 1:\n        return 2\n    elif x < 0:\n        return 3\n    return x\n";
         assert_eq!(
             sentinel(Lang::Python, py, 3).unwrap(),
-            "def f(x):\n    if x > 1:\n        raise RuntimeError(\"titer sentinel\")\n        return 2\n    elif x < 0:\n        return 3\n    return x\n"
+            "def f(x):\n    if x > 1:\n        raise SystemExit(\"titer sentinel\")\n        return 2\n    elif x < 0:\n        return 3\n    return x\n"
         );
         // An elif condition belongs to the whole if statement.
         assert!(
             sentinel(Lang::Python, py, 4)
                 .unwrap()
-                .contains("    raise RuntimeError(\"titer sentinel\")\n    if x > 1:")
+                .contains("    raise SystemExit(\"titer sentinel\")\n    if x > 1:")
         );
         let ts = "export function f(x: number) {\n  const y = x > 1\n    ? 2\n    : 3;\n  return <a href={y} />;\n}\n";
         assert!(
