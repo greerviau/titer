@@ -237,3 +237,30 @@ fn whole_files_and_the_suite_select_every_test() {
     assert_eq!(suite.executed(), 6);
     assert_eq!(suite.file_errors.len(), 1);
 }
+
+#[test]
+fn a_conftest_that_fails_to_load_fails_the_selected_tests() {
+    let repo = repo("");
+    repo.write(
+        "tests/conftest.py",
+        "raise RuntimeError(\"titer canary\")\n",
+    );
+    let runner = runner(".");
+    let cases = vec![case(&runner, "tests/test_a.py", &["TestX"], "test_ok")];
+    let scratch = repo.scratch().join("run");
+
+    let run = runner
+        .run(&RunRequest {
+            worktree: repo.path(),
+            selection: Selection::Tests(&cases),
+            fail_fast: true,
+            timeout: None,
+            scratch: &scratch,
+        })
+        .unwrap();
+
+    let CaseResult::Failed(failure) = run.result_for(&cases[0], ".") else {
+        panic!("{run:?}")
+    };
+    assert_eq!(failure.exception_type.as_deref(), Some("RuntimeError"));
+}

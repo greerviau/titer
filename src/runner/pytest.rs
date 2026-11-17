@@ -66,6 +66,32 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
                 continue;
             }
         }
+        // A conftest that fails to load stops pytest before it writes the junit file, and
+        // every selected test fails with it.
+        if parsed.outcomes.is_empty()
+            && file_errors.is_empty()
+            && !out.timed_out
+            && text.contains("while loading conftest")
+        {
+            let failure = failure_from("", &text);
+            let files: Vec<String> = match req.selection {
+                Selection::Tests(cases) => cases
+                    .iter()
+                    .map(|c| cwd_relative(&c.file, &runner.config.cwd))
+                    .collect(),
+                Selection::Files(files) => files
+                    .iter()
+                    .map(|f| cwd_relative(f, &runner.config.cwd))
+                    .collect(),
+                Selection::Suite => vec!["conftest.py".to_string()],
+            };
+            for file in files {
+                file_errors.push(FileError {
+                    file: format!("./{file}"),
+                    failure: failure.clone(),
+                });
+            }
+        }
         let runner_error = (parsed.outcomes.is_empty()
             && file_errors.is_empty()
             && !out.timed_out
