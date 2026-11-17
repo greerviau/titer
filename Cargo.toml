@@ -9,7 +9,7 @@ repository = "https://github.com/greerviau/titer"
 readme = "README.md"
 keywords = ["testing", "mutation-testing", "ci", "agents"]
 categories = ["development-tools::testing", "command-line-utilities"]
-exclude = [".github/", "scripts/", ".fixture-deps/"]
+exclude = [".github/", "scripts/", ".fixture-deps/", "npm/", "replay/", "pyproject.toml"]
 
 [dependencies]
 anyhow = "1"

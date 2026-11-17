@@ -13,9 +13,17 @@ Prove that a change's tests test the change: fail-on-base, diff-scoped mutation,
 
 titer supports Python and TypeScript/TSX sources and the pytest, unittest, and vitest runners. It is a single Rust binary. It never wraps the agent and contains no model.
 
-## Status
+## Install
 
-Under construction. See the work items in the pull requests.
+titer is one binary for Linux (x64, arm64) and macOS (arm64, x64). Install it as a dev dependency of the repo, so that every agent and CI job runs the version the repo pins:
+
+| Ecosystem | Install | Run |
+|---|---|---|
+| npm | `npm install --save-dev titer` | `npx titer check` |
+| Python with uv | `uv add --dev titer` | `uv run titer check` |
+| Rust | `cargo install titer` | `titer check` |
+
+Release binaries are also attached to each [GitHub release](https://github.com/greerviau/titer/releases).
 
 ## Exit codes
 
