@@ -220,6 +220,35 @@ fn a_file_error_never_lands_on_a_test_in_another_file_with_the_same_name() {
     );
     assert!(matches!(
         run.result_for(&cases[1], "web"),
+
+const EACH: &str = r#"import { it, expect } from "vitest";
+
+it.each([
+  ["a", 1],
+  ["b", 2],
+])("maps %s", (name, n) => {
+  expect(n).toBeLessThan(2);
+});
+"#;
+
+#[test]
+fn an_each_table_is_one_test_selected_by_its_call_line() {
+    let repo = fixture();
+    repo.write("web/src/each.test.ts", EACH);
+    let runner = runner();
+    // The title is formatted at run time, so only the line identifies the test.
+    let table = case(&runner, "web/src/each.test.ts", &[], "maps %s", 6);
+
+    let run = run(
+        &repo,
+        &runner,
+        Selection::Tests(std::slice::from_ref(&table)),
+        false,
+    );
+
+    assert_eq!(run.executed(), 2, "{run:?}");
+    assert!(matches!(
+        run.result_for(&table, "web"),
         CaseResult::Failed(_)
     ));
 }

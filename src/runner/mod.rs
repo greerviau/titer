@@ -121,19 +121,19 @@ impl TestRun {
             return CaseResult::Skipped;
         }
         let rel = cwd_relative(&case.file, cwd);
-        let mut matched: Vec<&TestOutcome> = self
+        // A reported line (vitest) identifies the test by itself, which also covers `.each`
+        // tables whose titles are formatted at run time and tests that share a full name.
+        let matched: Vec<&TestOutcome> = self
             .outcomes
             .iter()
-            .filter(|o| match &o.id {
-                Some(id) => id == &case.id,
-                None => o.name == case.name && o.suite == case.suite && same_file(&o.file, &rel),
+            .filter(|o| match (&o.id, o.line) {
+                (Some(id), _) => id == &case.id,
+                (None, Some(line)) => line == case.line && same_file(&o.file, &rel),
+                (None, None) => {
+                    o.name == case.name && o.suite == case.suite && same_file(&o.file, &rel)
+                }
             })
             .collect();
-        // When the runner reports lines (vitest), the line picks the test, so two tests with
-        // the same name in one file stay apart.
-        if matched.iter().all(|o| o.line.is_some()) {
-            matched.retain(|o| o.line == Some(case.line));
-        }
         if let Some(failure) = matched.iter().find_map(|o| match &o.status {
             Status::Failed(f) => Some(f),
             _ => None,
@@ -220,7 +220,15 @@ impl Runner {
 
     /// The repo's command, run in the runner's cwd inside the worktree, with `args` appended.
     pub(crate) fn command(&self, worktree: &Path, args: &[String]) -> Command {
-        let mut cmd = Command::new(&self.config.command[0]);
+        // A relative program with a slash, such as `.venv/bin/python`, is relative to the
+        // runner's cwd in the worktree.
+        let program = Path::new(&self.config.command[0]);
+        let program = if program.is_relative() && program.components().count() > 1 {
+            self.cwd_in(worktree).join(program)
+        } else {
+            program.to_path_buf()
+        };
+        let mut cmd = Command::new(program);
         cmd.args(&self.config.command[1..])
             .args(args)
             .current_dir(self.cwd_in(worktree))

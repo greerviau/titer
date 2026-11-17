@@ -168,6 +168,16 @@ impl Git {
         Ok(out.status.success().then_some(out.stdout))
     }
 
+    /// Every file path in `tree`, which may be a tree or a commit.
+    pub fn list_files(&self, tree: &str) -> anyhow::Result<std::collections::HashSet<String>> {
+        let bytes = self.run_bytes(["ls-tree", "-r", "-z", "--name-only", tree])?;
+        Ok(bytes
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect())
+    }
+
     /// Writes every file of `tree` under `dest`, without registering a git worktree.
     pub fn materialize(&self, tree: &str, dest: &Path, scratch_index: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(dest)?;

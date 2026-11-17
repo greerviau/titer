@@ -234,11 +234,19 @@ fn is_assertion(error_type: &str) -> bool {
     )
 }
 
+/// Matchers that throw a plain `Error`, such as jest-dom's `toBeDisabled`, and Testing
+/// Library queries that find no element or too many.
+static ASSERTION_TEXT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:\w+: )?(?:expect\(|Unable to find (?:an? )?(?:element|label|role|accessible element)|Found multiple elements)")
+        .unwrap()
+});
+
 fn failure_from(message: &str) -> Failure {
     let first = message.lines().next().unwrap_or_default().trim();
     let exception_type = ERROR_TYPE.captures(first).map(|c| c[1].to_string());
     let kind = match exception_type.as_deref() {
         Some(t) if is_assertion(t) => FailureKind::Assertion,
+        Some("Error") | None if ASSERTION_TEXT.is_match(first) => FailureKind::Assertion,
         _ => FailureKind::Exception,
     };
     let detail: Vec<&str> = message
@@ -271,6 +279,12 @@ mod tests {
         assert_eq!(f.kind, FailureKind::Assertion);
         assert_eq!(f.exception_type.as_deref(), Some("AssertionError"));
         assert_eq!(f.message, "expected 3 to be 4 // Object.is equality");
+        let f = failure_from(
+            "Error: expect(element).toBeDisabled()\n\nReceived element is not disabled:",
+        );
+        assert_eq!(f.kind, FailureKind::Assertion);
+        let f = failure_from("Error: Unable to find a label with the text of: /^R/");
+        assert_eq!(f.kind, FailureKind::Assertion);
         let f = failure_from("TypeError: no x\n    at get (/w/math.ts:5:26)");
         assert_eq!(f.kind, FailureKind::Exception);
         assert_eq!(f.exception_type.as_deref(), Some("TypeError"));
