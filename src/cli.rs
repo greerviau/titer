@@ -156,18 +156,72 @@ fn run_check(args: CheckArgs) -> u8 {
 
 /// A short human-readable summary of a report.
 pub fn render_text(report: &Report) -> String {
+    use std::fmt::Write as _;
+
+    use crate::report::MutantOutcome;
+
     let mut out = String::new();
     let status = match report.gate.status {
         GateStatus::Pass => "pass",
         GateStatus::Fail => "fail",
         GateStatus::Error => "error",
     };
-    out.push_str(&format!("titer gate: {status}\n"));
+    let _ = writeln!(out, "titer gate: {status}");
     for reason in &report.gate.reasons {
-        out.push_str(&format!("  - {reason}\n"));
+        let _ = writeln!(out, "  - {reason}");
+    }
+    if !report.tests.is_empty() {
+        let _ = writeln!(out, "\nchanged tests:");
+        for t in &report.tests {
+            let verdict = t
+                .verdict
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_else(|| format!("head {:?}", t.head));
+            let _ = writeln!(out, "  {verdict:<14} {}  ({}:{})", t.name, t.file, t.line);
+        }
+    }
+    let notable: Vec<_> = report
+        .mutants
+        .iter()
+        .filter(|m| {
+            matches!(
+                m.outcome,
+                MutantOutcome::Survived | MutantOutcome::NotExecuted
+            )
+        })
+        .collect();
+    if !notable.is_empty() {
+        let _ = writeln!(out, "\nsurvivors:");
+        for m in notable {
+            let _ = writeln!(
+                out,
+                "  {:<13} {}:{}  {} -> {}",
+                format!("{:?}", m.outcome),
+                m.file,
+                m.line,
+                m.original.lines().next().unwrap_or_default().trim(),
+                m.replacement.lines().next().unwrap_or_default().trim()
+            );
+        }
+    }
+    if !report.findings.is_empty() {
+        let _ = writeln!(out, "\nscan findings:");
+        for f in &report.findings {
+            let _ = writeln!(out, "  {:?} {}:{}  {}", f.kind, f.file, f.line, f.message);
+        }
+    }
+    for c in report.crap.iter().filter(|c| c.flagged) {
+        let _ = writeln!(
+            out,
+            "crap {:.0}: {} ({}:{})",
+            c.score.unwrap_or_default(),
+            c.function,
+            c.file,
+            c.line
+        );
     }
     for warning in &report.warnings {
-        out.push_str(&format!("warning: {warning}\n"));
+        let _ = writeln!(out, "warning: {warning}");
     }
     out
 }
