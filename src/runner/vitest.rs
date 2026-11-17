@@ -99,31 +99,42 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
     }
 }
 
-/// The flags that turn off vitest's on-disk caches, for the vitest version the runner's
-/// command runs. Older versions reject flags they do not know, so `--help` decides.
+/// Flags that keep vitest's on-disk caches out of the `node_modules` that the worktree links
+/// from the user's checkout and shares with every worker. The result cache goes off, and the
+/// module cache moves into the worktree, so each worker keeps its own. Older versions reject
+/// flags they do not know, so the runner's `--help` decides which flags apply.
 fn cache_flags(runner: &Runner, worktree: &std::path::Path) -> Vec<String> {
     use std::collections::HashMap;
     use std::sync::Mutex;
-    static KNOWN: LazyLock<Mutex<HashMap<String, Vec<String>>>> = LazyLock::new(Default::default);
+    static KNOWN: LazyLock<Mutex<HashMap<String, (bool, bool)>>> = LazyLock::new(Default::default);
     let key = runner.config.command.join(" ");
-    if let Some(flags) = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-        return flags.clone();
-    }
-    let help = crate::process::output(runner.command(worktree, &["--help".to_string()]))
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    let flags: Vec<String> = [
-        ("--cache ", "--cache=false"),
-        ("--fsModuleCache ", "--fsModuleCache=false"),
-    ]
-    .iter()
-    .filter(|(probe, _)| help.contains(probe))
-    .map(|(_, flag)| flag.to_string())
-    .collect();
-    KNOWN
+    let cached = KNOWN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(key, flags.clone());
+        .get(&key)
+        .copied();
+    let (results_cache, module_cache_path) = cached.unwrap_or_else(|| {
+        let help = crate::process::output(runner.command(worktree, &["--help".to_string()]))
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let known = (
+            help.contains("--cache "),
+            help.contains("--fsModuleCachePath "),
+        );
+        KNOWN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, known);
+        known
+    });
+    let mut flags = Vec::new();
+    if results_cache {
+        flags.push("--cache=false".to_string());
+    }
+    if module_cache_path {
+        let dir = worktree.join(".titer-cache/vitest");
+        flags.push(format!("--fsModuleCachePath={}", dir.display()));
+    }
     flags
 }
 

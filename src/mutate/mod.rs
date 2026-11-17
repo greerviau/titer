@@ -255,6 +255,8 @@ pub fn run_jobs(
 ) -> Vec<JobResult> {
     let queue: Mutex<VecDeque<usize>> = Mutex::new((0..jobs.len()).collect());
     let results: Mutex<Vec<Option<JobResult>>> = Mutex::new(vec![None; jobs.len()]);
+    // Total duration and count of finished runs, per runner.
+    let observed: Mutex<BTreeMap<usize, (Duration, u32)>> = Mutex::new(BTreeMap::new());
     std::thread::scope(|scope| {
         for worktree in workers {
             scope.spawn(|| {
@@ -265,7 +267,10 @@ pub fn run_jobs(
                     };
                     let job = &jobs[i];
                     let plan = &plans[&job.runner];
-                    let fits = deadline.is_none_or(|d| Instant::now() + plan.head_duration <= d);
+                    // Parallel runs are slower than the lone head run, so admit a job by
+                    // the longer of the head run and the mean mutant run so far.
+                    let expected = plan.head_duration.max(mean(&observed, job.runner));
+                    let fits = deadline.is_none_or(|d| Instant::now() + expected <= d);
                     let (result, healthy) = if fits {
                         run_job(ctx, worktree, plan, job)
                     } else {
@@ -276,6 +281,12 @@ pub fn run_jobs(
                         };
                         (skipped, true)
                     };
+                    if let Some(d) = result.duration {
+                        let mut observed = observed.lock().unwrap_or_else(|e| e.into_inner());
+                        let entry = observed.entry(job.runner).or_insert((Duration::ZERO, 0));
+                        entry.0 += d;
+                        entry.1 += 1;
+                    }
                     results.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(result);
                     if !healthy {
                         // The worktree may still hold a mutant; later jobs must not run in it.
@@ -301,6 +312,14 @@ pub fn run_jobs(
 
 /// Runs one job and restores the file. The flag is false when the original could not be
 /// restored, so the worktree must not take more jobs.
+fn mean(observed: &Mutex<BTreeMap<usize, (Duration, u32)>>, runner: usize) -> Duration {
+    let observed = observed.lock().unwrap_or_else(|e| e.into_inner());
+    match observed.get(&runner) {
+        Some((total, n)) if *n > 0 => *total / *n,
+        _ => Duration::ZERO,
+    }
+}
+
 fn run_job(ctx: &Context, worktree: &Worktree, plan: &RunnerPlan, job: &Job) -> (JobResult, bool) {
     let runner = &ctx.runners[job.runner];
     let selection = match &plan.plan {
