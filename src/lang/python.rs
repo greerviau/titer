@@ -21,15 +21,46 @@ fn name_of<'a>(node: Node, source: &'a str) -> &'a str {
         .unwrap_or_default()
 }
 
-fn is_test_class(class: Node, source: &str, style: PythonStyle) -> bool {
-    let name = name_of(class, source);
-    let bases = class
+/// The last dotted segment of each base class.
+fn base_names<'a>(class: Node, source: &'a str) -> Vec<&'a str> {
+    class
         .child_by_field_name("superclasses")
-        .map(|b| text(b, source))
-        .unwrap_or_default();
+        .map(|b| {
+            children(b)
+                .into_iter()
+                .filter(|n| matches!(n.kind(), "identifier" | "attribute"))
+                .map(|n| text(n, source).rsplit('.').next().unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A base that is, or by naming convention derives from, `unittest.TestCase`.
+fn is_test_base(name: &str) -> bool {
+    let test_word = name
+        .strip_prefix("Test")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(|c: char| c.is_ascii_uppercase()));
+    test_word || name.contains("TestCase") || name.ends_with("Test") || name.ends_with("Tests")
+}
+
+fn defines_init(class: Node, source: &str) -> bool {
+    class.child_by_field_name("body").is_some_and(|body| {
+        children(body).into_iter().any(|c| {
+            let def = unwrap_decorated(c).0;
+            def.kind() == "function_definition" && name_of(def, source) == "__init__"
+        })
+    })
+}
+
+fn is_test_class(class: Node, source: &str, style: PythonStyle) -> bool {
+    let unittest_class = base_names(class, source).into_iter().any(is_test_base);
     match style {
-        PythonStyle::Pytest => name.starts_with("Test") || bases.contains("TestCase"),
-        PythonStyle::Unittest => bases.contains("Test"),
+        // pytest collects unittest classes, and Test* classes without __init__.
+        PythonStyle::Pytest => {
+            unittest_class
+                || (name_of(class, source).starts_with("Test") && !defines_init(class, source))
+        }
+        PythonStyle::Unittest => unittest_class,
     }
 }
 
@@ -71,7 +102,7 @@ fn walk_tests(
                     });
                 }
             }
-            "class_definition" if is_test_class(def, source, style) || in_class => {
+            "class_definition" if is_test_class(def, source, style) => {
                 suite.push(name_of(def, source).to_string());
                 walk_tests(def, source, style, suite, out);
                 suite.pop();
@@ -162,6 +193,25 @@ class LoginTests(unittest.TestCase):
 class Plain:
     def test_ignored(self):
         pass
+
+
+class TestWithInit:
+    def __init__(self):
+        pass
+
+    def test_never_collected(self):
+        pass
+
+
+class TestOuter:
+    class Helper:
+        def test_in_helper(self):
+            pass
+
+
+class Bogus(Testable):
+    def test_bogus(self):
+        pass
 "#;
 
     fn summary(tests: &[TestDef]) -> Vec<String> {
@@ -221,6 +271,10 @@ class Plain:
                 "LoginTests.setUp 33-34",
                 "LoginTests.test_login 36-37",
                 "Plain.test_ignored 41-42",
+                "TestWithInit.__init__ 46-47",
+                "TestWithInit.test_never_collected 49-50",
+                "TestOuter.Helper.test_in_helper 55-56",
+                "Bogus.test_bogus 60-61",
             ]
         );
     }

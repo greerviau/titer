@@ -56,6 +56,19 @@ pub(crate) fn title(node: Node, source: &str) -> String {
     }
 }
 
+/// The line vitest reports for a test call, which is where V8 puts the call in a stack
+/// trace: the callee's name, the property of a member callee (`it.skip`), or the end of a
+/// curried callee (`it.each(table)`).
+fn reported_line(func: Node) -> u32 {
+    match func.kind() {
+        "member_expression" => func
+            .child_by_field_name("property")
+            .map_or_else(|| line_of(func), line_of),
+        "call_expression" => func.end_position().row as u32 + 1,
+        _ => line_of(func),
+    }
+}
+
 pub fn find_tests(root: Node, source: &str) -> Vec<TestDef> {
     let mut out = Vec::new();
     walk_tests(root, source, &mut Vec::new(), false, &mut out);
@@ -88,8 +101,7 @@ fn walk_tests(
                     name,
                     line: line_of(node),
                     end_line: end_line_of(node),
-                    // vitest reports a test at the opening paren of its outermost call.
-                    report_line: line_of(args),
+                    report_line: reported_line(func),
                     skip,
                 });
                 return;
@@ -200,6 +212,10 @@ describe("outer", () => {
   it(`template`, async () => {});
   it
     .skipIf(false)("multi", () => {});
+  it
+    ("bare", () => {});
+  test
+    .only("member", () => {});
 });
 
 describe.skip("off", () => {
@@ -234,8 +250,10 @@ it.todo("someday");
                 "outer > adds %i 11-13 at 11",
                 "outer > template 14-14 at 14",
                 "outer > multi 15-16 at 16",
-                "off > inherits skip 20-20 at 20 skip",
-                "someday 23-23 at 23 skip",
+                "outer > bare 17-18 at 17",
+                "outer > member 19-20 at 20",
+                "off > inherits skip 24-24 at 24 skip",
+                "someday 27-27 at 27 skip",
             ]
         );
     }
