@@ -1,6 +1,7 @@
 //! The mutate tier: mutate changed source lines and run the selected tests against each
 //! mutant, one process per mutant, in parallel worktrees.
 
+pub mod agent;
 pub mod operators;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -73,15 +74,13 @@ pub fn plan(
     ctx: &Context,
     heads: &[HeadRun],
     head: &Worktree,
+    runners: &[usize],
 ) -> anyhow::Result<BTreeMap<usize, RunnerPlan>> {
     let mut plans = BTreeMap::new();
-    let runners_with_sources: Vec<usize> = {
-        let mut r: Vec<usize> = ctx.detection.sources.iter().map(|s| s.runner).collect();
-        r.sort();
-        r.dedup();
-        r
-    };
-    for runner in runners_with_sources {
+    let mut runners = runners.to_vec();
+    runners.sort();
+    runners.dedup();
+    for runner in runners {
         if let Some(h) = heads.iter().find(|h| h.runner == runner) {
             let green = h.green();
             plans.insert(
@@ -518,7 +517,8 @@ pub fn run(
             warnings,
         });
     }
-    let plans = plan(ctx, heads, &head)?;
+    let runners: Vec<usize> = pairs.iter().map(|(_, j)| j.runner).collect();
+    let plans = plan(ctx, heads, &head, &runners)?;
     let peak = plans.values().map(|p| p.peak_rss).max().unwrap_or(0);
     let workers = ctx
         .options
