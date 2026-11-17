@@ -220,6 +220,9 @@ fn a_file_error_never_lands_on_a_test_in_another_file_with_the_same_name() {
     );
     assert!(matches!(
         run.result_for(&cases[1], "web"),
+        CaseResult::Failed(_)
+    ));
+}
 
 const EACH: &str = r#"import { it, expect } from "vitest";
 
