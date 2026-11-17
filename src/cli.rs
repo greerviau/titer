@@ -38,6 +38,14 @@ enum Command {
     /// Print the report's JSON Schema.
     #[command(hide = true)]
     Schema,
+    /// Run a command in a head worktree, the way titer runs tests.
+    #[command(hide = true)]
+    Exec {
+        #[arg(long)]
+        base: Option<String>,
+        #[arg(trailing_var_arg = true, required = true)]
+        argv: Vec<String>,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -80,6 +88,7 @@ pub fn main() -> ExitCode {
             exit::ERROR
         }
         Command::Check(args) => run_check(args),
+        Command::Exec { base, argv } => run_exec(base.as_deref(), &argv),
         Command::Schema => {
             let schema = crate::report::schema();
             println!(
@@ -90,6 +99,19 @@ pub fn main() -> ExitCode {
         }
     };
     ExitCode::from(code)
+}
+
+fn run_exec(base: Option<&str>, argv: &[String]) -> u8 {
+    let result = std::env::current_dir()
+        .map_err(anyhow::Error::from)
+        .and_then(|cwd| check::exec(&cwd, base, argv));
+    match result {
+        Ok(code) => u8::try_from(code).unwrap_or(exit::ERROR),
+        Err(e) => {
+            eprintln!("titer: {e:#}");
+            exit::ERROR
+        }
+    }
 }
 
 fn run_check(args: CheckArgs) -> u8 {

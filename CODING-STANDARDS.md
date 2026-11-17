@@ -5,8 +5,8 @@ These rules apply to every change in this repo, in addition to `docs/UBIQUITOUS-
 ## Safety
 
 - Never modify the user's checkout. Do not write to its working tree, index, stash, refs, or worktree list. Read git state with plumbing commands, and build trees with a temporary `GIT_INDEX_FILE`.
-- Start every test process in its own process group through `process::spawn`. Kill only process groups that titer started.
-- Put temporary files under `tmp::run_dir`, which is disk-backed and removed on exit and on SIGINT.
+- Start every test process in its own process group through `process::run`. Kill only process groups that titer started.
+- Put temporary files in a `tmp::RunDir`, which is disk-backed and removed on exit and on SIGINT.
 
 ## Results
 

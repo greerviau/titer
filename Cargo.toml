@@ -15,14 +15,17 @@ exclude = [".github/", "scripts/", ".fixture-deps/"]
 anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
 humantime = "2.4"
+libc = "0.2"
 schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+signal-hook = "0.4"
 thiserror = "2"
 toml = "1.2"
 
 [dev-dependencies]
 jsonschema = { version = "0.61", default-features = false }
+libc = "0.2"
 tempfile = "3"
 
 [profile.release]
