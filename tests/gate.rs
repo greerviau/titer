@@ -115,3 +115,25 @@ fn text_output_summarizes_the_gate() {
     assert!(text.starts_with("titer gate: pass\n"), "{text}");
     assert!(text.contains("Assertion"), "{text}");
 }
+
+#[test]
+fn a_red_suite_exits_2_even_when_the_change_yields_no_mutants() {
+    let repo = repo("");
+    // Neither a docstring nor an import has mutants, and the import breaks test_old on head.
+    repo.write(
+        "app.py",
+        "\"\"\"Clamping.\"\"\"\nimport missing_module\n\n\ndef clamp(x, hi):\n    return x\n",
+    );
+
+    let output = repo.titer(&["check", "--json"]);
+
+    let report = stdout_json(&output);
+    assert_eq!(report["mutants"], serde_json::json!([]), "{report:#}");
+    assert_eq!(output.status.code(), Some(2), "{report:#}");
+    assert!(
+        report["gate"]["reasons"][0]
+            .as_str()
+            .unwrap()
+            .contains("head is not green")
+    );
+}

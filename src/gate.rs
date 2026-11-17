@@ -45,9 +45,11 @@ pub fn evaluate(report: &mut Report, config: &GateConfig, touches_source: bool) 
 
     if touches_source && (ran(Tier::Prove) || ran(Tier::Mutate)) {
         let unproven_by_prove = !ran(Tier::Prove) || proven == 0;
-        let unproven_by_mutate = !ran(Tier::Mutate) || (!evaluated.is_empty() && detected == 0);
-        let mutate_blocks = ran(Tier::Mutate) && evaluated.is_empty();
-        if unproven_by_prove && unproven_by_mutate && !mutate_blocks {
+        // Mutants that exist but never ran (no result, or past the budget) prove nothing either.
+        let unproven_by_mutate =
+            !ran(Tier::Mutate) || (!report.mutants.is_empty() && detected == 0);
+        let no_mutants = ran(Tier::Mutate) && report.mutants.is_empty();
+        if unproven_by_prove && unproven_by_mutate && !no_mutants {
             failures.push(
                 "unproven change: no changed test fails on base, and the selected tests kill no mutant of the changed lines"
                     .to_string(),
@@ -58,7 +60,12 @@ pub fn evaluate(report: &mut Report, config: &GateConfig, touches_source: bool) 
         let survivors = report
             .mutants
             .iter()
-            .filter(|m| m.outcome == MutantOutcome::Survived)
+            .filter(|m| {
+                matches!(
+                    m.outcome,
+                    MutantOutcome::Survived | MutantOutcome::NotExecuted
+                )
+            })
             .count();
         if survivors > 0 {
             failures.push(format!(
@@ -196,7 +203,13 @@ mod tests {
                 vec![test(Verdict::PassesOnBase)],
                 vec![NotRun, NoResult],
                 true,
-                GateStatus::Pass,
+                GateStatus::Fail,
+            ),
+            (
+                vec![test(Verdict::Skipped)],
+                vec![NoResult],
+                true,
+                GateStatus::Fail,
             ),
             (
                 vec![test(Verdict::PassesOnBase)],

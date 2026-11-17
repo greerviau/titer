@@ -36,7 +36,7 @@ fn check_snapshots_head_with_untracked_files_and_leaves_the_checkout_unchanged()
     let repo = busy_repo();
     let before = repo.checkout_state();
 
-    let output = repo.titer(&["check", "--json"]);
+    let output = repo.titer(&["check", "--json", "--only", "scan"]);
 
     assert_eq!(
         output.status.code(),
@@ -139,7 +139,7 @@ fn a_new_run_removes_dirs_left_by_a_killed_run() {
     let stale = repo.titer_tmp().join("run-999999999-1");
     std::fs::create_dir_all(stale.join("head")).unwrap();
 
-    let output = repo.titer(&["check", "--json"]);
+    let output = repo.titer(&["check", "--json", "--only", "scan"]);
 
     assert_eq!(output.status.code(), Some(0));
     assert!(

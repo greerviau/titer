@@ -511,6 +511,9 @@ pub fn run(
     pairs.extend(extra);
     let pairs = operators::budget_order(pairs, |(m, _)| (m.file.clone(), m.line));
     if pairs.is_empty() {
+        // Still confirm that head is green where the suite stands in for changed tests.
+        let runners: Vec<usize> = ctx.detection.sources.iter().map(|s| s.runner).collect();
+        plan(ctx, heads, &head, &runners)?;
         return Ok(Mutation {
             mutants: Vec::new(),
             workers: 0,
