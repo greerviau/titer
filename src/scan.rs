@@ -19,7 +19,12 @@ pub fn scan(session: &Session, runners: &[Runner]) -> anyhow::Result<Vec<Finding
     for change in &session.changes.files {
         let path = change.path();
         if is_snapshot(path) {
-            if change.status != FileStatus::Added {
+            // A rename with identical contents, such as moving a test and its snapshot
+            // together, changes nothing.
+            let edited = !change.added.is_empty() || !change.removed.is_empty();
+            if change.status == FileStatus::Deleted
+                || (change.status != FileStatus::Added && edited)
+            {
                 let line = change
                     .added
                     .iter()
@@ -44,10 +49,14 @@ pub fn scan(session: &Session, runners: &[Runner]) -> anyhow::Result<Vec<Finding
         }
         let old_path = change.old_path.as_deref();
         let new_path = change.new_path.as_deref();
-        let role_path = new_path.or(old_path).unwrap_or_default();
+        // A test file renamed to a name the runner does not collect loses its tests.
+        let is_test = |p: &str| matches!(classifier.role(p), Role::Test { .. });
+        let new_is_test = new_path.is_some_and(is_test);
+        let role_path = if new_is_test { new_path } else { old_path }.unwrap_or_default();
         let Role::Test { runner } = classifier.role(role_path) else {
             continue;
         };
+        let new_path = new_path.filter(|_| new_is_test);
         let Some(lang) = Lang::of(role_path) else {
             continue;
         };
@@ -88,14 +97,8 @@ fn tests_of<'a>(
     source: &'a str,
     style: lang::PythonStyle,
 ) -> BTreeMap<String, Test<'a>> {
-    let offsets = line_offsets(source);
     let mut out = BTreeMap::new();
     for def in lang::find_tests(lang, source, style) {
-        let start = offsets[(def.line - 1) as usize];
-        let end = offsets
-            .get(def.end_line as usize)
-            .copied()
-            .unwrap_or(source.len());
         let mut key = def.suite.clone();
         key.push(def.name.clone());
         let mut key = key.join(" > ");
@@ -103,21 +106,10 @@ fn tests_of<'a>(
         while out.contains_key(&key) {
             key.push('\'');
         }
-        out.insert(
-            key,
-            Test {
-                def,
-                text: &source[start..end],
-            },
-        );
+        let text = &source[def.start_byte..def.end_byte];
+        out.insert(key, Test { def, text });
     }
     out
-}
-
-fn line_offsets(source: &str) -> Vec<usize> {
-    let mut offsets = vec![0];
-    offsets.extend(source.match_indices('\n').map(|(i, _)| i + 1));
-    offsets
 }
 
 /// Findings for one test file, from its base and head contents.
@@ -144,9 +136,6 @@ pub fn compare(
     }
     for (key, new) in &after {
         let old = before.get(key);
-        if old.is_some_and(|o| o.text == new.text) {
-            continue;
-        }
         let at = |kind, message: String| Finding {
             kind,
             file: file.to_string(),
@@ -164,7 +153,10 @@ pub fn compare(
                 format!("adds {}", list.join(", ")),
             ));
         }
-        let Some(old) = old else { continue };
+        // An unchanged test can still gain a skip, through an enclosing describe.skip.
+        let Some(old) = old.filter(|o| o.text != new.text) else {
+            continue;
+        };
         let (old_count, new_count) = (assertions(lang, old.text), assertions(lang, new.text));
         if new_count < old_count {
             findings.push(at(
@@ -201,18 +193,51 @@ pub fn compare(
                 format!("replaces {} with {}", lost.join(", "), gained.join(", ")),
             ));
         }
-        if new.text.contains("toMatchInlineSnapshot(")
-            && old.text != new.text
-            && inline_snapshots(old.text) != inline_snapshots(new.text)
-        {
+        if inline_snapshots(old.text) != inline_snapshots(new.text) {
             findings.push(at(
                 FindingKind::SnapshotChanged,
                 "an inline snapshot changed; check that the new output is intended".to_string(),
             ));
         }
     }
+    for (pattern, what) in file_markers(lang) {
+        let (was, now) = (
+            pattern.find_iter(base).count(),
+            pattern.find_iter(head).count(),
+        );
+        if now > was {
+            let line = pattern
+                .find_iter(head)
+                .last()
+                .map_or(1, |m| head[..m.start()].matches('\n').count() as u32 + 1);
+            findings.push(Finding {
+                kind: FindingKind::SkipAdded,
+                file: file.to_string(),
+                line,
+                test: None,
+                message: format!("adds {what}"),
+            });
+        }
+    }
     findings.sort_by_key(|f| (f.line, f.kind as u8));
     findings
+}
+
+static PY_PYTESTMARK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^pytestmark\s*=.*\b(skip|skipif|xfail)\b").unwrap());
+static TS_SUITE_ONLY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(describe|suite)\s*\.\s*only\b").unwrap());
+
+/// Markers that act on a whole file or suite rather than on one test.
+fn file_markers(lang: Lang) -> Vec<(&'static Regex, &'static str)> {
+    if lang.is_python() {
+        vec![(&PY_PYTESTMARK, "a module-level pytestmark skip or xfail")]
+    } else {
+        vec![(
+            &TS_SUITE_ONLY,
+            "describe.only, which skips every other suite in the file",
+        )]
+    }
 }
 
 static PY_SKIP_DECORATOR: LazyLock<Regex> = LazyLock::new(|| {
@@ -221,7 +246,7 @@ static PY_SKIP_DECORATOR: LazyLock<Regex> = LazyLock::new(|| {
 static PY_SKIP_CALL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(pytest\.skip|self\.skipTest|pytest\.xfail)\(").unwrap());
 static TS_MODIFIER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*[\w$]+((?:\.[\w$]+)*)").unwrap());
+    LazyLock::new(|| Regex::new(r"^\s*[\w$]+((?:\s*\.\s*[\w$]+)*)").unwrap());
 
 /// Skip, xfail, only, and todo markers on a test.
 fn markers(lang: Lang, test: &Test) -> BTreeSet<String> {
@@ -243,7 +268,7 @@ fn markers(lang: Lang, test: &Test) -> BTreeSet<String> {
         return out;
     }
     if let Some(caps) = TS_MODIFIER.captures(test.text) {
-        for m in caps[1].split('.').filter(|m| !m.is_empty()) {
+        for m in caps[1].split('.').map(str::trim).filter(|m| !m.is_empty()) {
             if matches!(m, "only" | "skip" | "todo" | "fails" | "skipIf" | "runIf") {
                 out.insert(m.to_string());
             }
@@ -381,13 +406,20 @@ fn is_weak(matcher: &str) -> bool {
     )
 }
 
-static INLINE_SNAPSHOT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)toMatchInlineSnapshot\((.*?)\)\s*;?").unwrap());
+static INLINE_SNAPSHOT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?s)toMatchInlineSnapshot\(\s*(`(?:[^`\\]|\\.)*`|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')?"#,
+    )
+    .unwrap()
+});
 
+/// The inline snapshot arguments, read as whole string or template literals, outside
+/// comments.
 fn inline_snapshots(text: &str) -> Vec<String> {
+    let text = strip_comments(Lang::TypeScript, text);
     INLINE_SNAPSHOT
-        .captures_iter(text)
-        .map(|c| c[1].to_string())
+        .captures_iter(&text)
+        .map(|c| c.get(1).map(|m| m.as_str().to_string()).unwrap_or_default())
         .collect()
 }
 
@@ -531,6 +563,58 @@ def test_new_and_marked():
                 (FindingKind::SkipAdded, "s > later".into()),
             ]
         );
+    }
+
+    #[test]
+    fn skips_from_enclosing_suites_and_files_are_findings() {
+        let base = "describe(\"s\", () => {\n  it(\"a\", () => { expect(1).toBe(1); });\n});\ndescribe(\"t\", () => {\n  it(\"b\", () => { expect(1).toBe(1); }); it(\"c\", () => { expect(2).toBe(2); });\n});\n";
+        let head = "describe.skip(\"s\", () => {\n  it(\"a\", () => { expect(1).toBe(1); });\n});\ndescribe.only(\"t\", () => {\n  it(\"b\", () => { expect(1).toBe(1); }); it\n    .only(\"c\", () => {});\n});\n";
+        let findings = compare(
+            Lang::TypeScript,
+            PythonStyle::Pytest,
+            "a.test.ts",
+            base,
+            head,
+        );
+        assert_eq!(
+            kinds(&findings),
+            vec![
+                (FindingKind::SkipAdded, "s > a".into()),
+                (FindingKind::SkipAdded, "".into()),
+                (FindingKind::AssertionRemoved, "t > c".into()),
+                (FindingKind::SkipAdded, "t > c".into()),
+            ]
+        );
+        let py = compare(
+            Lang::Python,
+            PythonStyle::Pytest,
+            "test_a.py",
+            "def test_a():\n    assert 1\n",
+            "import pytest\npytestmark = pytest.mark.skip(reason=\"later\")\n\ndef test_a():\n    assert 1\n",
+        );
+        assert_eq!(kinds(&py), vec![(FindingKind::SkipAdded, "".into())]);
+    }
+
+    #[test]
+    fn inline_snapshots_compare_whole_literals_outside_comments() {
+        let base = "it(\"s\", () => {\n  expect(a()).toMatchInlineSnapshot(`a() first`);\n});\n";
+        let changed =
+            "it(\"s\", () => {\n  expect(a()).toMatchInlineSnapshot(`a() second`);\n});\n";
+        let commented = "it(\"s\", () => {\n  /* toMatchInlineSnapshot(\"no\") */\n  expect(a()).toMatchInlineSnapshot(`a() first`);\n});\n";
+        let kinds_of = |head| {
+            kinds(&compare(
+                Lang::TypeScript,
+                PythonStyle::Pytest,
+                "a.test.ts",
+                base,
+                head,
+            ))
+        };
+        assert_eq!(
+            kinds_of(changed),
+            vec![(FindingKind::SnapshotChanged, "s".into())]
+        );
+        assert_eq!(kinds_of(commented), vec![]);
     }
 
     #[test]

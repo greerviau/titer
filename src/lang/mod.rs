@@ -56,6 +56,9 @@ pub struct TestDef {
     pub report_line: u32,
     /// Statically skipped: `it.skip`, `it.todo`, `xit`, or inside `describe.skip`.
     pub skip: bool,
+    /// The byte span of the test, including decorators.
+    pub start_byte: usize,
+    pub end_byte: usize,
 }
 
 /// A function, method, or named arrow function.
