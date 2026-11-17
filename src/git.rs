@@ -10,6 +10,8 @@ use std::process::Command;
 
 use anyhow::{Context, bail};
 
+use crate::process;
+
 #[derive(Debug, Clone)]
 pub struct Git {
     root: PathBuf,
@@ -18,10 +20,9 @@ pub struct Git {
 impl Git {
     /// Opens the checkout that contains `cwd`.
     pub fn discover(cwd: &Path) -> anyhow::Result<Git> {
-        let out = base_command(cwd)
-            .args(["rev-parse", "--show-toplevel"])
-            .output()
-            .context("cannot run git")?;
+        let mut cmd = base_command(cwd);
+        cmd.args(["rev-parse", "--show-toplevel"]);
+        let out = process::output(cmd).context("cannot run git")?;
         if !out.status.success() {
             bail!(
                 "not a git checkout: {}",
@@ -61,7 +62,7 @@ impl Git {
         let mut cmd = self.command();
         cmd.args(args);
         let shown = format!("{cmd:?}");
-        let out = cmd.output().context("cannot run git")?;
+        let out = process::output(cmd).context("cannot run git")?;
         if !out.status.success() {
             bail!(
                 "{shown} failed: {}",
@@ -124,6 +125,13 @@ impl Git {
         if index.is_file() {
             std::fs::copy(&index, scratch_index)
                 .with_context(|| format!("cannot copy {}", index.display()))?;
+            // Keep the index's mtime. Git's racy-entry check compares entry times with it, and
+            // a fresh mtime would let a same-size edit made in the same second look clean.
+            let modified = std::fs::metadata(&index)?.modified()?;
+            std::fs::File::options()
+                .write(true)
+                .open(scratch_index)?
+                .set_modified(modified)?;
         } else {
             let _ = std::fs::remove_file(scratch_index);
         }
@@ -154,11 +162,9 @@ impl Git {
     /// The contents of `path` in `tree`, or None when the path does not exist there.
     pub fn read_blob(&self, tree: &str, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
         let spec = format!("{tree}:{path}");
-        let out = self
-            .command()
-            .args(["cat-file", "blob", &spec])
-            .output()
-            .context("cannot run git")?;
+        let mut cmd = self.command();
+        cmd.args(["cat-file", "blob", &spec]);
+        let out = process::output(cmd).context("cannot run git")?;
         Ok(out.status.success().then_some(out.stdout))
     }
 
@@ -199,9 +205,9 @@ fn base_command(cwd: &Path) -> Command {
     cmd
 }
 
-fn run_command(mut cmd: Command) -> anyhow::Result<String> {
+fn run_command(cmd: Command) -> anyhow::Result<String> {
     let shown = format!("{cmd:?}");
-    let out = cmd.output().context("cannot run git")?;
+    let out = process::output(cmd).context("cannot run git")?;
     if !out.status.success() {
         bail!(
             "{shown} failed: {}",

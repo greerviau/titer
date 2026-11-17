@@ -175,3 +175,50 @@ fn wait_until_dead(pid: i32) -> bool {
     }
     false
 }
+
+#[test]
+fn worktree_writes_never_follow_a_symlinked_dependency_dir() {
+    let repo = busy_repo();
+    let session = titer::session::Session::open(repo.path(), None).unwrap();
+    let head = titer::worktree::Worktree::create(
+        &session.git,
+        &session.head_tree,
+        &session.run_dir.join("head"),
+        &session.config.runners,
+    )
+    .unwrap();
+
+    let err = head
+        .write(".venv/lib/marker.txt", b"overwritten")
+        .unwrap_err();
+
+    assert!(err.to_string().contains("symlink"), "{err}");
+    let marker = std::fs::read_to_string(repo.path().join(".venv/lib/marker.txt")).unwrap();
+    assert_eq!(marker, "dep\n");
+}
+
+#[test]
+fn sigint_during_the_snapshot_kills_git_filters_too() {
+    let repo = busy_repo();
+    let pidfile = repo.scratch().join("filter.pids");
+    let filter = format!("sh -c 'echo $$ >> {}; sleep 300; cat'", pidfile.display());
+    repo.git(&["config", "filter.slow.clean", &filter]);
+    repo.write(".gitattributes", "*.slow filter=slow\n")
+        .write("data.slow", "x\n");
+    let mut child = repo.titer_cmd().args(["check", "--json"]).spawn().unwrap();
+    let pids = wait_for_pids(&pidfile, 1);
+
+    // SAFETY: signalling our own child process.
+    unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    let status = child.wait().unwrap();
+
+    assert_eq!(status.code(), Some(130));
+    for pid in pids {
+        assert!(wait_until_dead(pid), "filter {pid} survived SIGINT");
+    }
+    assert!(
+        repo.leftover_tmp().is_empty(),
+        "left {:?}",
+        repo.leftover_tmp()
+    );
+}

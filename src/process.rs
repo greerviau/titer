@@ -234,6 +234,37 @@ fn unique_stamp() -> String {
     format!("run{}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Runs `cmd` to completion in its own process group with piped output, like
+/// `Command::output`, so a signal kills it too. Used for git, whose filters and hooks can
+/// start their own children.
+pub fn output(mut cmd: Command) -> std::io::Result<std::process::Output> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let child = {
+        let mut state = state();
+        if state.shutting_down {
+            return Err(std::io::Error::other("titer is shutting down"));
+        }
+        let child = cmd.spawn()?;
+        state.groups.insert(child.id() as i32);
+        child
+    };
+    let pid = child.id() as i32;
+    let result = child.wait_with_output();
+    kill_group(pid, libc::SIGKILL);
+    let mut state = state();
+    if state.shutting_down {
+        drop(state);
+        loop {
+            std::thread::park();
+        }
+    }
+    state.groups.remove(&pid);
+    result
+}
+
 /// True while a process with this pid exists.
 pub fn pid_alive(pid: i32) -> bool {
     // SAFETY: signal 0 only checks for existence and permission.

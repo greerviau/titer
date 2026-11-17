@@ -54,8 +54,10 @@ impl Worktree {
         })
     }
 
-    /// Writes `contents` to the repo-relative `path`, replacing what is there.
+    /// Writes `contents` to the repo-relative `path`, replacing what is there. Refuses a path
+    /// under a symlinked dir, such as a dependency dir linked from the user's checkout.
     pub fn write(&self, path: &str, contents: &[u8]) -> anyhow::Result<()> {
+        self.check_inside(path)?;
         let target = self.path.join(path);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
@@ -68,12 +70,30 @@ impl Worktree {
             .with_context(|| format!("cannot write {}", target.display()))
     }
 
+    /// Fails when a dir on the way to `path` is a symlink, which could lead outside the
+    /// worktree.
+    fn check_inside(&self, path: &str) -> anyhow::Result<()> {
+        let mut dir = self.path.clone();
+        let parts: Vec<&str> = path.split('/').collect();
+        for part in &parts[..parts.len().saturating_sub(1)] {
+            dir.push(part);
+            if dir.is_symlink() {
+                anyhow::bail!(
+                    "refusing to write {path}: {} is a symlink out of the worktree",
+                    dir.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Copies `paths` from `tree` into this worktree, removing those that `tree` lacks.
     pub fn overlay(&self, git: &Git, tree: &str, paths: &[&str]) -> anyhow::Result<()> {
         for path in paths {
             match git.read_blob(tree, path)? {
                 Some(contents) => self.write(path, &contents)?,
                 None => {
+                    self.check_inside(path)?;
                     let _ = std::fs::remove_file(self.path.join(path));
                 }
             }
