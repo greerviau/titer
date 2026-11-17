@@ -8,6 +8,8 @@ pub mod exit;
 pub mod git;
 pub mod process;
 pub mod report;
+pub mod runner;
 pub mod session;
 pub mod tmp;
 pub mod worktree;
+pub mod xml;

@@ -892,6 +892,7 @@ dependencies = [
  "humantime",
  "jsonschema",
  "libc",
+ "regex",
  "schemars",
  "serde",
  "serde_json",
