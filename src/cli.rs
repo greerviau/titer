@@ -71,6 +71,9 @@ struct CheckArgs {
     /// A coverage file for CRAP: lcov, cobertura XML, or coverage.py JSON.
     #[arg(long)]
     coverage: Option<PathBuf>,
+    /// Also write a Markdown summary to this file, for a CI job summary.
+    #[arg(long)]
+    markdown: Option<PathBuf>,
 }
 
 fn parse_tier(text: &str) -> Result<Tier, String> {
@@ -163,6 +166,12 @@ fn run_check(args: CheckArgs) -> u8 {
             eprintln!("titer: {reason}");
         }
     }
+    if let Some(path) = &args.markdown
+        && let Err(e) = std::fs::write(path, render_markdown(&report))
+    {
+        eprintln!("titer: cannot write {}: {e}", path.display());
+        return exit::ERROR;
+    }
     let mut stdout = std::io::stdout().lock();
     let written = if args.json {
         serde_json::to_writer_pretty(&mut stdout, &report)
@@ -248,4 +257,114 @@ pub fn render_text(report: &Report) -> String {
         let _ = writeln!(out, "warning: {warning}");
     }
     out
+}
+
+/// A Markdown summary of a report, for a CI job summary.
+pub fn render_markdown(report: &Report) -> String {
+    use std::fmt::Write as _;
+
+    use crate::report::MutantOutcome;
+
+    let mut out = String::new();
+    let status = match report.gate.status {
+        GateStatus::Pass => "pass",
+        GateStatus::Fail => "fail",
+        GateStatus::Error => "error",
+    };
+    let _ = writeln!(out, "## titer: {status}\n");
+    for reason in &report.gate.reasons {
+        let _ = writeln!(out, "- {}", escape_md(reason));
+    }
+    if !report.tests.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n### Changed tests\n\n| Verdict | Test | File |\n|---|---|---|"
+        );
+        for t in &report.tests {
+            let verdict = t
+                .verdict
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_else(|| format!("head {:?}", t.head));
+            let _ = writeln!(
+                out,
+                "| {verdict} | {} | `{}:{}` |",
+                escape_md(&t.name),
+                t.file,
+                t.line
+            );
+        }
+    }
+    if !report.mutants.is_empty() {
+        let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+        for m in &report.mutants {
+            *counts.entry(format!("{:?}", m.outcome)).or_default() += 1;
+        }
+        let summary: Vec<String> = counts.iter().map(|(k, n)| format!("{k} {n}")).collect();
+        let _ = writeln!(out, "\n### Mutants\n\n{}\n", summary.join(", "));
+        let notable: Vec<_> = report
+            .mutants
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m.outcome,
+                    MutantOutcome::Survived | MutantOutcome::NotExecuted
+                )
+            })
+            .collect();
+        if !notable.is_empty() {
+            let _ = writeln!(out, "| Outcome | Line | Change |\n|---|---|---|");
+            for m in notable {
+                let _ = writeln!(
+                    out,
+                    "| {:?} | `{}:{}` | `{}` to `{}` |",
+                    m.outcome,
+                    m.file,
+                    m.line,
+                    escape_md(m.original.lines().next().unwrap_or_default().trim()),
+                    escape_md(m.replacement.lines().next().unwrap_or_default().trim())
+                );
+            }
+        }
+    }
+    if !report.findings.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n### Scan findings\n\n| Kind | Where | Detail |\n|---|---|---|"
+        );
+        for f in &report.findings {
+            let _ = writeln!(
+                out,
+                "| {:?} | `{}:{}` | {} |",
+                f.kind,
+                f.file,
+                f.line,
+                escape_md(&f.message)
+            );
+        }
+    }
+    let flagged: Vec<_> = report.crap.iter().filter(|c| c.flagged).collect();
+    if !flagged.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n### CRAP above the threshold\n\n| Score | Function |\n|---|---|"
+        );
+        for c in flagged {
+            let _ = writeln!(
+                out,
+                "| {:.1} | `{}` (`{}:{}`) |",
+                c.score.unwrap_or_default(),
+                c.function,
+                c.file,
+                c.line
+            );
+        }
+    }
+    for w in &report.warnings {
+        let _ = writeln!(out, "\n> warning: {}", escape_md(w));
+    }
+    out
+}
+
+fn escape_md(text: &str) -> String {
+    text.replace('|', "\\|").replace('\n', " ")
 }
