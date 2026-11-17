@@ -54,6 +54,7 @@ fn case(runner: &Runner, file: &str, suite: &[&str], name: &str) -> TestCase {
         id: runner.test_id(file, &suite, name, 1),
         suite,
         name: name.to_string(),
+        skip: false,
     }
 }
 

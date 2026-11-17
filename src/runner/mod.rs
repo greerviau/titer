@@ -2,6 +2,7 @@
 
 pub mod pytest;
 pub mod unittest;
+pub mod vitest;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,6 +26,9 @@ pub struct TestCase {
     pub name: String,
     /// The runner-native selector: a pytest node id, a unittest dotted id, or `file:line`.
     pub id: String,
+    /// Statically marked skipped, such as `it.skip`. vitest runs such a test when it is
+    /// selected by line, so its result is skipped whatever the runner reports.
+    pub skip: bool,
 }
 
 impl TestCase {
@@ -113,25 +117,22 @@ impl TestRun {
     /// The result for one selected test. Parametrized outcomes aggregate: any failure fails
     /// the test, and it passes only if some instance passed and none failed.
     pub fn result_for(&self, case: &TestCase, cwd: &str) -> CaseResult {
+        if case.skip {
+            return CaseResult::Skipped;
+        }
         let rel = cwd_relative(&case.file, cwd);
-        let mut matched = self
+        let mut matched: Vec<&TestOutcome> = self
             .outcomes
             .iter()
             .filter(|o| match &o.id {
                 Some(id) => id == &case.id,
                 None => o.name == case.name && o.suite == case.suite && same_file(&o.file, &rel),
             })
-            .collect::<Vec<_>>();
-        // Duplicate titles in one file: the reported line picks the test.
-        if matched.len() > 1 && matched.iter().all(|o| o.line.is_some()) {
-            let at_line: Vec<_> = matched
-                .iter()
-                .copied()
-                .filter(|o| o.line == Some(case.line))
-                .collect();
-            if !at_line.is_empty() {
-                matched = at_line;
-            }
+            .collect();
+        // When the runner reports lines (vitest), the line picks the test, so two tests with
+        // the same name in one file stay apart.
+        if matched.iter().all(|o| o.line.is_some()) {
+            matched.retain(|o| o.line == Some(case.line));
         }
         if let Some(failure) = matched.iter().find_map(|o| match &o.status {
             Status::Failed(f) => Some(f),
@@ -204,10 +205,7 @@ impl Runner {
         match self.config.kind {
             RunnerKind::Pytest => pytest::node_id(&rel, suite, name),
             RunnerKind::Unittest => unittest::test_id(&rel, &self.config.start_dir, suite, name),
-            RunnerKind::Vitest => {
-                let _ = line;
-                unimplemented!("adapter not yet available")
-            }
+            RunnerKind::Vitest => vitest::test_id(&rel, line),
         }
     }
 
@@ -216,9 +214,7 @@ impl Runner {
         match self.config.kind {
             RunnerKind::Pytest => pytest::run(self, req),
             RunnerKind::Unittest => unittest::run(self, req),
-            RunnerKind::Vitest => {
-                anyhow::bail!("{} adapter not yet available", self.config.kind.name())
-            }
+            RunnerKind::Vitest => vitest::run(self, req),
         }
     }
 
