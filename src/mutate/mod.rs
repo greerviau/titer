@@ -608,7 +608,12 @@ fn follow_up(
     };
     // One sentinel per surviving line.
     let mut lines: Vec<(usize, String, u32)> = Vec::new();
+    // A sentinel probes one line, so a mutant that spans lines, such as a multi-line agent
+    // mutant, skips this step and stays a survivor.
     for i in survivors(mutants) {
+        if mutants[i].end_line != mutants[i].line {
+            continue;
+        }
         let key = (pairs[i].1.runner, mutants[i].file.clone(), mutants[i].line);
         if !lines.contains(&key) {
             lines.push(key);
@@ -640,7 +645,11 @@ fn follow_up(
             continue;
         }
         for m in mutants.iter_mut() {
-            if &m.file == file && m.line == *line && m.outcome == MutantOutcome::Survived {
+            if &m.file == file
+                && m.line == *line
+                && m.end_line == *line
+                && m.outcome == MutantOutcome::Survived
+            {
                 m.outcome = MutantOutcome::NotExecuted;
             }
         }
