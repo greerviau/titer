@@ -1,0 +1,24 @@
+{
+  "repos": {
+    "click": {
+      "url": "https://github.com/pallets/click.git",
+      "runner": "[[runner]]\nkind = \"pytest\"\ncommand = [\"{python}\", \"-m\", \"pytest\"]\nenv = { PYTHONPATH = \"src\" }\n"
+    },
+    "ufo": {
+      "url": "https://github.com/unjs/ufo.git",
+      "runner": "[[runner]]\nkind = \"vitest\"\ncommand = [\"node_modules/.bin/vitest\", \"run\"]\n"
+    }
+  },
+  "prs": [
+    {"repo": "click", "pr": 3678, "merge": "b67832c", "title": "Fix parsing when a parameter is named help"},
+    {"repo": "click", "pr": 3208, "merge": "0cd28d6", "title": "Fix help hint showing shadowed option name"},
+    {"repo": "click", "pr": 3299, "merge": "1458800", "title": "Fix speculative empty string check"},
+    {"repo": "click", "pr": 3021, "merge": "8533c96", "title": "Fix rendering when prompt_suffix is empty"},
+    {"repo": "click", "pr": 2935, "merge": "b7cf069", "title": "Fix shell completion for nested groups"},
+    {"repo": "ufo", "pr": 335, "merge": "5cd9e67", "title": "fix(withoutBase): collapse leading slashes"},
+    {"repo": "ufo", "pr": 313, "merge": "eb29945", "title": "fix(withBase, withoutBase): prevent false prefix matches"},
+    {"repo": "ufo", "pr": 284, "merge": "7959de5", "title": "fix(parseFilename): use optional chaining to access opts.strict"},
+    {"repo": "ufo", "pr": 286, "merge": "4d024df", "title": "fix(parseQuery): use object with null prototype"},
+    {"repo": "ufo", "pr": 242, "merge": "62199a0", "title": "fix(withProtocol): consider relative protocol"}
+  ]
+}

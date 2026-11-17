@@ -1,0 +1,165 @@
+mod common;
+
+use common::{Fixture, assert_schema_valid, fixture_python, stdout_json};
+use serde_json::Value;
+
+const CLAMP_BASE: &str = "def clamp(x, hi):\n    return x\n";
+const CLAMP_HEAD: &str = "def clamp(x, hi):\n    if x > hi:\n        return hi\n    return x\n";
+const CLAMP_TEST: &str = "from app import clamp\n\n\ndef test_clamps_high_values():\n    assert clamp(5, 3) == 3\n\n\ndef test_keeps_low_values():\n    assert clamp(1, 3) == 1\n";
+
+fn repo(budget: &str) -> Fixture {
+    let repo = Fixture::new();
+    repo.write(
+        "titer.toml",
+        &format!(
+            "[[runner]]\nkind = \"pytest\"\ncommand = [\"{}\", \"-m\", \"pytest\"]\n\n[mutate]\nbudget = \"{budget}\"\n",
+            fixture_python()
+        ),
+    )
+    .write("app.py", CLAMP_BASE)
+    .write("other.py", "def untouched():\n    return 1\n");
+    repo.commit_all("base");
+    repo.git(&["checkout", "-q", "-b", "fix"]);
+    repo
+}
+
+fn outcomes(report: &Value) -> Vec<(u64, String, String, String)> {
+    report["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["line"].as_u64().unwrap(),
+                m["operator"].as_str().unwrap().to_string(),
+                m["replacement"].as_str().unwrap().to_string(),
+                m["outcome"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn mutants_on_changed_lines_are_killed_or_survive() {
+    let repo = repo("120s");
+    repo.write("app.py", CLAMP_HEAD)
+        .write("test_app.py", CLAMP_TEST);
+    let before = repo.checkout_state();
+
+    let output = repo.titer(&["check", "--json", "--only", "mutate", "--workers", "2"]);
+
+    let report = stdout_json(&output);
+    assert_schema_valid(&report);
+    assert_eq!(output.status.code(), Some(0), "{report:#}");
+    let mut got = outcomes(&report);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            (
+                2,
+                "negate_if".into(),
+                "not (x > hi)".into(),
+                "killed".into()
+            ),
+            (2, "swap_comparison".into(), ">=".into(), "survived".into()),
+            (
+                3,
+                "return_none".into(),
+                "return None".into(),
+                "killed".into()
+            ),
+        ]
+    );
+    let killed = report["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["outcome"] == "killed")
+        .unwrap();
+    assert!(
+        killed["killed_by"]
+            .as_str()
+            .unwrap()
+            .starts_with("test_app.py::"),
+        "{killed:#}"
+    );
+    assert_eq!(report["timing"]["workers"], 2);
+    assert_eq!(repo.checkout_state(), before);
+    assert!(repo.leftover_tmp().is_empty());
+}
+
+#[test]
+fn modules_the_tests_never_load_are_not_executed() {
+    let repo = repo("120s");
+    repo.write("app.py", CLAMP_HEAD)
+        .write("test_app.py", CLAMP_TEST)
+        .write("other.py", "def untouched():\n    return 2\n");
+
+    let output = repo.titer(&["check", "--json", "--only", "mutate"]);
+
+    let report = stdout_json(&output);
+    let other: Vec<&Value> = report["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["file"] == "other.py")
+        .collect();
+    assert_eq!(other.len(), 2, "{report:#}");
+    assert!(
+        other.iter().all(|m| m["outcome"] == "not_executed"),
+        "{report:#}"
+    );
+    assert!(report["warnings"][0].as_str().unwrap().contains("other.py"));
+}
+
+#[test]
+fn a_canary_that_survives_everywhere_exits_2() {
+    let repo = repo("120s");
+    repo.write("test_app.py", "def test_unrelated():\n    assert True\n")
+        .write("other.py", "def untouched():\n    return 2\n");
+
+    let output = repo.titer(&["check", "--json", "--only", "mutate"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let report = stdout_json(&output);
+    assert!(
+        report["gate"]["reasons"][0]
+            .as_str()
+            .unwrap()
+            .contains("canary"),
+        "{report:#}"
+    );
+}
+
+#[test]
+fn without_changed_tests_the_suite_runs_against_mutants() {
+    let repo = repo("120s");
+    repo.write("test_app.py", CLAMP_TEST);
+    repo.commit_all("tests first");
+    repo.write("app.py", CLAMP_HEAD);
+    repo.git(&["checkout", "-q", "-b", "fix2"]);
+
+    let output = repo.titer(&["check", "--json", "--only", "mutate", "--base", "HEAD"]);
+
+    let report = stdout_json(&output);
+    assert_eq!(output.status.code(), Some(0), "{report:#}");
+    let killed = outcomes(&report).iter().filter(|o| o.3 == "killed").count();
+    assert_eq!(killed, 2, "{report:#}");
+}
+
+#[test]
+fn mutants_past_the_budget_are_not_run() {
+    let repo = repo("1ms");
+    repo.write("app.py", CLAMP_HEAD)
+        .write("test_app.py", CLAMP_TEST);
+
+    let output = repo.titer(&["check", "--json", "--only", "mutate"]);
+
+    let report = stdout_json(&output);
+    assert_eq!(output.status.code(), Some(0), "{report:#}");
+    assert!(
+        outcomes(&report).iter().all(|o| o.3 == "not_run"),
+        "{report:#}"
+    );
+}

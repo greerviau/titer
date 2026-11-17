@@ -220,3 +220,28 @@ fn files_and_suite_select_whole_modules() {
     assert_eq!(suite.executed(), 4);
     assert_eq!(suite.file_errors.len(), 1);
 }
+
+#[test]
+fn a_non_import_error_while_loading_a_module_fails_its_tests() {
+    let repo = fixture();
+    // Raises TypeError at import time, which unittest's loader does not catch.
+    repo.write(
+        "api/app/core.py",
+        "LIMIT = max(None, None)\n\ndef get(d):\n    return d[\"exclude\"]\n",
+    );
+    let runner = runner();
+    let cases = vec![case(
+        &runner,
+        "api/tests/test_login.py",
+        "LoginTests",
+        "test_ok",
+    )];
+
+    let run = run(&repo, &runner, Selection::Tests(&cases), false);
+
+    let CaseResult::Failed(failure) = run.result_for(&cases[0], "api") else {
+        panic!("{run:?}")
+    };
+    assert_eq!(failure.exception_type.as_deref(), Some("TypeError"));
+    assert_eq!(failure.kind, FailureKind::Exception);
+}

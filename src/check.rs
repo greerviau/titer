@@ -5,6 +5,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::detect::{self, Detection};
+use crate::mutate;
 use crate::process;
 use crate::prove::{self, HeadRun};
 use crate::report::{Gate, Report, Tier};
@@ -72,10 +73,11 @@ pub fn run(cwd: &Path, options: &CheckOptions) -> anyhow::Result<Report> {
     report.not_analyzed = ctx.detection.not_analyzed.clone();
 
     if ctx.wants(Tier::Prove) || ctx.wants(Tier::Mutate) {
-        let heads = head_tier(&ctx, &mut report)?;
-        if let Some(heads) = heads
-            && ctx.wants(Tier::Prove)
-        {
+        let Some((heads, head)) = head_tier(&ctx, &mut report)? else {
+            report.timing.total_ms = elapsed_ms(started);
+            return Ok(report);
+        };
+        if ctx.wants(Tier::Prove) {
             let tier_started = Instant::now();
             let base = Worktree::create(
                 &ctx.session.git,
@@ -93,6 +95,18 @@ pub fn run(cwd: &Path, options: &CheckOptions) -> anyhow::Result<Report> {
             report.tests = prove::prove(&ctx.session, &ctx.runners, &ctx.detection, &heads, &base)?;
             report.timing.prove_ms = Some(elapsed_ms(tier_started));
         }
+        if ctx.wants(Tier::Mutate) {
+            let tier_started = Instant::now();
+            match mutate::run(&ctx, &heads, head, Vec::new()) {
+                Ok(mutation) => {
+                    report.mutants = mutation.mutants;
+                    report.warnings.extend(mutation.warnings);
+                    report.timing.workers = Some(mutation.workers);
+                }
+                Err(e) => report.gate = Gate::error(format!("{e:#}")),
+            }
+            report.timing.mutate_ms = Some(elapsed_ms(tier_started));
+        }
     }
     report.timing.total_ms = elapsed_ms(started);
     Ok(report)
@@ -100,26 +114,31 @@ pub fn run(cwd: &Path, options: &CheckOptions) -> anyhow::Result<Report> {
 
 /// Runs the changed tests on head. Returns None, with the gate set to error, when a changed
 /// test fails on head.
-fn head_tier(ctx: &Context, report: &mut Report) -> anyhow::Result<Option<Vec<HeadRun>>> {
+fn head_tier(
+    ctx: &Context,
+    report: &mut Report,
+) -> anyhow::Result<Option<(Vec<HeadRun>, Worktree)>> {
     let head = Worktree::create(
         &ctx.session.git,
         &ctx.session.head_tree,
         &ctx.session.run_dir.join("head"),
         &ctx.session.config.runners,
     )?;
+    // The budget limits mutants, not the head run that everything else needs.
+    let head_timeout = ctx.budget.max(Duration::from_secs(300));
     let heads = prove::run_head(
         &ctx.session,
         &ctx.runners,
         &ctx.detection,
         &head,
-        ctx.remaining(),
+        head_timeout,
     )?;
     let red: Vec<String> = heads
         .iter()
         .flat_map(|h| h.red().into_iter().map(|c| c.id.clone()))
         .collect();
     if red.is_empty() {
-        return Ok(Some(heads));
+        return Ok(Some((heads, head)));
     }
     report.tests = heads
         .iter()
