@@ -64,7 +64,8 @@ pub enum Status {
 pub struct TestOutcome {
     /// The runner-native id, when the runner reports one that matches [`TestCase::id`].
     pub id: Option<String>,
-    /// The path as the runner reported it; any of repo-, cwd-, or rootdir-relative, or absolute.
+    /// The path as the runner reported it (repo-, cwd-, or rootdir-relative, or absolute), or
+    /// cwd-relative with a leading `./`.
     pub file: String,
     pub suite: Vec<String>,
     /// The test name without parameters.
@@ -77,7 +78,7 @@ pub struct TestOutcome {
 /// A failure that stopped a whole file from loading, such as an import error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileError {
-    /// The path as the runner reported it.
+    /// The path as the runner reported it, or cwd-relative with a leading `./`.
     pub file: String,
     pub failure: Failure,
 }
@@ -260,11 +261,14 @@ pub fn cwd_relative(file: &str, cwd: &str) -> String {
         .to_string()
 }
 
-/// True when two paths name the same file, allowing one to be relative to a parent of the
-/// other's root. Runners report paths relative to different roots.
+/// True when two paths name the same file. A reported path that starts with `./` is
+/// cwd-relative and must match exactly. Other reported paths may be relative to another
+/// root, such as pytest's rootdir, or absolute, so they match by whole-component suffix.
 pub fn same_file(reported: &str, expected: &str) -> bool {
-    let reported = reported.trim_start_matches("./");
     let expected = expected.trim_start_matches("./");
+    if let Some(exact) = reported.strip_prefix("./") {
+        return exact == expected;
+    }
     reported == expected
         || reported.ends_with(&format!("/{expected}"))
         || expected.ends_with(&format!("/{reported}"))
@@ -289,6 +293,8 @@ mod tests {
         assert!(same_file("/abs/repo/tests/test_a.py", "tests/test_a.py"));
         assert!(!same_file("tests/test_ab.py", "tests/test_a.py"));
         assert!(!same_file("xtests/test_a.py", "tests/test_a.py"));
+        assert!(same_file("./src/a.test.ts", "src/a.test.ts"));
+        assert!(!same_file("./src/sub/a.test.ts", "a.test.ts"));
     }
 
     #[test]

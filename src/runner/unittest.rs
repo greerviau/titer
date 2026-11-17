@@ -33,12 +33,13 @@ pub fn test_id(rel: &str, start_dir: &str, suite: &[String], name: &str) -> Stri
     parts.join(".")
 }
 
+/// The cwd-relative file of a dotted module, marked exact with a leading `./`.
 fn module_path(module: &str, start_dir: &str) -> String {
     let path = format!("{}.py", module.replace('.', "/"));
     if start_dir == "." {
-        path
+        format!("./{path}")
     } else {
-        format!("{start_dir}/{path}")
+        format!("./{start_dir}/{path}")
     }
 }
 
@@ -179,7 +180,10 @@ fn parse(stderr: &str, start_dir: &str) -> Parsed {
     let failures = sections(&lines);
     let mut parsed = Parsed::default();
     for id in order {
-        let status = statuses.get(&id).map(String::as_str).unwrap_or("ok");
+        // A test with no status line never finished, for example when the process died.
+        let Some(status) = statuses.get(&id).map(String::as_str) else {
+            continue;
+        };
         if id.starts_with("unittest.loader._FailedTest.") {
             if let Some((_, failure, body)) = failures.iter().find(|(fid, _, _)| fid == &id) {
                 if let Some(caps) = IMPORT_FAILURE.captures(body) {
@@ -346,6 +350,7 @@ test_skip (test_login.LoginTests.test_skip) ... skipped 'nope'
 test_sub (test_login.LoginTests.test_sub) ...
   test_sub (test_login.LoginTests.test_sub) (i=1) ... FAIL
 test_old (test_login.OldStyle) ... ok
+test_died (test_login.LoginTests.test_died) ... 
 test_broken (unittest.loader._FailedTest.test_broken) ... ERROR
 test_nope (unittest.loader._FailedTest.test_nope) ... ERROR
 
@@ -442,7 +447,7 @@ FAILED (failures=2, errors=3, skipped=1)
             ]
         );
         assert_eq!(parsed.file_errors.len(), 1);
-        assert_eq!(parsed.file_errors[0].file, "tests/test_broken.py");
+        assert_eq!(parsed.file_errors[0].file, "./tests/test_broken.py");
         assert_eq!(
             parsed.file_errors[0].failure.exception_type.as_deref(),
             Some("ImportError")
@@ -457,6 +462,6 @@ FAILED (failures=2, errors=3, skipped=1)
             "pkg.test_a.A.test_x"
         );
         assert_eq!(module_name("test_a.py", "."), "test_a");
-        assert_eq!(module_path("pkg.test_a", "tests"), "tests/pkg/test_a.py");
+        assert_eq!(module_path("pkg.test_a", "tests"), "./tests/pkg/test_a.py");
     }
 }
