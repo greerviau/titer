@@ -8,6 +8,10 @@ use std::process::{Command, Output};
 /// A throwaway git repo built inside a test.
 pub struct Fixture {
     dir: tempfile::TempDir,
+    /// TITER_TMPDIR for runs in this fixture, so tests can check that runs clean up.
+    tmp: tempfile::TempDir,
+    /// Scratch space outside the repo, such as for linked worktrees.
+    scratch: tempfile::TempDir,
 }
 
 impl Fixture {
@@ -16,13 +20,55 @@ impl Fixture {
             .prefix("titer-fixture-")
             .tempdir()
             .expect("create fixture dir");
-        let fixture = Fixture { dir };
+        let tmp = tempfile::Builder::new()
+            .prefix("titer-tmp-")
+            .tempdir()
+            .expect("create titer tmp dir");
+        let scratch = tempfile::Builder::new()
+            .prefix("titer-scratch-")
+            .tempdir()
+            .expect("create scratch dir");
+        let fixture = Fixture { dir, tmp, scratch };
         fixture.git(&["init", "-q", "-b", "main"]);
         fixture
     }
 
     pub fn path(&self) -> &Path {
         self.dir.path()
+    }
+
+    pub fn scratch(&self) -> &Path {
+        self.scratch.path()
+    }
+
+    pub fn titer_tmp(&self) -> &Path {
+        self.tmp.path()
+    }
+
+    /// Entries left in TITER_TMPDIR.
+    pub fn leftover_tmp(&self) -> Vec<String> {
+        std::fs::read_dir(self.titer_tmp())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Everything a run must leave unchanged: status, index bytes, stash, worktrees, and refs.
+    pub fn checkout_state(&self) -> Vec<String> {
+        let index = std::fs::read(self.path().join(".git/index")).unwrap_or_default();
+        vec![
+            self.git(&[
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v2",
+                "--untracked-files=all",
+                "--ignored",
+            ]),
+            format!("{:x?}", index),
+            self.git(&["stash", "list", "--format=%H %gs"]),
+            self.git(&["worktree", "list", "--porcelain"]),
+            self.git(&["for-each-ref", "--format=%(refname) %(objectname)"]),
+        ]
     }
 
     pub fn write(&self, rel: &str, contents: &str) -> &Fixture {
@@ -56,7 +102,13 @@ impl Fixture {
 
     /// Runs the titer binary in the fixture.
     pub fn titer(&self, args: &[&str]) -> Output {
-        titer_command(self.path()).args(args).output().unwrap()
+        self.titer_cmd().args(args).output().unwrap()
+    }
+
+    pub fn titer_cmd(&self) -> Command {
+        let mut cmd = titer_command(self.path());
+        cmd.env("TITER_TMPDIR", self.titer_tmp());
+        cmd
     }
 }
 
