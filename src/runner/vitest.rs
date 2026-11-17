@@ -122,7 +122,7 @@ static ANSI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-9;?]*[ -/]
 static MISSING_FILE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Couldn't find file (\S+?)\.? Note").unwrap());
 static NO_TEST_AT_LINE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"No test found in (\S+) in line (\d+)").unwrap());
+    LazyLock::new(|| Regex::new(r"No test found in (\S+) in lines? (\d+(?:, \d+)*)").unwrap());
 static ERROR_TYPE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([A-Za-z_$][\w$]*(?:Error|Exception))(?::|$)").unwrap());
 
@@ -165,7 +165,9 @@ fn parse(json: &str, selected: Option<&[(String, u32)]>, roots: &[std::path::Pat
         let line_errors: Vec<_> = NO_TEST_AT_LINE.captures_iter(&message).collect();
         if !line_errors.is_empty() {
             for caps in line_errors {
-                parsed.bad_lines.push(format!("{}:{}", &caps[1], &caps[2]));
+                for line in caps[2].split(", ") {
+                    parsed.bad_lines.push(format!("{}:{line}", &caps[1]));
+                }
             }
             continue;
         }
