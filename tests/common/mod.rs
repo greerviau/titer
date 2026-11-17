@@ -60,9 +60,24 @@ impl Fixture {
     }
 }
 
-/// A git command isolated from the user's and system config.
+/// Git variables that would point fixture commands at another repo or index, for example
+/// when the tests run inside a git hook.
+const GIT_REPO_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+];
+
+/// A git command isolated from the user's and system config and from any outer repo.
 pub fn git_command(cwd: &Path) -> Command {
     let mut cmd = Command::new("git");
+    for var in GIT_REPO_VARS {
+        cmd.env_remove(var);
+    }
     cmd.current_dir(cwd)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -75,6 +90,9 @@ pub fn git_command(cwd: &Path) -> Command {
 
 pub fn titer_command(cwd: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_titer"));
+    for var in GIT_REPO_VARS {
+        cmd.env_remove(var);
+    }
     cmd.current_dir(cwd)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
