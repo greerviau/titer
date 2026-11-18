@@ -73,7 +73,7 @@ pub fn run(cwd: &Path, dry_run: bool, update: bool) -> anyhow::Result<Plan> {
         let runners = detect_runners(&root)?;
         if runners.is_empty() {
             bail!(
-                "found no pytest, unittest, or vitest project; write titer.toml by hand (see the README)"
+                "found no pytest, unittest, or vitest project; write titer.toml by hand (see docs/configuration.md)"
             );
         }
         let text = render_config(&runners);
