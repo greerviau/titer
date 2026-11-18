@@ -163,3 +163,84 @@ fn mutants_past_the_budget_are_not_run() {
         "{report:#}"
     );
 }
+
+const LABEL_BASE: &str = "def label(x):\n    if x < 0:\n        return \"neg\"\n    return \"pos\"\n\n\ndef shout(s):\n    return s.upper()\n";
+const LABEL_HEAD: &str = "def label(x):\n    if x <= -1:\n        return \"neg\"\n    return \"pos\"\n\n\ndef shout(s):\n    return s.upper() + \"!\"\n";
+const LABEL_TEST_BASE: &str =
+    "from app import label\n\n\ndef test_minus_one_is_neg():\n    assert label(-1) == \"neg\"\n";
+
+#[test]
+fn survivors_split_into_not_executed_and_caught_by_other_tests() {
+    let repo = Fixture::new();
+    repo.write(
+        "titer.toml",
+        &format!(
+            "[[runner]]\nkind = \"pytest\"\ncommand = [\"{}\", \"-m\", \"pytest\"]\n",
+            fixture_python()
+        ),
+    )
+    .write("app.py", LABEL_BASE)
+    .write("test_app.py", LABEL_TEST_BASE);
+    repo.commit_all("base");
+    repo.git(&["checkout", "-q", "-b", "fix"]);
+    // The new test is weak: -5 stays negative under most mutants of line 2. The older test
+    // in the same file pins the -1 boundary. Nothing calls shout.
+    repo.write("app.py", LABEL_HEAD).write(
+        "test_app.py",
+        &format!(
+            "{LABEL_TEST_BASE}\n\ndef test_minus_five_is_neg():\n    assert label(-5) == \"neg\"\n"
+        ),
+    );
+
+    let output = repo.titer(&["check", "--json", "--only", "mutate"]);
+
+    let report = stdout_json(&output);
+    assert_eq!(output.status.code(), Some(0), "{report:#}");
+    let mut got = outcomes(&report);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            (
+                2,
+                "increment_int".into(),
+                "2".into(),
+                "caught_by_other".into()
+            ),
+            (
+                2,
+                "negate_if".into(),
+                "not (x <= -1)".into(),
+                "killed".into()
+            ),
+            (
+                2,
+                "swap_comparison".into(),
+                "<".into(),
+                "caught_by_other".into()
+            ),
+            (
+                8,
+                "return_none".into(),
+                "return None".into(),
+                "not_executed".into()
+            ),
+            (
+                8,
+                "swap_arithmetic".into(),
+                "-".into(),
+                "not_executed".into()
+            ),
+        ]
+    );
+    let caught = report["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["outcome"] == "caught_by_other")
+        .unwrap();
+    assert_eq!(
+        caught["killed_by"], "test_app.py::test_minus_one_is_neg",
+        "{caught:#}"
+    );
+}
