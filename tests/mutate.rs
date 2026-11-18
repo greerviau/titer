@@ -157,11 +157,12 @@ fn mutants_past_the_budget_are_not_run() {
     let output = repo.titer(&["check", "--json", "--only", "mutate"]);
 
     let report = stdout_json(&output);
-    assert_eq!(output.status.code(), Some(0), "{report:#}");
     assert!(
         outcomes(&report).iter().all(|o| o.3 == "not_run"),
         "{report:#}"
     );
+    // With only mutate run, mutants that never ran leave the change unproven.
+    assert_eq!(output.status.code(), Some(1), "{report:#}");
 }
 
 const LABEL_BASE: &str = "def label(x):\n    if x < 0:\n        return \"neg\"\n    return \"pos\"\n\n\ndef shout(s):\n    return s.upper()\n";

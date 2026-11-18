@@ -6,6 +6,7 @@ pub mod config;
 pub mod detect;
 pub mod diff;
 pub mod exit;
+pub mod gate;
 pub mod git;
 pub mod imports;
 pub mod lang;

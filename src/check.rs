@@ -5,6 +5,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::detect::{self, Detection};
+use crate::gate;
 use crate::mutate;
 use crate::process;
 use crate::prove::{self, HeadRun};
@@ -122,6 +123,8 @@ pub fn run(cwd: &Path, options: &CheckOptions) -> anyhow::Result<Report> {
             report.timing.mutate_ms = Some(elapsed_ms(tier_started));
         }
     }
+    let touches_source = !ctx.detection.sources.is_empty();
+    gate::evaluate(&mut report, &ctx.session.config.gate, touches_source);
     report.timing.total_ms = elapsed_ms(started);
     Ok(report)
 }
