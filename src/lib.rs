@@ -3,6 +3,7 @@
 pub mod check;
 pub mod cli;
 pub mod config;
+pub mod crap;
 pub mod detect;
 pub mod diff;
 pub mod exit;

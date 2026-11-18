@@ -308,6 +308,16 @@ impl Config {
                 )));
             }
         }
+        if config
+            .crap
+            .coverage_command
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+        {
+            return Err(ConfigError::Invalid(
+                "crap.coverage_command must not be empty".to_string(),
+            ));
+        }
         if config.crap.coverage_command.is_some() && config.crap.coverage_file.is_none() {
             return Err(ConfigError::Invalid(
                 "crap.coverage_command needs crap.coverage_file".to_string(),
