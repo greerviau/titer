@@ -13,6 +13,13 @@ pub const COMMENT_MARKER: &str = "<!-- titer-report -->";
 /// Items listed before the rest move into a collapsed section.
 const SHOWN: usize = 10;
 
+/// The longest base failure the changed tests table shows.
+const FAILURE_CHARS: usize = 200;
+
+/// Follows "this code" for a survivor whose mutated code is unchanged from base.
+const UNCHANGED: &str =
+    "is also in the base lines the change replaces, so it may predate the change";
+
 /// A Markdown summary. With `link_base`, such as
 /// `https://github.com/owner/repo/blob/<sha>`, file locations link to that commit. With
 /// `commit`, the heading names the commit checked, and a hidden marker records it so the
@@ -81,11 +88,16 @@ pub fn markdown(report: &Report, link_base: Option<&str>, commit: Option<&str>) 
     if !survivors.is_empty() {
         let _ = writeln!(
             out,
-            "\n**Survivors.** These edits to changed lines pass every changed test. Each is a missing test or noise, such as an equivalent edit; triage before you act.\n"
+            "\n**Survivors.** These edits to changed lines pass every changed test. Each may be a missing test, or noise such as an equivalent edit or code the change only moved.\n"
         );
         list(&mut out, &survivors, |m| {
+            let note = if m.unchanged_from_base {
+                format!(" (this code {UNCHANGED})")
+            } else {
+                String::new()
+            };
             format!(
-                "{}: {} to {}",
+                "{}: {} to {}{note}",
                 link(&m.file, m.line),
                 code(&m.original),
                 code(&m.replacement)
@@ -137,19 +149,40 @@ pub fn markdown(report: &Report, link_base: Option<&str>, commit: Option<&str>) 
             "\n<details><summary>Changed tests ({})</summary>\n",
             report.tests.len()
         );
-        let _ = writeln!(out, "| Result on base | Test | Where |\n|---|---|---|");
+        let _ = writeln!(
+            out,
+            "| Result on base | Test | Where | Failure on base |\n|---|---|---|---|"
+        );
         for t in &report.tests {
             let verdict = match (t.head, t.verdict) {
                 (HeadStatus::Red, _) => "fails on head".to_string(),
                 (_, Some(v)) => verdict_name(v).to_string(),
                 (_, None) => "-".to_string(),
             };
+            let failure = match (t.head, &t.message) {
+                (HeadStatus::Green, Some(m)) => cell(&code_span(&brief(m, FAILURE_CHARS))),
+                _ => "-".to_string(),
+            };
             let _ = writeln!(
                 out,
-                "| {verdict} | {} | {} |",
+                "| {verdict} | {} | {} | {failure} |",
                 escape(&t.name),
                 link(&t.file, t.line)
             );
+        }
+        let cut: Vec<_> = report
+            .tests
+            .iter()
+            .filter(|t| t.head == HeadStatus::Green)
+            .filter_map(|t| t.message.as_deref().map(|m| (t, m)))
+            .filter(|(_, m)| one_row(m).chars().count() > FAILURE_CHARS)
+            .collect();
+        if !cut.is_empty() {
+            out.push_str("\n<details><summary>Full base failures</summary>\n\n");
+            for (t, m) in cut {
+                let _ = writeln!(out, "{}:\n\n{}\n", escape(&t.name), code_block(m));
+            }
+            out.push_str("</details>\n");
         }
         out.push_str("\n</details>\n");
     }
@@ -201,7 +234,7 @@ pub fn markdown(report: &Report, link_base: Option<&str>, commit: Option<&str>) 
         .unwrap_or("?");
     let _ = writeln!(
         out,
-        "\n<sub>titer {} against `{base}` in {:.0} s. Proof is a changed test that fails on the base code; a killed mutant is an edit a changed test catches.</sub>",
+        "\n<sub>titer {} against `{base}` in {:.0} s. A test that fails on base detects a difference from base, not necessarily the intended one. A caught mutant is an edit to a changed line that makes a changed test fail.</sub>",
         report.titer_version,
         report.timing.total_ms as f64 / 1000.0
     );
@@ -236,49 +269,85 @@ fn headline(report: &Report) -> (&'static str, String) {
                 .iter()
                 .any(|r| r.starts_with("unproven")) =>
         {
-            let mut sentence = "No changed test fails on the base code, and no changed test catches an edit to the changed lines. The tests may not cover this change.".to_string();
+            let mut sentence = format!(
+                "{}. The tests may not cover this change.",
+                no_evidence(report)
+            );
             let others = reasons(true);
             if !others.is_empty() {
                 sentence.push_str(&format!(" The gate also failed on: {}.", others.join("; ")));
             }
-            ("unproven", sentence)
+            ("failed", sentence)
         }
         GateStatus::Fail => (
             "failed",
             format!("The gate failed on: {}.", reasons(false).join("; ")),
         ),
         GateStatus::Pass if proven > 0 => (
-            "proven",
+            "passed",
             format!(
-                "{proven} changed test{} fail{} on the base code, so {} would have caught the bug.",
+                "{proven} changed test{} fail{} on base and pass{} on head. Check under Changed tests that each base failure is the behavior the change targets.",
                 plural(proven),
                 if proven == 1 { "s" } else { "" },
-                if proven == 1 { "it" } else { "they" }
+                if proven == 1 { "es" } else { "" }
             ),
         ),
-        GateStatus::Pass if killed > 0 => (
-            "proven by mutation",
-            format!(
-                "No changed test fails on the base code, but the tests catch {killed} edit{} to the changed lines.",
+        GateStatus::Pass if killed > 0 => {
+            let caught = format!(
+                "the tests titer ran catch {killed} edit{} to the changed lines.",
                 plural(killed)
-            ),
-        ),
+            );
+            let sentence = if report.tiers.contains(&Tier::Prove) {
+                format!("No changed test fails on base, but {caught}")
+            } else {
+                capitalized(&caught)
+            };
+            ("passed", sentence)
+        }
         GateStatus::Pass
             if !report.tiers.contains(&Tier::Prove) && !report.tiers.contains(&Tier::Mutate) =>
         {
             let tiers: Vec<&str> = report.tiers.iter().map(|t| t.name()).collect();
             (
-                "pass",
+                "passed",
                 format!(
-                    "Only {} ran, so nothing here says whether the tests prove the change.",
+                    "Only {} ran, so this check says nothing about whether the tests cover the change.",
                     tiers.join(" and ")
                 ),
             )
         }
         GateStatus::Pass => (
-            "pass",
-            "Nothing in this change needs proof from tests.".to_string(),
+            "passed",
+            format!(
+                "{}, so this check says nothing about whether the tests cover the change.",
+                no_evidence(report)
+            ),
         ),
+    }
+}
+
+/// What the prove and mutate tiers that ran observed when neither found evidence, as the
+/// start of a sentence.
+fn no_evidence(report: &Report) -> String {
+    let mut parts = Vec::new();
+    if report.tiers.contains(&Tier::Prove) {
+        parts.push("no changed test fails on base");
+    }
+    if !report.tiers.contains(&Tier::Mutate) {
+        parts.push("the mutate tier did not run");
+    } else if report.mutants.is_empty() {
+        parts.push("titer made no mutants of the changed lines");
+    } else {
+        parts.push("no test titer ran catches an edit to the changed lines");
+    }
+    capitalized(&parts.join(", and "))
+}
+
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -423,10 +492,39 @@ fn plain(text: &str) -> String {
     }
 }
 
+/// All of `text` on one line, at most `max` characters. Lines are trimmed and joined with a
+/// space; spacing inside a line is kept, since it can be the difference a test reports.
+fn brief(text: &str, max: usize) -> String {
+    let line = one_row(text);
+    if line.chars().count() > max {
+        format!("{}...", line.chars().take(max - 3).collect::<String>())
+    } else {
+        line
+    }
+}
+
 /// An inline code span that shows the source exactly: its fence is longer than any run of
 /// backticks inside it.
 fn code(text: &str) -> String {
-    let text = plain(text);
+    code_span(&plain(text))
+}
+
+fn one_row(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A fenced code block that shows `text` exactly.
+fn code_block(text: &str) -> String {
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat((longest + 1).max(3));
+    format!("{fence}\n{text}\n{fence}")
+}
+
+fn code_span(text: &str) -> String {
     let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(longest + 1);
     let pad = if text.starts_with('`') || text.ends_with('`') {
@@ -503,9 +601,14 @@ pub fn annotations(report: &Report) -> String {
             m.line,
             "titer: survivor",
             &format!(
-                "Changing \"{}\" to \"{}\" here fails no changed test. Add a test if the behavior matters; leave it if the edit is equivalent.",
+                "Changing \"{}\" to \"{}\" here fails no changed test. Add a test if the behavior matters; leave it if the edit is equivalent.{}",
                 plain(&m.original),
-                plain(&m.replacement)
+                plain(&m.replacement),
+                if m.unchanged_from_base {
+                    format!(" This code {UNCHANGED}.")
+                } else {
+                    String::new()
+                }
             ),
         ));
     }
@@ -603,6 +706,7 @@ mod tests {
             outcome,
             killed_by: None,
             duration_ms: None,
+            unchanged_from_base: false,
         };
         r.mutants = vec![
             mutant(9, MutantOutcome::NotExecuted),
@@ -624,7 +728,7 @@ mod tests {
     fn markdown_leads_with_the_verdict_and_links_locations() {
         let text = markdown(&report(), Some("https://github.com/o/r/blob/abc"), None);
         assert!(text.starts_with(COMMENT_MARKER), "{text}");
-        assert!(text.contains("### titer: proven\n\n1 changed test fails on the base code, so it would have caught the bug."), "{text}");
+        assert!(text.contains("### titer: passed\n\n1 changed test fails on base and passes on head. Check under Changed tests that each base failure is the behavior the change targets."), "{text}");
         assert!(
             text.contains("- Changed tests: 1 of 1 fail on base."),
             "{text}"
@@ -672,7 +776,7 @@ mod tests {
         r.gate = crate::report::Gate::fail(vec!["unproven change: ...".into()]);
         let text = markdown(&r, None, None);
         assert!(
-            text.contains("### titer: unproven\n\nNo changed test fails on the base code"),
+            text.contains("### titer: failed\n\nNo changed test fails on base"),
             "{text}"
         );
         assert!(text.contains("app.py:2"), "{text}");
@@ -681,7 +785,7 @@ mod tests {
     #[test]
     fn the_heading_and_a_hidden_marker_name_the_commit() {
         let text = markdown(&report(), None, Some("4b986aa0123456789"));
-        assert!(text.starts_with("<!-- titer-report -->\n<!-- titer-commit: 4b986aa0123456789 -->\n### titer: proven for `4b986aa`\n"), "{text}");
+        assert!(text.starts_with("<!-- titer-report -->\n<!-- titer-commit: 4b986aa0123456789 -->\n### titer: passed for `4b986aa`\n"), "{text}");
         let unsafe_commit = markdown(&report(), None, Some("--> <b>"));
         assert!(
             !unsafe_commit.contains("titer-commit") && !unsafe_commit.contains("<b>"),
@@ -727,10 +831,130 @@ mod tests {
         );
         let mut scan_only = Report::new();
         scan_only.tiers = vec![Tier::Scan];
+        assert!(markdown(&scan_only, None, None).contains(
+            "Only scan ran, so this check says nothing about whether the tests cover the change."
+        ));
+    }
+
+    #[test]
+    fn the_changed_tests_table_shows_each_base_failure() {
+        let mut r = report();
+        r.tests[0].message =
+            Some("expect(element).toHaveAttribute(\"lang\", \"ja\")\nExpected:\n  lang=\"ja\"\nReceived:\n  lang=\"es\"".into());
+        let mut guard = r.tests[0].clone();
+        guard.name = "test_guard".into();
+        guard.verdict = Some(Verdict::PassesOnBase);
+        guard.message = None;
+        r.tests.push(guard);
+        let text = markdown(&r, None, None);
         assert!(
-            markdown(&scan_only, None, None).contains(
-                "Only scan ran, so nothing here says whether the tests prove the change."
-            )
+            text.contains("| Result on base | Test | Where | Failure on base |"),
+            "{text}"
+        );
+        assert!(
+            text.contains("| fails (assertion) | test\\_high | tests/test\\_app.py:4 | `expect(element).toHaveAttribute(\"lang\", \"ja\") Expected: lang=\"ja\" Received: lang=\"es\"` |"),
+            "{text}"
+        );
+        assert!(
+            text.contains("| passes | test\\_guard | tests/test\\_app.py:4 | - |"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn long_base_failures_are_cut_short() {
+        let mut r = report();
+        r.tests[0].message = Some("x".repeat(500));
+        let text = markdown(&r, None, None);
+        let row = text.lines().find(|l| l.contains("test\\_high")).unwrap();
+        assert!(row.contains(&format!("`{}...`", "x".repeat(197))), "{row}");
+    }
+
+    #[test]
+    fn survivors_on_code_that_is_also_in_base_say_so() {
+        let mut r = report();
+        r.mutants[2].unchanged_from_base = true;
+        let text = markdown(&r, None, None);
+        assert!(
+            text.contains("- app.py:2: `>` to `>=` (this code is also in the base lines the change replaces, so it may predate the change)"),
+            "{text}"
+        );
+        assert!(
+            annotations(&r).contains("This code is also in the base lines the change replaces, so it may predate the change."),
+            "{}",
+            annotations(&r)
+        );
+        r.mutants[2].unchanged_from_base = false;
+        assert!(!markdown(&r, None, None).contains("may predate"));
+    }
+
+    #[test]
+    fn a_pass_from_mutants_alone_says_what_it_rests_on() {
+        let mut r = report();
+        r.tests[0].verdict = Some(Verdict::PassesOnBase);
+        let text = markdown(&r, None, None);
+        assert!(
+            text.contains("### titer: passed\n\nNo changed test fails on base, but the tests titer ran catch 1 edit to the changed lines."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn headlines_claim_only_what_the_tiers_that_ran_observed() {
+        let mut r = report();
+        r.tests[0].verdict = Some(Verdict::PassesOnBase);
+        r.gate = crate::report::Gate::fail(vec!["unproven change: x".into()]);
+        r.tiers = vec![Tier::Prove];
+        r.mutants.clear();
+        assert!(
+            markdown(&r, None, None).contains("### titer: failed\n\nNo changed test fails on base, and the mutate tier did not run. The tests may not cover this change."),
+            "{}",
+            markdown(&r, None, None)
+        );
+        r.tiers = vec![Tier::Mutate];
+        r.mutants = report().mutants;
+        r.mutants.retain(|m| m.outcome != MutantOutcome::Killed);
+        assert!(
+            markdown(&r, None, None).contains("### titer: failed\n\nNo test titer ran catches an edit to the changed lines. The tests may not cover this change."),
+            "{}",
+            markdown(&r, None, None)
+        );
+        r.gate = crate::report::Gate::pass();
+        r.tiers = vec![Tier::Prove, Tier::Mutate];
+        r.mutants.clear();
+        assert!(
+            markdown(&r, None, None).contains("### titer: passed\n\nNo changed test fails on base, and titer made no mutants of the changed lines, so this check says nothing about whether the tests cover the change."),
+            "{}",
+            markdown(&r, None, None)
+        );
+        r.tiers = vec![Tier::Mutate];
+        r.mutants = report().mutants;
+        assert!(
+            markdown(&r, None, None).contains(
+                "### titer: passed\n\nThe tests titer ran catch 1 edit to the changed lines."
+            ),
+            "{}",
+            markdown(&r, None, None)
+        );
+    }
+
+    #[test]
+    fn base_failures_keep_their_spacing_and_long_ones_appear_in_full() {
+        let mut r = report();
+        r.tests[0].message = Some("ValueError: expected a b, got a  b\n    more".into());
+        let text = markdown(&r, None, None);
+        assert!(
+            text.contains("| `ValueError: expected a b, got a  b more` |"),
+            "{text}"
+        );
+        assert!(!text.contains("Full base failures"), "{text}");
+
+        let long = format!("{} wrong currency", "x".repeat(300));
+        r.tests[0].message = Some(long.clone());
+        let text = markdown(&r, None, None);
+        assert!(
+            text.contains(&format!("<details><summary>Full base failures</summary>\n\ntest\\_high:\n\n```\n{long}\n```\n")),
+            "{text}"
         );
     }
 }

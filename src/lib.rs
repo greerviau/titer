@@ -1,4 +1,4 @@
-//! titer: prove that a change's tests test the change.
+//! titer: check whether a change's tests test the change.
 
 pub mod check;
 pub mod cli;

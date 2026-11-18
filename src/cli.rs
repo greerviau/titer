@@ -15,7 +15,7 @@ use crate::report::{GateStatus, Report, Tier};
 #[command(
     name = "titer",
     version,
-    about = "Prove that a change's tests test the change."
+    about = "Check whether a change's tests test the change."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -33,7 +33,7 @@ enum Command {
         #[arg(long)]
         update: bool,
     },
-    /// Check that the tests in the change against the base ref prove the change.
+    /// Check whether the tests in the change against the base ref test the change.
     Check(CheckArgs),
     /// Print the report's JSON Schema.
     #[command(hide = true)]

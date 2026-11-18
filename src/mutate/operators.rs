@@ -18,6 +18,44 @@ pub struct Candidate {
     pub end_byte: usize,
     pub original: String,
     pub replacement: String,
+    /// The code the edit's meaning depends on, such as the whole comparison for an operator
+    /// swap. A mutant whose context is unchanged from base may predate the change.
+    pub context: CodeNode,
+}
+
+/// A syntax node, in a form that can be compared with nodes of the base file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeNode {
+    pub kind: String,
+    pub parent: Option<String>,
+    /// The texts of the node's leaf tokens. Whitespace between tokens is formatting and is
+    /// left out; whitespace inside a token, such as a string literal, is kept.
+    pub leaves: Vec<String>,
+}
+
+impl CodeNode {
+    pub fn of(node: Node, source: &str) -> CodeNode {
+        CodeNode {
+            kind: node.kind().to_string(),
+            parent: node.parent().map(|p| p.kind().to_string()),
+            leaves: leaves(node, source),
+        }
+    }
+}
+
+fn leaves(node: Node, source: &str) -> Vec<String> {
+    if node.child_count() == 0 {
+        let t = text(node, source);
+        return if t.is_empty() {
+            Vec::new()
+        } else {
+            vec![t.to_string()]
+        };
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .flat_map(|c| leaves(c, source))
+        .collect()
 }
 
 impl Candidate {
@@ -138,6 +176,7 @@ impl Gen<'_> {
             end_byte: node.end_byte(),
             original,
             replacement,
+            context: CodeNode::of(context(node, operator), self.source),
         });
     }
 
@@ -379,6 +418,36 @@ impl Gen<'_> {
     }
 }
 
+/// Parents that only wrap a literal, such as the `-` of `-1` or a call's argument list.
+const WRAPPERS: &[&str] = &[
+    "argument_list",
+    "arguments",
+    "parenthesized_expression",
+    "unary_operator",
+    "unary_expression",
+];
+
+/// The node a mutant's meaning depends on. An operator token means nothing without its
+/// operands, and a literal nothing without what uses it, so each widens to that; other
+/// mutants replace a whole construct already. A context matches base only with the same
+/// parent kind, which ties a negated condition to its `if`.
+fn context(node: Node, operator: Operator) -> Node {
+    let parent = node.parent().unwrap_or(node);
+    match operator {
+        Operator::SwapComparison | Operator::SwapBoolean | Operator::SwapArithmetic => parent,
+        Operator::FlipBool | Operator::IncrementInt => {
+            let mut user = parent;
+            while WRAPPERS.contains(&user.kind())
+                && let Some(next) = user.parent()
+            {
+                user = next;
+            }
+            user
+        }
+        _ => node,
+    }
+}
+
 fn swap_arithmetic(op: &str) -> Option<&'static str> {
     Some(match op {
         "+" => "-",
@@ -571,6 +640,48 @@ def g():
                 "7 JsxAttributeUndefined aria-label=\"go\" -> aria-label={undefined}",
             ]
         );
+    }
+
+    #[test]
+    fn mutants_carry_the_code_their_meaning_depends_on() {
+        let source =
+            "def f(xs, flag):\n    if not flag and len(xs) <= 3:\n        save(-1, True)\n";
+        let cands = generate(
+            Lang::Python,
+            source,
+            &lines(2..=3),
+            &CallFilter::default(),
+            &[],
+        );
+        let contexts: Vec<String> = cands
+            .iter()
+            .map(|c| {
+                format!(
+                    "{:?} {} in {}: {}",
+                    c.operator,
+                    c.context.kind,
+                    c.context.parent.as_deref().unwrap_or("-"),
+                    c.context.leaves.join(" ")
+                )
+            })
+            .collect();
+        assert_eq!(
+            contexts,
+            vec![
+                "RemoveNot not_operator in boolean_operator: not flag",
+                "NegateIf boolean_operator in if_statement: not flag and len ( xs ) <= 3",
+                "SwapBoolean boolean_operator in if_statement: not flag and len ( xs ) <= 3",
+                "SwapComparison comparison_operator in boolean_operator: len ( xs ) <= 3",
+                "IncrementInt comparison_operator in boolean_operator: len ( xs ) <= 3",
+                "RemoveCall expression_statement in block: save ( - 1 , True )",
+                "IncrementInt call in expression_statement: save ( - 1 , True )",
+                "FlipBool call in expression_statement: save ( - 1 , True )",
+            ]
+        );
+
+        let tsx = "const a = <p lang={lang} className={LARGE}>{text}</p>;\n";
+        let cands = generate(Lang::Tsx, tsx, &lines(1..=1), &CallFilter::default(), &[]);
+        assert_eq!(cands[1].context.leaves.join(""), "className={LARGE}");
     }
 
     #[test]

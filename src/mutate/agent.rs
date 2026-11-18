@@ -102,6 +102,8 @@ pub fn load(ctx: &Context, path: &Path) -> anyhow::Result<Loaded> {
             outcome: MutantOutcome::NotRun,
             killed_by: None,
             duration_ms: None,
+            // An agent edit replaces whole lines, with no syntax node to compare with base.
+            unchanged_from_base: false,
         };
         out.push((
             mutant,

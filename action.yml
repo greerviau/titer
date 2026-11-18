@@ -1,5 +1,5 @@
 name: titer
-description: Check that a pull request's tests prove the change, with the titer version the repo pins.
+description: Check whether a pull request's tests test the change, with the titer version the repo pins.
 branding:
   icon: check-circle
   color: green
@@ -87,7 +87,7 @@ runs:
           echo "exit-code=$code" >> "$GITHUB_OUTPUT"
           case "$code" in
             0) exit 0 ;;
-            1) echo "::error::titer: the change's tests do not prove the change"; exit 1 ;;
+            1) echo "::error::titer: the gate failed; see the job summary"; exit 1 ;;
             *) echo "::error::titer could not run the check (exit $code)"; exit "$code" ;;
           esac
         }

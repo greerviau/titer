@@ -321,3 +321,66 @@ fn a_malformed_mutants_file_exits_2() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--mutants"));
 }
+
+#[test]
+fn mutants_of_code_the_change_only_reformats_are_marked_unchanged_from_base() {
+    let repo = repo("120s");
+    repo.write(
+        "app.py",
+        "def clamp(x, hi):\n    if x > hi: return hi\n    return x\n",
+    );
+    repo.commit_all("one-line if");
+    // Line 2 only splits the base line; line 4 is new behavior.
+    repo.write(
+        "app.py",
+        "def clamp(x, hi):\n    if x > hi:\n        return hi\n    return max(x, 0)\n",
+    )
+    .write(
+        "test_app.py",
+        &format!("{CLAMP_TEST}\n\ndef test_floors_at_zero():\n    assert clamp(-1, 3) == 0\n"),
+    );
+    let summary = repo.scratch().join("summary.md");
+
+    let output = repo.titer(&[
+        "check",
+        "--json",
+        "--only",
+        "mutate",
+        "--base",
+        "HEAD",
+        "--markdown",
+        summary.to_str().unwrap(),
+    ]);
+
+    let report = stdout_json(&output);
+    assert_schema_valid(&report);
+    let mut got: Vec<(u64, String, bool)> = report["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["line"].as_u64().unwrap(),
+                m["operator"].as_str().unwrap().to_string(),
+                m["unchanged_from_base"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            (2, "negate_if".into(), true),
+            (2, "swap_comparison".into(), true),
+            (3, "return_none".into(), true),
+            (4, "increment_int".into(), false),
+            (4, "return_none".into(), false),
+        ],
+        "{report:#}"
+    );
+    let text = std::fs::read_to_string(&summary).unwrap();
+    assert!(
+        text.contains("app.py:2: `>` to `>=` (this code is also in the base lines the change replaces, so it may predate the change)"),
+        "{text}"
+    );
+}

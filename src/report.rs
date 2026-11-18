@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::exit;
 
 /// Bumped on any breaking change to the report shape.
-pub const SCHEMA_VERSION: &str = "1";
+pub const SCHEMA_VERSION: &str = "2";
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -267,6 +267,11 @@ pub struct Mutant {
     /// The test that killed the mutant, when known.
     pub killed_by: Option<String>,
     pub duration_ms: Option<u64>,
+    /// The mutated code also appears in the base lines that this hunk replaces, as a syntax
+    /// node with the same kind, parent kind, and tokens. The change may only have moved or
+    /// reformatted it, so a survivor here may predate the change. Always false for agent
+    /// mutants.
+    pub unchanged_from_base: bool,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]

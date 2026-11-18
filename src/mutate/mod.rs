@@ -12,13 +12,15 @@ use anyhow::bail;
 
 use crate::check::Context;
 use crate::detect::{self, glob_set};
+use crate::diff::FileChange;
 use crate::lang::Lang;
 use crate::prove::HeadRun;
 use crate::report::{Mutant, MutantOutcome, MutantSource};
 use crate::runner::{CaseResult, RunRequest, Runner, Selection, Status, TestCase, TestRun};
+use crate::session::Session;
 use crate::worktree::Worktree;
 
-use operators::{CallFilter, Candidate};
+use operators::{CallFilter, Candidate, CodeNode};
 
 /// What each runner's mutants run: the head-green changed tests, or the whole suite when the
 /// change has no changed tests for that runner.
@@ -152,6 +154,7 @@ pub fn generate(ctx: &Context) -> anyhow::Result<Vec<(Mutant, Job)>> {
             continue;
         }
         let text = detect::read_head(&ctx.session, &source.file)?;
+        let base = BaseHunks::load(&ctx.session, &source.file, source.lang)?;
         for cand in operators::generate(
             source.lang,
             &text,
@@ -160,13 +163,15 @@ pub fn generate(ctx: &Context) -> anyhow::Result<Vec<(Mutant, Job)>> {
             &config.exclude_operators,
         ) {
             let mutated = cand.apply(&text);
+            let mut mutant = mutant_from(
+                &ctx.runners[source.runner],
+                &source.file,
+                &cand,
+                MutantSource::Generated,
+            );
+            mutant.unchanged_from_base = base.contains(cand.line, &cand.context);
             all.push((
-                mutant_from(
-                    &ctx.runners[source.runner],
-                    &source.file,
-                    &cand,
-                    MutantSource::Generated,
-                ),
+                mutant,
                 Job {
                     runner: source.runner,
                     file: source.file.clone(),
@@ -199,6 +204,63 @@ pub fn mutant_from(runner: &Runner, file: &str, cand: &Candidate, source: Mutant
         outcome: MutantOutcome::NotRun,
         killed_by: None,
         duration_ms: None,
+        unchanged_from_base: false,
+    }
+}
+
+/// The base side of one source file's hunks, for telling whether a mutant's code is new.
+pub struct BaseHunks {
+    change: Option<FileChange>,
+    base: String,
+    tree: Option<tree_sitter::Tree>,
+}
+
+impl BaseHunks {
+    pub fn load(session: &Session, file: &str, lang: Lang) -> anyhow::Result<BaseHunks> {
+        let change = session.changes.get(file).cloned();
+        let base = match change.as_ref().and_then(|c| c.old_path.as_deref()) {
+            Some(old) => session
+                .git
+                .read_blob(&session.base_sha, old)?
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        Ok(BaseHunks::new(change, lang, base))
+    }
+
+    pub fn new(change: Option<FileChange>, lang: Lang, base: String) -> BaseHunks {
+        let tree = lang.parse(&base);
+        BaseHunks { change, base, tree }
+    }
+
+    /// Whether a node in the base lines that the hunk of head `line` replaces has the same
+    /// kind, parent kind, and tokens as `context`. Then the change only moved or reformatted
+    /// that code.
+    pub fn contains(&self, line: u32, context: &CodeNode) -> bool {
+        let (Some(change), Some(tree)) = (&self.change, &self.tree) else {
+            return false;
+        };
+        let replaced = change.replaced(line);
+        let (Some(&first), Some(&last)) = (replaced.first(), replaced.last()) else {
+            return false;
+        };
+        let mut found = false;
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            let start = node.start_position().row as u32 + 1;
+            let end = node.end_position().row as u32 + 1;
+            if end < first || start > last {
+                continue;
+            }
+            if start >= first && end <= last && CodeNode::of(node, &self.base) == *context {
+                found = true;
+                break;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+        }
+        found
     }
 }
 
@@ -726,6 +788,89 @@ fn follow_up(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn matches(base: &str, head: &str, lang: Lang) -> Vec<(u32, String, bool)> {
+        let patch = format!(
+            "diff --git a/f b/f\n--- a/f\n+++ b/f\n{}",
+            hunks(base, head)
+        );
+        let change = crate::diff::ChangeSet::parse(&patch).files.pop();
+        let changed = change.as_ref().unwrap().added.clone();
+        let hunks = BaseHunks::new(change, lang, base.to_string());
+        operators::generate(lang, head, &changed, &CallFilter::default(), &[])
+            .into_iter()
+            .map(|c| {
+                (
+                    c.line,
+                    c.original.clone(),
+                    hunks.contains(c.line, &c.context),
+                )
+            })
+            .collect()
+    }
+
+    /// One hunk that replaces every base line with every head line: enough for these tests.
+    fn hunks(base: &str, head: &str) -> String {
+        let (b, h) = (base.lines().count(), head.lines().count());
+        let mut out = format!("@@ -1,{b} +1,{h} @@\n");
+        for l in base.lines() {
+            out.push_str(&format!("-{l}\n"));
+        }
+        for l in head.lines() {
+            out.push_str(&format!("+{l}\n"));
+        }
+        out
+    }
+
+    #[test]
+    fn code_the_change_only_reformats_matches_base() {
+        let base = "const a = <p className={LARGE}>{t}</p>;\n";
+        let head = "const a = (\n  <p lang={lang} className={LARGE}>\n    {t}\n  </p>\n);\n";
+        assert_eq!(
+            matches(base, head, Lang::Tsx),
+            vec![
+                (2, "lang={lang}".into(), false),
+                (2, "className={LARGE}".into(), true)
+            ]
+        );
+        let base = "def f(x, hi):\n    if x > hi: return hi\n";
+        let head = "def f(x, hi):\n    if x > hi:\n        return hi\n";
+        assert!(
+            matches(base, head, Lang::Python).iter().all(|m| m.2),
+            "{:?}",
+            matches(base, head, Lang::Python)
+        );
+    }
+
+    #[test]
+    fn comments_larger_expressions_and_literals_do_not_match() {
+        let cases = [
+            (
+                "def f(x):\n    # return x > 2\n    pass\n",
+                "def f(x):\n    return x > 2\n",
+            ),
+            (
+                "def f(x):\n    return x > 2 + 3\n",
+                "def f(x):\n    return x > 2\n",
+            ),
+            (
+                "def f(x):\n    return x > 'a b'\n",
+                "def f(x):\n    return x > 'a  b'\n",
+            ),
+            (
+                "def f(x, y):\n    if y and x:\n        pass\n",
+                "def f(x, y):\n    if x:\n        pass\n",
+            ),
+        ];
+        for (base, head) in cases {
+            let got = matches(base, head, Lang::Python);
+            assert!(!got.is_empty(), "{head}");
+            assert!(
+                got.iter().filter(|m| m.0 > 1).all(|m| !m.2),
+                "{head}: {got:?}"
+            );
+        }
+    }
 
     #[test]
     fn workers_are_bounded_by_cores_and_memory() {

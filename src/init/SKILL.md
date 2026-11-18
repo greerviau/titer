@@ -1,13 +1,13 @@
 ---
 name: titer
-description: Use after changing code in this repo and before committing or opening a PR, to check with `titer check --json` that the change's tests prove the change. Also use when titer reports survivors, unproven changes, or weakened tests.
+description: Use after changing code in this repo and before committing or opening a PR, to check with `titer check --json` whether the change's tests test the change. Also use when titer reports survivors, unproven changes, or weakened tests.
 ---
 
 <!-- titer-version: {version} -->
 
 # titer
 
-This repo uses titer to check that the tests in a change prove the change. Run it after a code change, before you commit or open a PR.
+This repo uses titer to check whether the tests in a change test the change. titer gathers evidence; it cannot show that a change is correct. Run it after a code change, before you commit or open a PR.
 
 ## Run
 
@@ -25,16 +25,16 @@ titer compares the working tree, including untracked files, with the merge-base 
 
 ## Read the report
 
-`tests` has one entry per changed test. Its `verdict` says what the test proves against the base code:
+`tests` has one entry per changed test. Its `verdict` says what the test did on the base code:
 
-- `assertion` or `exception`: the test fails on base. It would have caught the bug. This is proof.
-- `missing_symbol`: the test fails on base only because it imports or calls something new. It proves nothing about behavior. Add a test that exercises the behavior through code that exists in base, or rely on mutation results.
+- `assertion` or `exception`: the test fails on base, so it detects a difference between base and head. The gate counts this as proof. Read `message` and check that the failure is the behavior the change targets; a test can also fail on base for an unrelated reason.
+- `missing_symbol`: the test fails on base only because it imports or calls something new. It shows nothing about behavior. Add a test that exercises the behavior through code that exists in base, or rely on mutation results.
 - `passes_on_base`: a regression guard. It is fine when mutants show that it pins the changed lines.
-- `skipped` or `no_result`: the test did not run. It proves nothing.
+- `skipped` or `no_result`: the test did not run. It shows nothing.
 
 `mutants` has one entry per mutant of a changed line. Its `outcome`:
 
-- `killed` or `timed_out`: the changed tests detect the change.
+- `killed` or `timed_out`: the changed tests detect this edit.
 - `survived`: the changed tests run the line but miss the change. Triage it (see below).
 - `not_executed`: no green changed test runs the line. If the line matters, add a test that runs it.
 - `caught_by_other`: an older test in the changed test files catches it, but the change's own tests do not.
@@ -46,7 +46,7 @@ titer compares the working tree, including untracked files, with the merge-base 
 
 ## Triage survivors
 
-A survivor is either a real gap or noise. Decide which before you act.
+A survivor is either a real gap or noise. Decide which before you act. When `unchanged_from_base` is true, the mutated code also appears in the base lines that the hunk replaces, so the change may only have moved or reformatted it. Check the base code to confirm, and say so in the PR.
 
 - Real gap: the mutant changes behavior that a user or caller can observe, and no test pins it. Write a test that fails on the mutant and passes on the real code.
 - Noise: the mutant is equivalent or does not matter, such as a tuning constant, `return []` versus `return None` where callers treat both as empty, or a cosmetic attribute. Leave it and say why in the PR.

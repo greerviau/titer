@@ -1,8 +1,8 @@
 # titer
 
-Prove that a change's tests test the change: fail-on-base, diff-scoped mutation, weakened-test scan, and CRAP, as a CLI any agent can call.
+Check whether a change's tests test the change: fail-on-base, diff-scoped mutation, weakened-test scan, and CRAP, as a CLI any agent can call.
 
-`titer check` answers one question about the diff against a base ref: do the tests in this change prove the change? It prints a JSON report and exits with the gate's code. It never wraps the agent and contains no model. Agents call it, read the JSON, and decide what to do.
+`titer check` gathers evidence on one question about the diff against a base ref: do the tests in this change test the change? It cannot show that the change is correct. A test that fails on base detects a difference from base, and a reviewer still checks that the difference is the intended one. titer prints a JSON report and exits with the gate's code. It never wraps the agent and contains no model. Agents call it, read the JSON, and decide what to do.
 
 | Tier | What it does |
 |---|---|
@@ -50,8 +50,8 @@ titer check [--base REF] [--only scan,prove,mutate,crap] [--json]
 
 titer snapshots the working tree, including untracked files that are not ignored, and diffs it against the merge-base of HEAD and `--base`. `--base` defaults to `base` in `titer.toml`, then to the remote default branch. Tests run in temporary worktrees under the user cache dir (`$TITER_TMPDIR` overrides it), through the repo's own command and the runner's native selection: pytest node ids, unittest dotted ids, and vitest `file:line`. The checkout's status, index, stash, and worktree list never change, and titer kills its own process groups on exit, timeout, and SIGINT.
 
-- `prove` runs the changed tests on head, then on base with head's test files copied in. Each changed test gets a verdict: `assertion` or `exception` (proof), `missing_symbol` (it fails on base only because a name exists only in head), `passes_on_base`, `skipped`, `no_result`, or `timeout`.
-- `mutate` applies one mutant at a time to changed source lines: comparison, boolean, and arithmetic swaps, bool flips, int +1, removed `not`/`!`, `return None`/`undefined`, removed calls (never logging calls), removed raise/throw, negated `if`, and JSX attributes set to undefined. The head-green changed tests run against each mutant in parallel workers; with no changed tests, the suite runs instead. A canary first checks that the worktree loads the mutated code. Survivors get two follow-ups: a sentinel raise before the line's statement (`not_executed` when nothing runs it), and a rerun of the whole changed test files (`caught_by_other`).
+- `prove` runs the changed tests on head, then on base with head's test files copied in. Each changed test gets a verdict: `assertion` or `exception` (the test fails on base, which the gate counts as proof), `missing_symbol` (it fails on base only because a name exists only in head), `passes_on_base`, `skipped`, `no_result`, or `timeout`.
+- `mutate` applies one mutant at a time to changed source lines: comparison, boolean, and arithmetic swaps, bool flips, int +1, removed `not`/`!`, `return None`/`undefined`, removed calls (never logging calls), removed raise/throw, negated `if`, and JSX attributes set to undefined. The head-green changed tests run against each mutant in parallel workers; with no changed tests, the suite runs instead. A canary first checks that the worktree loads the mutated code. A mutant whose code also appears in the base lines its hunk replaces gets `unchanged_from_base: true`, because the change may only have moved or reformatted that code. Survivors get two follow-ups: a sentinel raise before the line's statement (`not_executed` when nothing runs it), and a rerun of the whole changed test files (`caught_by_other`).
 - `--mutants FILE` adds agent-written mutants, one JSON object per line: `{"file": "app.py", "line": 3, "end_line": 3, "replacement": "    return x", "id": "optional"}`.
 - `crap` scores changed functions with `CRAP = comp^2 * (1 - cov)^3 + comp`, from `--coverage` (lcov, Cobertura XML, or coverage.py JSON) or `[crap] coverage_command`.
 
@@ -131,7 +131,7 @@ steps:
 
 The Action runs the repo's pinned titer (`npx --no-install titer` or `uv run --no-sync titer`) against the pull request's base branch and fails on exit 1 or 2. It reports in three places:
 
-- The job summary leads with a plain verdict (proven, unproven, or could not run), then lists survivors, lines no test runs, and weakened tests, with links to the pull request's head commit. The full test and mutant tables are collapsed.
+- The job summary leads with the gate result (passed, failed, or could not run) and the evidence it rests on. It then lists survivors, lines no test runs, and weakened tests, with links to the pull request's head commit. A survivor whose code is unchanged from base says so. The full test and mutant tables are collapsed. The test table shows each changed test's failure on base, so a reviewer can check that the failure is the behavior the change targets.
 - With `annotations: true` (the default), survivors and weakened tests are warnings on their lines in the diff, and lines no test runs are notices.
 - With `comment: true`, the same summary is posted as a pull request comment whose heading names the commit checked. Each new head commit gets a new comment, and earlier titer comments collapse as outdated, so the newest result sits next to the newest push. A rerun on the same commit updates that commit's comment. This needs `pull-requests: write`. On pull requests from forks of a public repo, GitHub gives the token read access only, so the Action warns and skips the comment.
 
