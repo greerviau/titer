@@ -137,3 +137,23 @@ fn a_red_suite_exits_2_even_when_the_change_yields_no_mutants() {
             .contains("head is not green")
     );
 }
+
+#[test]
+fn markdown_writes_a_job_summary() {
+    let repo = repo("");
+    repo.write(
+        "test_new.py",
+        "from app import clamp\n\n\ndef test_high():\n    assert clamp(5, 3) == 3\n",
+    );
+    let summary = repo.scratch().join("summary.md");
+
+    let output = repo.titer(&["check", "--json", "--markdown", summary.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let text = std::fs::read_to_string(&summary).unwrap();
+    assert!(text.starts_with("## titer: pass\n"), "{text}");
+    assert!(
+        text.contains("| Assertion | test_high | `test_new.py:4` |"),
+        "{text}"
+    );
+}

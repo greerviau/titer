@@ -1,0 +1,94 @@
+name: titer
+description: Check that a pull request's tests prove the change, with the titer version the repo pins.
+branding:
+  icon: check-circle
+  color: green
+
+inputs:
+  base:
+    description: The base ref. Defaults to the pull request's base branch, then to titer's own default.
+    required: false
+    default: ""
+  args:
+    description: Extra arguments for `titer check`, such as `--budget 90s`.
+    required: false
+    default: ""
+  working-directory:
+    description: The repo root, where titer.toml lives.
+    required: false
+    default: "."
+  command:
+    description: >-
+      The command that runs titer. Defaults to the pinned version: `npx --no-install titer`
+      when package.json pins titer, else `uv run --no-sync titer` when pyproject.toml does.
+    required: false
+    default: ""
+
+outputs:
+  exit-code:
+    description: titer's exit code. 0 pass, 1 fail, 2 could not run.
+    value: ${{ steps.check.outputs.exit-code }}
+  report:
+    description: The path of the JSON report.
+    value: ${{ steps.check.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - id: check
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        TITER_BASE: ${{ inputs.base || (github.base_ref && format('origin/{0}', github.base_ref)) || '' }}
+        TITER_ARGS: ${{ inputs.args }}
+        TITER_COMMAND: ${{ inputs.command }}
+      run: |
+        set -u
+        # Finds the dir whose manifest pins titer: the repo root, then each runner cwd.
+        pinned_dir=""
+        command="$TITER_COMMAND"
+        if [ -z "$command" ]; then
+          dirs="."
+          if [ -f titer.toml ]; then
+            dirs="$dirs $(sed -n 's/^cwd *= *"\(.*\)"/\1/p' titer.toml)"
+          fi
+          for dir in $dirs; do
+            if [ -f "$dir/package.json" ] && grep -Eq '"titer"[[:space:]]*:' "$dir/package.json"; then
+              command="npx --no-install titer"; pinned_dir="$dir"; break
+            fi
+            if [ -f "$dir/pyproject.toml" ] && grep -Eq "[\"']titer[[:space:]]*([=<>~!;[]|[\"'])" "$dir/pyproject.toml"; then
+              command="uv run --no-sync titer"; pinned_dir="$dir"; break
+            fi
+          done
+          if [ -z "$command" ]; then
+            echo "::error::titer is not pinned in package.json or pyproject.toml; run titer init, or set the command input"
+            echo "exit-code=2" >> "$GITHUB_OUTPUT"
+            exit 2
+          fi
+        fi
+        # merge-base needs history: deepen a shallow checkout, and fetch a missing base.
+        if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+          git fetch --quiet --unshallow --no-tags origin || true
+        fi
+        if [ -n "$TITER_BASE" ] && ! git rev-parse --verify --quiet "$TITER_BASE^{commit}" >/dev/null; then
+          git fetch --quiet --no-tags origin "${TITER_BASE#origin/}:refs/remotes/$TITER_BASE" || true
+        fi
+        report=$(mktemp "$RUNNER_TEMP/titer-report.XXXXXX")
+        summary=$(mktemp "$RUNNER_TEMP/titer-summary.XXXXXX")
+        args=()
+        [ -n "$TITER_BASE" ] && args=(--base "$TITER_BASE")
+        # Quotes in the args input group words, as in a shell.
+        eval "extra=($TITER_ARGS)"
+        args+=("${extra[@]}")
+        set +e
+        ( [ -n "$pinned_dir" ] && cd "$pinned_dir"; $command check --json --markdown "$summary" "${args[@]}" ) > "$report"
+        code=$?
+        set -e
+        [ -s "$summary" ] && cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+        case "$code" in
+          0) ;;
+          1) echo "::error::titer: the change's tests do not prove the change"; exit 1 ;;
+          *) echo "::error::titer could not run the check (exit $code)"; exit "$code" ;;
+        esac
