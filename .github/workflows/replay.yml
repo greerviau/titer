@@ -1,0 +1,32 @@
+name: Public replay
+
+# Replays titer over merged bug-fix PRs of pallets/click (pytest) and unjs/ufo (vitest).
+# See replay/corpus.json for the PRs and replay/expected.json for the verdicts it checks.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: replay-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: cargo build --release
+      - name: Replay
+        run: replay/run.py target/release/titer --check --work "$RUNNER_TEMP/replay"

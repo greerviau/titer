@@ -9,6 +9,7 @@ pub mod exit;
 pub mod git;
 pub mod imports;
 pub mod lang;
+pub mod mutate;
 pub mod process;
 pub mod prove;
 pub mod report;

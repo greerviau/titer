@@ -49,6 +49,9 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
         if req.fail_fast {
             args.push("--bail=1".to_string());
         }
+        // vitest's result cache and module cache live in node_modules, which is linked from
+        // the user's checkout and shared by every worker.
+        args.extend(cache_flags(runner, req.worktree));
         args.extend(selectors.iter().cloned());
         let cmd = runner.command(req.worktree, &args);
         let out = runner.exec(cmd, req)?;
@@ -85,15 +88,90 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
         }
         let runner_error =
             (json.trim().is_empty() && !out.timed_out && !out.success()).then(|| output_tail(&out));
+        let mut file_errors = parsed.file_errors;
+        // vitest also fails a run for errors outside any test, such as an unhandled
+        // rejection, and then reports every test as passed. The run still failed, so the
+        // selected files share the failure.
+        let failed_test = parsed
+            .outcomes
+            .iter()
+            .any(|o| matches!(o.status, Status::Failed(_)));
+        if !json.trim().is_empty()
+            && !out.timed_out
+            && out.exit_code == Some(1)
+            && !failed_test
+            && file_errors.is_empty()
+        {
+            let failure = Failure {
+                kind: FailureKind::Exception,
+                exception_type: None,
+                message: "vitest failed the run after its tests passed, for example on an unhandled error".to_string(),
+            };
+            let files: Vec<String> = match req.selection {
+                Selection::Tests(_) => selected_lines
+                    .iter()
+                    .flatten()
+                    .map(|(f, _)| f.clone())
+                    .collect(),
+                Selection::Files(_) => selectors.clone(),
+                Selection::Suite => vec![String::new()],
+            };
+            for file in files {
+                file_errors.push(FileError {
+                    file: format!("./{file}"),
+                    failure: failure.clone(),
+                });
+            }
+            file_errors.dedup();
+        }
         return Ok(TestRun {
             outcomes: parsed.outcomes,
-            file_errors: parsed.file_errors,
+            file_errors,
             timed_out: out.timed_out,
             duration: out.duration,
             max_rss_bytes: out.max_rss_bytes,
             runner_error,
         });
     }
+}
+
+/// Flags that keep vitest's on-disk caches out of the `node_modules` that the worktree links
+/// from the user's checkout and shares with every worker. The result cache goes off, and the
+/// module cache moves into the worktree, so each worker keeps its own. Older versions reject
+/// flags they do not know, so the runner's `--help` decides which flags apply.
+fn cache_flags(runner: &Runner, worktree: &std::path::Path) -> Vec<String> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static KNOWN: LazyLock<Mutex<HashMap<String, (bool, bool)>>> = LazyLock::new(Default::default);
+    let key = runner.config.command.join(" ");
+    let cached = KNOWN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .copied();
+    let (results_cache, module_cache_path) = cached.unwrap_or_else(|| {
+        let help = crate::process::output(runner.command(worktree, &["--help".to_string()]))
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let known = (
+            help.contains("--cache "),
+            help.contains("--fsModuleCachePath "),
+        );
+        KNOWN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, known);
+        known
+    });
+    let mut flags = Vec::new();
+    if results_cache {
+        flags.push("--cache=false".to_string());
+    }
+    if module_cache_path {
+        let dir = worktree.join(".titer-cache/vitest");
+        flags.push(format!("--fsModuleCachePath={}", dir.display()));
+    }
+    flags
 }
 
 fn empty_run(out: &crate::process::RunOutput) -> TestRun {
@@ -174,12 +252,15 @@ fn parse(json: &str, selected: Option<&[(String, u32)]>, roots: &[std::path::Pat
         let ran_any = assertions
             .iter()
             .any(|a| matches!(a["status"].as_str(), Some("passed" | "failed")));
-        if file["status"] == "failed" && !message.trim().is_empty() && !ran_any {
+        if file["status"] == "failed" && !message.trim().is_empty() {
+            // A load error, or a hook such as afterAll that threw after the tests ran.
             parsed.file_errors.push(FileError {
                 file: path.clone(),
                 failure: failure_from(&message),
             });
-            continue;
+            if !ran_any {
+                continue;
+            }
         }
         for a in assertions {
             let line = a["location"]["line"].as_u64().map(|l| l as u32);

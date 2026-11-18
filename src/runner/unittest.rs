@@ -85,7 +85,35 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
     }
     cmd.env("PYTHONPATH", python_path);
     let out = runner.exec(cmd, req)?;
-    let parsed = parse(&out.stderr, &config.start_dir);
+    let mut parsed = parse(&out.stderr, &config.start_dir);
+    // unittest turns only ImportError into a failed test. Any other exception while a
+    // selected module loads crashes the loader before a test runs; every selected module
+    // shares the failure, since the loader stops at the first one.
+    if parsed.outcomes.is_empty()
+        && parsed.file_errors.is_empty()
+        && !out.timed_out
+        && !out.stderr.contains("\nRan ")
+        && out.stderr.contains("Traceback (most recent call last)")
+    {
+        let lines: Vec<&str> = out.stderr.lines().collect();
+        let failure = failure_from(&lines, false);
+        let mut modules: Vec<String> = match req.selection {
+            Selection::Tests(cases) => cases
+                .iter()
+                .map(|c| cwd_relative(&c.file, &config.cwd))
+                .collect(),
+            Selection::Files(files) => files.iter().map(|f| cwd_relative(f, &config.cwd)).collect(),
+            Selection::Suite => Vec::new(),
+        };
+        modules.dedup();
+        parsed.file_errors = modules
+            .into_iter()
+            .map(|file| FileError {
+                file,
+                failure: failure.clone(),
+            })
+            .collect();
+    }
     let runner_error = (parsed.outcomes.is_empty()
         && parsed.file_errors.is_empty()
         && !out.timed_out
@@ -184,6 +212,31 @@ fn parse(stderr: &str, start_dir: &str) -> Parsed {
         let Some(status) = statuses.get(&id).map(String::as_str) else {
             continue;
         };
+        // A class or module fixture that fails, such as setUpClass, fails every test of its
+        // module; unittest reports it under the fixture's name.
+        let fixture = [
+            "setUpClass",
+            "tearDownClass",
+            "setUpModule",
+            "tearDownModule",
+        ]
+        .iter()
+        .find(|f| id.ends_with(&format!(".{f}")));
+        if let Some(name) = fixture {
+            if let Some((_, failure, _)) = failures.iter().find(|(fid, _, _)| fid == &id) {
+                let mut module = id.trim_end_matches(&format!(".{name}")).to_string();
+                if name.ends_with("Class") {
+                    module = module
+                        .rsplit_once('.')
+                        .map_or(module.clone(), |(m, _)| m.to_string());
+                }
+                parsed.file_errors.push(FileError {
+                    file: module_path(&module, start_dir),
+                    failure: failure.clone(),
+                });
+            }
+            continue;
+        }
         if id.starts_with("unittest.loader._FailedTest.") {
             if let Some((_, failure, body)) = failures.iter().find(|(fid, _, _)| fid == &id) {
                 if let Some(caps) = IMPORT_FAILURE.captures(body) {
