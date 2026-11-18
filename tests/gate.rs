@@ -151,9 +151,9 @@ fn markdown_writes_a_job_summary() {
 
     assert_eq!(output.status.code(), Some(0));
     let text = std::fs::read_to_string(&summary).unwrap();
-    assert!(text.starts_with("## titer: pass\n"), "{text}");
+    assert!(text.contains("### titer: proven\n"), "{text}");
     assert!(
-        text.contains("| Assertion | test_high | `test_new.py:4` |"),
+        text.contains("| fails (assertion) | test\\_high | test\\_new.py:4 |"),
         "{text}"
     );
 }

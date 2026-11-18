@@ -108,15 +108,31 @@ Python commands should not sync the environment (`uv run --no-sync`), because wo
 ## GitHub Action
 
 ```yaml
-- uses: actions/checkout@v4
-  with:
-    fetch-depth: 0
-- uses: greerviau/titer@v1
-  with:
-    args: --budget 120s
+permissions:
+  contents: read
+  pull-requests: write # only for comment: true
+
+steps:
+  - uses: actions/checkout@v4
+    with:
+      fetch-depth: 0
+      # The pull request head, so annotations land on the right diff lines.
+      ref: ${{ github.event.pull_request.head.sha }}
+  # Install the repo's dependencies here.
+  - uses: greerviau/titer@v1
+    with:
+      comment: true
 ```
 
-The Action runs the repo's pinned titer (`npx --no-install titer` or `uv run --no-sync titer`), writes a job summary, and fails on exit 1 or 2. Install the repo's dependencies before it. Inputs: `base`, `args`, `working-directory`, and `command`.
+The Action runs the repo's pinned titer (`npx --no-install titer` or `uv run --no-sync titer`) against the pull request's base branch and fails on exit 1 or 2. It reports in three places:
+
+- The job summary leads with a plain verdict (proven, unproven, or could not run), then lists survivors, lines no test runs, and weakened tests, with links to the pull request's head commit. The full test and mutant tables are collapsed.
+- With `annotations: true` (the default), survivors and weakened tests are warnings on their lines in the diff, and lines no test runs are notices.
+- With `comment: true`, the same summary is posted as a pull request comment and updated in place on later runs. This needs `pull-requests: write`. On pull requests from forks of a public repo, GitHub gives the token read access only, so the Action warns and skips the comment. Give the workflow a `concurrency` group per pull request, so two runs never post at once.
+
+Annotations need the pull request head checked out, as above. The default `pull_request` checkout is a merge commit whose line numbers can differ, so the Action skips annotations there.
+
+Other inputs: `base`, `args`, `working-directory`, `command`, and `github-token`. Outputs: `exit-code`, `report` (the JSON report's path), and `summary` (the Markdown's path).
 
 ## Report
 

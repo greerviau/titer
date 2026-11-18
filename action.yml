@@ -17,6 +17,20 @@ inputs:
     description: The repo root, where titer.toml lives.
     required: false
     default: "."
+  annotations:
+    description: Annotate survivors, weakened tests, and lines no test runs in the pull request's diff.
+    required: false
+    default: "true"
+  comment:
+    description: >-
+      Post the summary as a pull request comment and update that one comment on later runs.
+      Needs `pull-requests: write`.
+    required: false
+    default: "false"
+  github-token:
+    description: The token that posts the comment.
+    required: false
+    default: ${{ github.token }}
   command:
     description: >-
       The command that runs titer. Defaults to the pinned version: `npx --no-install titer`
@@ -31,6 +45,9 @@ outputs:
   report:
     description: The path of the JSON report.
     value: ${{ steps.check.outputs.report }}
+  summary:
+    description: The path of the Markdown summary.
+    value: ${{ steps.check.outputs.summary }}
 
 runs:
   using: composite
@@ -42,8 +59,31 @@ runs:
         TITER_BASE: ${{ inputs.base || (github.base_ref && format('origin/{0}', github.base_ref)) || '' }}
         TITER_ARGS: ${{ inputs.args }}
         TITER_COMMAND: ${{ inputs.command }}
+        TITER_ANNOTATIONS: ${{ inputs.annotations }}
+        TITER_PR_HEAD: ${{ github.event.pull_request.head.sha }}
       run: |
         set -u
+        report=$(mktemp "$RUNNER_TEMP/titer-report.XXXXXX")
+        summary=$(mktemp "$RUNNER_TEMP/titer-summary.XXXXXX")
+        annotations=$(mktemp "$RUNNER_TEMP/titer-annotations.XXXXXX")
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+        echo "summary=$summary" >> "$GITHUB_OUTPUT"
+
+        # Publishes the summary, or a short one when titer wrote none, and exits with $1.
+        finish() {
+          code=$1
+          if [ ! -s "$summary" ]; then
+            printf '<!-- titer-report -->\n### titer: could not run\n\n%s See the job log.\n' "$2" > "$summary"
+          fi
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+          case "$code" in
+            0) exit 0 ;;
+            1) echo "::error::titer: the change's tests do not prove the change"; exit 1 ;;
+            *) echo "::error::titer could not run the check (exit $code)"; exit "$code" ;;
+          esac
+        }
+
         # Finds the dir whose manifest pins titer: the repo root, then each runner cwd.
         pinned_dir=""
         command="$TITER_COMMAND"
@@ -61,11 +101,10 @@ runs:
             fi
           done
           if [ -z "$command" ]; then
-            echo "::error::titer is not pinned in package.json or pyproject.toml; run titer init, or set the command input"
-            echo "exit-code=2" >> "$GITHUB_OUTPUT"
-            exit 2
+            finish 2 "titer is not pinned in package.json or pyproject.toml. Run titer init, or set the command input."
           fi
         fi
+
         # merge-base needs history: deepen a shallow checkout, and fetch a missing base.
         if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
           git fetch --quiet --unshallow --no-tags origin || true
@@ -73,22 +112,66 @@ runs:
         if [ -n "$TITER_BASE" ] && ! git rev-parse --verify --quiet "$TITER_BASE^{commit}" >/dev/null; then
           git fetch --quiet --no-tags origin "${TITER_BASE#origin/}:refs/remotes/$TITER_BASE" || true
         fi
-        report=$(mktemp "$RUNNER_TEMP/titer-report.XXXXXX")
-        summary=$(mktemp "$RUNNER_TEMP/titer-summary.XXXXXX")
-        args=()
-        [ -n "$TITER_BASE" ] && args=(--base "$TITER_BASE")
+
+        # Line numbers come from the commit checked out here. Links point at that commit. Diff
+        # annotations need it to be the pull request's head; the default pull_request
+        # checkout is a merge commit, whose lines can differ.
+        checked_out=$(git rev-parse HEAD)
+        annotate="$TITER_ANNOTATIONS"
+        if [ "$annotate" = true ] && [ -n "$TITER_PR_HEAD" ] && [ "$checked_out" != "$TITER_PR_HEAD" ]; then
+          annotate=false
+          echo "::notice::titer skips diff annotations because the checkout is not the pull request head. To get them, check out with ref set to github.event.pull_request.head.sha."
+        fi
+        args=(--link-base "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$checked_out" --annotations "$annotations")
+        [ -n "$TITER_BASE" ] && args+=(--base "$TITER_BASE")
         # Quotes in the args input group words, as in a shell.
         eval "extra=($TITER_ARGS)"
         args+=("${extra[@]}")
+
         set +e
         ( [ -n "$pinned_dir" ] && cd "$pinned_dir"; $command check --json --markdown "$summary" "${args[@]}" ) > "$report"
         code=$?
         set -e
-        [ -s "$summary" ] && cat "$summary" >> "$GITHUB_STEP_SUMMARY"
-        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
-        echo "report=$report" >> "$GITHUB_OUTPUT"
-        case "$code" in
-          0) ;;
-          1) echo "::error::titer: the change's tests do not prove the change"; exit 1 ;;
-          *) echo "::error::titer could not run the check (exit $code)"; exit "$code" ;;
-        esac
+        # Workflow commands on stdout become annotations on the diff.
+        [ "$annotate" = true ] && [ -s "$annotations" ] && cat "$annotations"
+        finish "$code" "titer exited $code before writing a summary."
+    - name: Comment
+      if: always() && inputs.comment == 'true' && github.event_name == 'pull_request' && steps.check.outputs.summary != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        SUMMARY: ${{ steps.check.outputs.summary }}
+      run: |
+        set -u
+        [ -s "$SUMMARY" ] || exit 0
+        # GitHub rejects bodies over 65536 characters. Keep whole lines under the limit and
+        # close any <details> the cut leaves open.
+        body=$(mktemp "$RUNNER_TEMP/titer-comment.XXXXXX")
+        awk -v limit=60000 '
+          { size += length($0) + 1 }
+          size > limit { cut = 1; exit }
+          { print; if ($0 ~ /<details>/) open++; if ($0 ~ /<\/details>/) open-- }
+          END {
+            if (cut) {
+              for (; open > 0; open--) print "\n</details>"
+              print "\n_The summary was cut to fit a comment. See the job summary for the rest._"
+            }
+          }' "$SUMMARY" > "$body"
+
+        # Our comment: the oldest one with the marker that this token's account wrote. The
+        # default token posts as github-actions[bot].
+        login=$(gh api user --jq .login 2>/dev/null) || login="github-actions[bot]"
+        if ! ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+          --jq ".[] | select(.user.login == \"$login\" and (.body | startswith(\"<!-- titer-report -->\"))) | .id"); then
+          echo "::warning::titer could not list the pull request's comments, so it did not post one"
+          exit 0
+        fi
+        existing=$(printf '%s\n' "$ids" | sed -n '1p')
+        if [ -n "$existing" ]; then
+          gh api --silent -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" -F "body=@$body" \
+            || echo "::warning::titer could not update its comment; the workflow needs pull-requests: write"
+        else
+          gh api --silent "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F "body=@$body" \
+            || echo "::warning::titer could not post its comment; the workflow needs pull-requests: write"
+        fi
