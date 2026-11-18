@@ -4,7 +4,7 @@
 use std::fmt::Write as _;
 
 use crate::report::{
-    Finding, GateStatus, HeadStatus, Mutant, MutantOutcome, Report, Tier, Verdict,
+    Finding, FindingKind, GateStatus, HeadStatus, Mutant, MutantOutcome, Report, Tier, Verdict,
 };
 
 /// The marker that identifies titer's pull request comment, so the Action updates one comment.
@@ -16,13 +16,7 @@ const SHOWN: usize = 10;
 /// A Markdown summary. With `link_base`, such as
 /// `https://github.com/owner/repo/blob/<sha>`, file locations link to that commit.
 pub fn markdown(report: &Report, link_base: Option<&str>) -> String {
-    let link = |file: &str, line: u32| match link_base {
-        Some(base) => format!(
-            "[`{file}:{line}`]({}/{file}#L{line})",
-            base.trim_end_matches('/')
-        ),
-        None => format!("`{file}:{line}`"),
-    };
+    let link = |file: &str, line: u32| location(file, line, link_base);
     let mut out = String::new();
     let _ = writeln!(out, "{COMMENT_MARKER}");
     let (title, sentence) = headline(report);
@@ -77,7 +71,7 @@ pub fn markdown(report: &Report, link_base: Option<&str>) -> String {
         );
         list(&mut out, &survivors, |m| {
             format!(
-                "{}: `{}` to `{}`",
+                "{}: {} to {}",
                 link(&m.file, m.line),
                 code(&m.original),
                 code(&m.replacement)
@@ -107,11 +101,16 @@ pub fn markdown(report: &Report, link_base: Option<&str>) -> String {
             let test = f
                 .test
                 .as_deref()
-                .map(|t| format!(" `{}`", code(t)))
+                .map(|t| format!(" {}", code(t)))
                 .unwrap_or_default();
+            // A deleted test's line is in base, so it gets no link to head.
+            let place = if f.kind == FindingKind::TestDeleted {
+                format!("{} (in base)", escape(&format!("{}:{}", f.file, f.line)))
+            } else {
+                link(&f.file, f.line)
+            };
             format!(
-                "{} {}{test}: {}",
-                link(&f.file, f.line),
+                "{place} {}{test}: {}",
                 kind_name(f.kind),
                 escape(&f.message)
             )
@@ -150,11 +149,11 @@ pub fn markdown(report: &Report, link_base: Option<&str>) -> String {
         for m in &report.mutants {
             let _ = writeln!(
                 out,
-                "| {} | {} | `{}` to `{}` |",
+                "| {} | {} | {} to {} |",
                 outcome_name(m.outcome),
                 link(&m.file, m.line),
-                code(&m.original),
-                code(&m.replacement)
+                cell(&code(&m.original)),
+                cell(&code(&m.replacement))
             );
         }
         out.push_str("\n</details>\n");
@@ -170,9 +169,9 @@ pub fn markdown(report: &Report, link_base: Option<&str>) -> String {
         for c in flagged {
             let _ = writeln!(
                 out,
-                "| {:.1} | `{}` | {} |",
+                "| {:.1} | {} | {} |",
                 c.score.unwrap_or_default(),
-                code(&c.function),
+                cell(&code(&c.function)),
                 link(&c.file, c.line)
             );
         }
@@ -202,22 +201,70 @@ fn headline(report: &Report) -> (&'static str, String) {
         .filter(|t| t.verdict.is_some_and(Verdict::is_proof))
         .count();
     let killed = detected(report);
+    let reasons = |skip_unproven: bool| -> Vec<String> {
+        report
+            .gate
+            .reasons
+            .iter()
+            .filter(|r| !(skip_unproven && r.starts_with("unproven")))
+            .map(|r| one_line(r))
+            .collect()
+    };
     match report.gate.status {
-        GateStatus::Error => ("could not run", "titer could not finish the check.".to_string()),
-        GateStatus::Fail if report.gate.reasons.iter().any(|r| r.starts_with("unproven")) => (
-            "unproven",
-            "No changed test fails on the base code, and no changed test catches an edit to the changed lines. The tests may not cover this change.".to_string(),
+        GateStatus::Error => (
+            "could not run",
+            "titer could not finish the check.".to_string(),
         ),
-        GateStatus::Fail => ("failed", format!("The gate failed: {}.", report.gate.reasons.iter().map(|r| one_line(r)).collect::<Vec<_>>().join("; "))),
+        GateStatus::Fail
+            if report
+                .gate
+                .reasons
+                .iter()
+                .any(|r| r.starts_with("unproven")) =>
+        {
+            let mut sentence = "No changed test fails on the base code, and no changed test catches an edit to the changed lines. The tests may not cover this change.".to_string();
+            let others = reasons(true);
+            if !others.is_empty() {
+                sentence.push_str(&format!(" The gate also failed on: {}.", others.join("; ")));
+            }
+            ("unproven", sentence)
+        }
+        GateStatus::Fail => (
+            "failed",
+            format!("The gate failed on: {}.", reasons(false).join("; ")),
+        ),
         GateStatus::Pass if proven > 0 => (
             "proven",
-            format!("{proven} changed test{} fail{} on the base code, so {} would have caught the bug.", plural(proven), if proven == 1 { "s" } else { "" }, if proven == 1 { "it" } else { "they" }),
+            format!(
+                "{proven} changed test{} fail{} on the base code, so {} would have caught the bug.",
+                plural(proven),
+                if proven == 1 { "s" } else { "" },
+                if proven == 1 { "it" } else { "they" }
+            ),
         ),
         GateStatus::Pass if killed > 0 => (
             "proven by mutation",
-            format!("No changed test fails on the base code, but the tests catch {killed} edit{} to the changed lines.", plural(killed)),
+            format!(
+                "No changed test fails on the base code, but the tests catch {killed} edit{} to the changed lines.",
+                plural(killed)
+            ),
         ),
-        GateStatus::Pass => ("pass", "Nothing in this change needs proof from tests.".to_string()),
+        GateStatus::Pass
+            if !report.tiers.contains(&Tier::Prove) && !report.tiers.contains(&Tier::Mutate) =>
+        {
+            let tiers: Vec<&str> = report.tiers.iter().map(|t| t.name()).collect();
+            (
+                "pass",
+                format!(
+                    "Only {} ran, so nothing here says whether the tests prove the change.",
+                    tiers.join(" and ")
+                ),
+            )
+        }
+        GateStatus::Pass => (
+            "pass",
+            "Nothing in this change needs proof from tests.".to_string(),
+        ),
     }
 }
 
@@ -331,29 +378,83 @@ fn kind_name(kind: crate::report::FindingKind) -> &'static str {
     }
 }
 
-/// The first line, without Markdown table breakers.
+/// The first line, as Markdown-safe text.
 fn one_line(text: &str) -> String {
     escape(text.lines().next().unwrap_or_default().trim())
 }
 
+/// Text with Markdown's inline syntax and table pipes escaped, on one line.
 fn escape(text: &str) -> String {
-    text.replace('|', "\\|").replace(['\n', '\r'], " ")
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '|' | '#' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' | '\r' => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
-/// Text for an inline code span: one line, no backticks, at most 60 characters.
-fn code(text: &str) -> String {
-    let line = text
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .replace('`', "'")
-        .replace('|', "\\|");
+/// The first line of source, at most 60 characters.
+fn plain(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
     if line.chars().count() > 60 {
         format!("{}...", line.chars().take(57).collect::<String>())
     } else {
-        line
+        line.to_string()
     }
+}
+
+/// An inline code span that shows the source exactly: its fence is longer than any run of
+/// backticks inside it.
+fn code(text: &str) -> String {
+    let text = plain(text);
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest + 1);
+    let pad = if text.starts_with('`') || text.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{text}{pad}{fence}")
+}
+
+/// A Markdown fragment made safe for a table cell, where `|` ends the cell even in code.
+fn cell(markdown: &str) -> String {
+    markdown.replace('|', "\\|")
+}
+
+/// A location, linked to `link_base` when there is one. The label is escaped text and the
+/// URL is percent-encoded, so spaces and other characters in paths survive.
+fn location(file: &str, line: u32, link_base: Option<&str>) -> String {
+    let label = escape(&format!("{file}:{line}"));
+    match link_base {
+        Some(base) => {
+            let path: Vec<String> = file.split('/').map(percent_encode).collect();
+            format!(
+                "[{label}]({}/{}#L{line})",
+                base.trim_end_matches('/'),
+                path.join("/")
+            )
+        }
+        None => label,
+    }
+}
+
+fn percent_encode(segment: &str) -> String {
+    let mut out = String::new();
+    for b in segment.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// GitHub workflow commands that annotate the diff: errors for tests that fail on head,
@@ -388,13 +489,18 @@ pub fn annotations(report: &Report) -> String {
             m.line,
             "titer: survivor",
             &format!(
-                "Changing `{}` to `{}` here fails no changed test. Add a test if the behavior matters; leave it if the edit is equivalent.",
-                code(&m.original),
-                code(&m.replacement)
+                "Changing \"{}\" to \"{}\" here fails no changed test. Add a test if the behavior matters; leave it if the edit is equivalent.",
+                plain(&m.original),
+                plain(&m.replacement)
             ),
         ));
     }
-    for f in &report.findings {
+    // A deleted test's line is in base and cannot be annotated on the head diff.
+    for f in report
+        .findings
+        .iter()
+        .filter(|f| f.kind != FindingKind::TestDeleted)
+    {
         warnings.push(command(
             "warning",
             &f.file,
@@ -453,7 +559,7 @@ fn command(level: &str, file: &str, line: u32, title: &str, message: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::report::{FindingKind, MutantSource, Operator, TestResult};
+    use crate::report::{MutantSource, Operator, TestResult};
 
     fn report() -> Report {
         let mut r = Report::new();
@@ -514,10 +620,10 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("- [`app.py:2`](https://github.com/o/r/blob/abc/app.py#L2): `>` to `>=`"),
+            text.contains("- [app.py:2](https://github.com/o/r/blob/abc/app.py#L2): `>` to `>=`"),
             "{text}"
         );
-        assert_eq!(text.matches("- [`app.py:9`]").count(), 1, "{text}");
+        assert_eq!(text.matches("- [app.py:9]").count(), 1, "{text}");
         assert!(text.contains("skip added `test_low`: adds skip"), "{text}");
         assert!(text.contains("against `0123456`"), "{text}");
     }
@@ -529,7 +635,7 @@ mod tests {
         assert_eq!(lines.len(), 3, "{text}");
         assert!(
             lines[0].starts_with(
-                "::warning file=app.py,line=2,title=titer%3A survivor::Changing `>` to `>=` here"
+                "::warning file=app.py,line=2,title=titer%3A survivor::Changing \">\" to \">=\" here"
             ),
             "{text}"
         );
@@ -555,6 +661,51 @@ mod tests {
             text.contains("### titer: unproven\n\nNo changed test fails on the base code"),
             "{text}"
         );
-        assert!(text.contains("`app.py:2`"), "{text}");
+        assert!(text.contains("app.py:2"), "{text}");
+    }
+
+    #[test]
+    fn odd_paths_and_source_render_exactly() {
+        let mut r = report();
+        r.mutants[2].file = "sub dir/a|b`.ts".into();
+        r.mutants[2].original = "a || `x`".into();
+        let text = markdown(&r, Some("https://h/blob/s"));
+        assert!(
+            text.contains("- [sub dir/a\\|b\\`.ts:2](https://h/blob/s/sub%20dir/a%7Cb%60.ts#L2): `` a || `x` `` to `>=`"),
+            "{text}"
+        );
+        assert!(text.contains("| survived | [sub dir/a\\|b\\`.ts:2](https://h/blob/s/sub%20dir/a%7Cb%60.ts#L2) | `` a \\|\\| `x` `` to `>=` |"), "{text}");
+    }
+
+    #[test]
+    fn deleted_tests_point_at_base_and_get_no_annotation() {
+        let mut r = report();
+        r.findings[0].kind = FindingKind::TestDeleted;
+        let text = markdown(&r, Some("https://h/blob/s"));
+        assert!(
+            text.contains("- tests/test\\_app.py:10 (in base) test deleted"),
+            "{text}"
+        );
+        assert!(!annotations(&r).contains("test deleted"));
+    }
+
+    #[test]
+    fn verdicts_name_every_gate_failure_and_partial_runs() {
+        let mut r = report();
+        r.gate = crate::report::Gate::fail(vec![
+            "unproven change: x".into(),
+            "1 scan finding(s) (gate.fail_on_scan)".into(),
+        ]);
+        assert!(
+            markdown(&r, None)
+                .contains("The gate also failed on: 1 scan finding(s) (gate.fail\\_on\\_scan).")
+        );
+        let mut scan_only = Report::new();
+        scan_only.tiers = vec![Tier::Scan];
+        assert!(
+            markdown(&scan_only, None).contains(
+                "Only scan ran, so nothing here says whether the tests prove the change."
+            )
+        );
     }
 }

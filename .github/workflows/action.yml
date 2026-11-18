@@ -49,6 +49,7 @@ jobs:
           PROVEN_SUMMARY: ${{ steps.proven.outputs.summary }}
           UNPROVEN_SUMMARY: ${{ steps.unproven.outputs.summary }}
         run: |
-          test "$OUTCOME" = failure && test "$CODE" = 1
+          test "$OUTCOME" = failure
+          test "$CODE" = 1
           grep -q '^### titer: proven$' "$PROVEN_SUMMARY"
           grep -q '^### titer: unproven$' "$UNPROVEN_SUMMARY"
