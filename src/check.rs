@@ -221,16 +221,20 @@ fn crap_tier(ctx: &Context, report: &mut Report) -> anyhow::Result<()> {
             .current_dir(&worktree.path)
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .env("NO_COLOR", "1");
-        let out = process::run(
+        // CRAP is informational, so a coverage command that cannot run is a warning.
+        match process::run(
             cmd,
             Some(ctx.budget.max(Duration::from_secs(300))),
             &ctx.session.run_dir.join("logs"),
-        )?;
-        if !out.success() {
-            report.warnings.push(format!(
-                "the coverage command exited with {:?}; CRAP scores have no coverage",
+        ) {
+            Ok(out) if out.success() => {}
+            Ok(out) => report.warnings.push(format!(
+                "the coverage command exited with {:?}; CRAP scores may lack coverage",
                 out.exit_code
-            ));
+            )),
+            Err(e) => report
+                .warnings
+                .push(format!("cannot run the coverage command: {e:#}")),
         }
         std::fs::read_to_string(worktree.path.join(file)).ok()
     } else {

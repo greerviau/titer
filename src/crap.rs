@@ -37,6 +37,13 @@ impl Coverage {
     /// own root or absolute, so the longest path that ends with, or is a suffix of, the
     /// repo-relative path wins.
     pub fn for_file(&self, repo_rel: &str) -> Option<&BTreeMap<u32, bool>> {
+        if let Some((_, lines)) = self
+            .files
+            .iter()
+            .find(|(path, _)| path.trim_start_matches("./") == repo_rel)
+        {
+            return Some(lines);
+        }
         self.files
             .iter()
             .filter(|(path, _)| {
@@ -181,12 +188,10 @@ fn decisions(lang: Lang, node: Node, source: &str, top: bool) -> u32 {
         TS_FUNCTIONS
     };
     // The decorated definition wraps the function itself; only deeper functions are nested.
-    if !top
-        && nested.contains(&kind)
-        && node
-            .parent()
-            .is_none_or(|p| p.kind() != "decorated_definition")
-    {
+    let wrapped = node
+        .parent()
+        .is_some_and(|p| p.kind() == "decorated_definition");
+    if !top && (kind == "decorated_definition" || (nested.contains(&kind) && !wrapped)) {
         return 0;
     }
     let own = if lang.is_python() {
@@ -257,7 +262,8 @@ pub fn scores(
         };
         let complexity = complexity(lang, &source, &changed.function);
         let cov = coverage.and_then(|c| coverage_of(c.for_file(&changed.file), &changed.function));
-        let score = cov.map(|c| (score(complexity, c) * 100.0).round() / 100.0);
+        let raw = cov.map(|c| score(complexity, c));
+        let score = raw.map(|s| (s * 100.0).round() / 100.0);
         out.push(CrapScore {
             file: changed.file.clone(),
             function: changed.function.name.clone(),
@@ -265,7 +271,7 @@ pub fn scores(
             complexity,
             coverage: cov.map(|c| (c * 1000.0).round() / 1000.0),
             score,
-            flagged: score.is_some_and(|s| s > threshold),
+            flagged: raw.is_some_and(|s| s > threshold),
         });
     }
     out
@@ -308,6 +314,37 @@ mod tests {
         let functions = find_functions(Lang::TypeScript, ts);
         // case, case, ??, &&, ternary: 5, plus 1.
         assert_eq!(complexity(Lang::TypeScript, ts, &functions[0]), 6);
+    }
+
+    #[test]
+    fn decorated_nested_functions_are_their_own() {
+        let src = "def outer():\n    @cache\n    def inner(x):\n        if x:\n            return 1\n    return inner\n";
+        let functions = find_functions(Lang::Python, src);
+        assert_eq!(complexity(Lang::Python, src, &functions[0]), 1);
+        assert_eq!(complexity(Lang::Python, src, &functions[1]), 2);
+    }
+
+    #[test]
+    fn an_exact_path_beats_a_longer_suffix_match() {
+        let lcov = "SF:src/app.py\nDA:1,1\nend_of_record\nSF:packages/other/src/app.py\nDA:1,0\nend_of_record\n";
+        let coverage = Coverage::parse(lcov).unwrap();
+        assert!(coverage.for_file("src/app.py").unwrap()[&1]);
+    }
+
+    #[test]
+    fn the_threshold_applies_before_rounding() {
+        let src = "def f(x):\n    return x\n";
+        let function = find_functions(Lang::Python, src).remove(0);
+        let changed = vec![ChangedFunction {
+            runner: 0,
+            file: "a.py".into(),
+            function,
+        }];
+        let coverage = Coverage::parse("SF:a.py\nDA:1,0\nDA:2,0\nend_of_record\n").unwrap();
+        let read = |_: &str| Some(src.to_string());
+        // Complexity 1 and no coverage give a CRAP of exactly 2.
+        assert!(!scores(&changed, &read, Some(&coverage), 2.0)[0].flagged);
+        assert!(scores(&changed, &read, Some(&coverage), 1.9999)[0].flagged);
     }
 
     #[test]
