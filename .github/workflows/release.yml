@@ -1,9 +1,9 @@
 name: Release
 
-# On a v* tag: build binaries and wheels, create the GitHub release, and publish to npm,
-# PyPI, and crates.io for each registry whose token is set as a repo secret (NPM_TOKEN,
-# PYPI_TOKEN, CARGO_REGISTRY_TOKEN). Then check `npx @greerviau/titer` and `uvx titer` on Linux x64
-# and macOS arm64.
+# On a v* tag: build binaries and wheels, create the GitHub release, and publish. npm and
+# PyPI use trusted publishing, so each package must list this repo and release.yml as a
+# trusted publisher. crates.io publishes when the CARGO_REGISTRY_TOKEN secret is set. Then
+# check `npx @greerviau/titer` and `uvx titer` on Linux x64 and macOS arm64.
 
 on:
   push:
@@ -32,19 +32,12 @@ jobs:
   tokens:
     runs-on: ubuntu-latest
     outputs:
-      npm: ${{ steps.check.outputs.npm }}
-      pypi: ${{ steps.check.outputs.pypi }}
       crates: ${{ steps.check.outputs.crates }}
     steps:
       - id: check
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          echo "npm=${NPM_TOKEN:+true}" >> "$GITHUB_OUTPUT"
-          echo "pypi=${PYPI_TOKEN:+true}" >> "$GITHUB_OUTPUT"
-          echo "crates=${CARGO_REGISTRY_TOKEN:+true}" >> "$GITHUB_OUTPUT"
+        run: echo "crates=${CARGO_REGISTRY_TOKEN:+true}" >> "$GITHUB_OUTPUT"
 
   binaries:
     needs: version
@@ -132,23 +125,26 @@ jobs:
             --generate-notes *.tar.gz *.whl SHA256SUMS
 
   npm:
-    needs: [version, tokens, binaries, github]
-    if: needs.tokens.outputs.npm == 'true'
+    needs: [version, binaries, github]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v7
+      # No registry-url: npm already defaults to npmjs.org, and that option only writes a
+      # token .npmrc, which trusted publishing does not use.
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or later.
+      - run: npm install -g npm@11.21.1
       - uses: actions/download-artifact@v8
         with:
           pattern: bin-*
           path: bins
           merge-multiple: true
       - name: Publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           scripts/npm-packages.py "${{ needs.version.outputs.version }}" bins npm-out
           # A ./ prefix keeps npm from reading owner/name paths as GitHub specs.
@@ -156,9 +152,10 @@ jobs:
           npm publish --access public ./npm-out/titer
 
   pypi:
-    needs: [tokens, wheels, sdist, github]
-    if: needs.tokens.outputs.pypi == 'true'
+    needs: [wheels, sdist, github]
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
     steps:
       - uses: astral-sh/setup-uv@v7
       - uses: actions/download-artifact@v8
@@ -166,7 +163,7 @@ jobs:
           pattern: wheel-*
           path: dist
           merge-multiple: true
-      - run: uv publish --token "${{ secrets.PYPI_TOKEN }}" dist/*
+      - run: uv publish --trusted-publishing always dist/*
 
   crates:
     needs: [tokens, github]
@@ -191,9 +188,10 @@ jobs:
         with:
           node-version: 24
       - name: npx runs the published version
+        # npm took about 5 minutes to serve new packages on 0.1.1, so retry for 10.
         run: |
           version="${{ needs.version.outputs.version }}"
-          for attempt in 1 2 3 4 5 6; do
+          for attempt in $(seq 20); do
             if npx -y "@greerviau/titer@$version" --version | grep -qx "titer $version"; then exit 0; fi
             sleep 30
           done
@@ -211,7 +209,7 @@ jobs:
       - name: uvx runs the published version
         run: |
           version="${{ needs.version.outputs.version }}"
-          for attempt in 1 2 3 4 5 6; do
+          for attempt in $(seq 20); do
             if uvx --no-cache "titer@$version" --version | grep -qx "titer $version"; then exit 0; fi
             sleep 30
           done
