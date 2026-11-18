@@ -478,6 +478,29 @@ fn inline_snapshots(lang: Lang, text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Drops Rust comments as the parser finds them, so `//` inside a string stays.
+fn strip_rust_comments(text: &str) -> String {
+    let Some(tree) = Lang::Rust.parse(text) else {
+        return TS_COMMENT.replace_all(text, "").into_owned();
+    };
+    let mut cuts = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "line_comment" | "block_comment") {
+            cuts.push(node.byte_range());
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    cuts.sort_by_key(|r| r.start);
+    let mut out = text.to_string();
+    for range in cuts.into_iter().rev() {
+        out.replace_range(range, "");
+    }
+    out
+}
+
 static PY_COMMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)#.*$").unwrap());
 static TS_COMMENT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?ms)//.*?$|/\*.*?\*/").unwrap());
@@ -485,10 +508,12 @@ static TS_COMMENT: LazyLock<Regex> =
 /// Drops comments, so a commented-out assertion does not count. Approximate: a `#` or `//`
 /// inside a string also starts a comment here.
 fn strip_comments(lang: Lang, text: &str) -> String {
+    if lang == Lang::Rust {
+        return strip_rust_comments(text);
+    }
     let re = if lang.is_python() {
         &PY_COMMENT
     } else {
-        // TypeScript and Rust share comment syntax.
         &TS_COMMENT
     };
     re.replace_all(text, "").into_owned()
@@ -665,6 +690,14 @@ mod tests {
         ];
         expected.sort_by_key(|(k, t)| (*k as u8, t.clone()));
         assert_eq!(got, expected, "{findings:#?}");
+    }
+
+    #[test]
+    fn rust_comments_come_from_the_parser_so_urls_in_strings_stay() {
+        let base = "#[test]\nfn t() {\n    assert_eq!(f(1), 1); assert_eq!(f(2), 2);\n}\n";
+        let head = "#[test]\nfn t() {\n    let s = \"http://example\"; assert_eq!(f(1), 1); assert_eq!(f(2), 2);\n    // assert_eq!(f(3), 3);\n}\n";
+        assert_eq!(assertions(Lang::Rust, head), 2);
+        assert!(compare(Lang::Rust, PythonStyle::Pytest, "tests/a.rs", base, head).is_empty());
     }
 
     #[test]

@@ -49,9 +49,9 @@ impl RunnerKind {
             RunnerKind::Pytest => &["**/test_*.py", "**/*_test.py"],
             RunnerKind::Unittest => &["**/test*.py"],
             RunnerKind::Vitest => &["**/*.{test,spec}.{ts,tsx,mts,cts,js,jsx,mjs,cjs}"],
-            // Integration tests, and unit tests split out of a source file into `tests.rs`.
-            // Unit tests inside source files are found by their attributes instead.
-            RunnerKind::Cargo => &["**/tests/**/*.rs", "**/tests.rs"],
+            // Integration tests. Unit tests live in source files, where titer finds them by
+            // their attributes; the classifier never takes a file under `src/` as a test file.
+            RunnerKind::Cargo => &["**/tests/**/*.rs"],
         };
         globs.iter().map(|g| g.to_string()).collect()
     }
@@ -148,6 +148,14 @@ impl TryFrom<RawRunner> for RunnerConfig {
                     .to_string(),
             );
         }
+        if raw.kind == RunnerKind::Cargo
+            && let Some(flag) = raw.command.iter().find(|a| is_reserved_cargo_flag(a))
+        {
+            return Err(format!(
+                "a cargo command must not contain {flag:?}: titer chooses the packages, targets, \
+                 test names, output format, and target dir itself"
+            ));
+        }
         let cwd = normalize_rel(&raw.cwd)?;
         Ok(RunnerConfig {
             name: raw.name.unwrap_or_else(|| raw.kind.name().to_string()),
@@ -165,6 +173,35 @@ impl TryFrom<RawRunner> for RunnerConfig {
             start_dir: normalize_rel(raw.start_dir.as_deref().unwrap_or("."))?,
         })
     }
+}
+
+/// Cargo arguments that would override titer's selection of packages, targets, tests, and
+/// output, or point the build at a shared target dir.
+fn is_reserved_cargo_flag(arg: &str) -> bool {
+    const FLAGS: &[&str] = &[
+        "--",
+        "-q",
+        "--quiet",
+        "--workspace",
+        "--all",
+        "--exclude",
+        "--lib",
+        "--bin",
+        "--bins",
+        "--test",
+        "--tests",
+        "--example",
+        "--examples",
+        "--bench",
+        "--benches",
+        "--all-targets",
+        "--doc",
+        "--no-run",
+        "--message-format",
+        "--target-dir",
+    ];
+    let flag = arg.split_once('=').map_or(arg, |(f, _)| f);
+    FLAGS.contains(&flag)
 }
 
 /// Normalizes a repo-relative path: no leading `./`, no trailing slash, `.` for the root.
@@ -391,7 +428,7 @@ mod tests {
         let cargo = &config.runners[0];
         assert_eq!(cargo.name, "cargo");
         assert_eq!(cargo.kind, RunnerKind::Cargo);
-        assert_eq!(cargo.test_globs, vec!["**/tests/**/*.rs", "**/tests.rs"]);
+        assert_eq!(cargo.test_globs, vec!["**/tests/**/*.rs"]);
         assert_eq!(
             cargo.support_globs,
             vec!["**/tests/**", "**/testdata/**", "**/snapshots/**"]
@@ -426,6 +463,18 @@ mod tests {
             (
                 "[[runner]]\nkind = \"unittest\"\ncommand = [\"python\", \"-m\", \"unittest\", \"discover\"]",
                 "drop `discover`",
+            ),
+            (
+                "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\", \"--workspace\"]",
+                "must not contain \"--workspace\"",
+            ),
+            (
+                "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\", \"--\", \"--show-output\"]",
+                "must not contain \"--\"",
+            ),
+            (
+                "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\", \"--target-dir=/tmp/t\"]",
+                "must not contain \"--target-dir=/tmp/t\"",
             ),
             (
                 "[[runner]]\nkind = \"pytest\"\ncommand = [\"x\"]\n[mutate]\nbudget = \"soon\"",

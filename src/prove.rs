@@ -218,6 +218,8 @@ fn run_base(
 ) -> anyhow::Result<TestRun> {
     let timeout = head.run.duration * 3 + Duration::from_secs(10);
     let mut set_aside: Vec<TestCase> = Vec::new();
+    // Names that base lacks, imported outside any test, by file.
+    let mut unresolved: Vec<(String, String)> = Vec::new();
     loop {
         let run = runner.run(&RunRequest {
             worktree: &base.path,
@@ -229,10 +231,11 @@ fn run_base(
         if runner.config.kind != RunnerKind::Cargo || run.compile_errors.is_empty() {
             return Ok(run);
         }
-        let blamed = blame(&run.compile_errors, &selected, base, session)?;
+        let (blamed, names) = blame(&run.compile_errors, &selected, base, session)?;
         if blamed.is_empty() {
             return Ok(run);
         }
+        unresolved.extend(names);
         for (case, message) in &blamed {
             if let Some(i) = head.cases.iter().position(|c| c == case) {
                 statics[i] = Some(message.clone());
@@ -246,6 +249,12 @@ fn run_base(
         for file in files {
             let head_text = read_head(session, file)?;
             let without = remove_tests(&head_text, file, &set_aside);
+            let names: Vec<&str> = unresolved
+                .iter()
+                .filter(|(f, _)| f == file)
+                .map(|(_, n)| n.as_str())
+                .collect();
+            let without = lang::rust::remove_imports(&without, &names);
             write_base_copy(session, detection, base, file, &without)?;
         }
         if selected.is_empty() {
@@ -256,14 +265,17 @@ fn run_base(
 
 /// The selected tests that compile errors fall in, each with its first error. An error
 /// inside a test blames that test. An error outside every test, such as in a `use`, blames
-/// the tests in its file that name what it reports missing.
+/// the tests in its file that name what it reports missing; such names also come back by
+/// file, so the import can go with the tests.
+#[allow(clippy::type_complexity)]
 fn blame(
     errors: &[CompileError],
     selected: &[TestCase],
     base: &Worktree,
     session: &Session,
-) -> anyhow::Result<Vec<(TestCase, String)>> {
+) -> anyhow::Result<(Vec<(TestCase, String)>, Vec<(String, String)>)> {
     let mut out: Vec<(TestCase, String)> = Vec::new();
+    let mut names: Vec<(String, String)> = Vec::new();
     let mut files: Vec<&str> = selected.iter().map(|c| c.file.as_str()).collect();
     files.sort();
     files.dedup();
@@ -295,12 +307,15 @@ fn blame(
                     outside && missing_name(&e.message).is_some_and(|n| mentions(text, &n))
                 })
             };
-            if let Some(error) = inside.or_else(named) {
+            if let Some(error) = inside {
                 out.push((case.clone(), error.message.clone()));
+            } else if let Some(error) = named() {
+                out.push((case.clone(), error.message.clone()));
+                names.extend(missing_name(&error.message).map(|n| (file.to_string(), n)));
             }
         }
     }
-    Ok(out)
+    Ok((out, names))
 }
 
 static BACKTICKED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`]+)`").unwrap());
@@ -349,7 +364,9 @@ fn write_base_copy(
     file: &str,
     head_text: &str,
 ) -> anyhow::Result<()> {
-    if !detection.rust_sources.iter().any(|f| f == file) {
+    // A file that is test code throughout, such as one under `#![cfg(test)]`, goes over
+    // whole, helpers and all.
+    if !detection.rust_sources.iter().any(|f| f == file) || lang::rust::is_test_only(head_text) {
         return base.write(file, head_text.as_bytes());
     }
     let Some(original) = session.git.read_blob(&session.base_sha, file)? else {

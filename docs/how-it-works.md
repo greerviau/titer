@@ -17,7 +17,7 @@ titer runs tests through the repo's own command and the runner's native selectio
 | pytest | node ids |
 | unittest | dotted ids |
 | vitest | `file:line` |
-| cargo | the target (`--lib`, `--bin`, or `--test`) and libtest name filters |
+| cargo | the package and target (`-p`, `--lib`, `--bin`, or `--test`) and exact libtest names |
 
 The checkout's status, index, stash, and worktree list never change. titer kills its own process groups on exit, on timeout, and on SIGINT.
 
@@ -74,7 +74,7 @@ Each survivor gets two follow-up runs:
 
 Mutant outcomes are `killed`, `timed_out`, `survived`, `not_executed`, `caught_by_other`, `not_run` (the budget ran out first), and `no_result`.
 
-A mutant that does not compile gets `no_result`. A compile error is never a kill.
+A mutant that leaves any selected target unbuildable gets `no_result`, unless a test in a target that built fails. A compile error is never a kill, and a pass in one target is not a survivor while another target cannot build.
 
 Agents can add their own mutants with `--mutants`. See the [CLI reference](cli.md#agent-mutants).
 
@@ -92,13 +92,17 @@ Coverage comes from `--coverage` (lcov, Cobertura XML, or coverage.py JSON) or f
 
 Rust keeps unit tests in the source file they test. titer reads `#[cfg(test)]` items and test functions (`#[test]`, `#[tokio::test]`, `#[rstest]`, and the like) as test code:
 
-- A changed test inside a source file is a changed test.
-- Lines in test items are never mutated, and a change that edits only test items does not touch source.
-- `prove` keeps base's source code and replaces its test items with head's. Each test item goes at the end of the inline module that holds it in head.
+- A changed test inside a source file is a changed test. `#[cfg_attr(condition, test)]` also marks a test.
+- Test code is never mutated, and a change that edits only test code does not touch source. Code that shares a line with test code is still source.
+- `prove` keeps base's source code and replaces its test items with head's, in place. A new test item goes right after the nearest item before it in head that base also has, so it sees the same `macro_rules!` definitions it sees in head. A file marked `#![cfg(test)]` is test code throughout and goes onto base whole.
 
-A test that uses a name only head has stops its whole target from compiling on base. `prove` gives such a test the `missing_symbol` verdict, removes it from base, and builds again, so the other changed tests in that target still run.
+titer maps each file to the targets that compile it by following `mod` declarations, including `#[path]`, from each target's root. A module that several targets declare, such as `tests/common/mod.rs`, belongs to each of them. It lists each target's tests and selects exact names; a test that a macro such as `rstest` expands into cases selects every case.
 
-Each worktree builds its own target dir, and the first build in each one is cold. The runner's timeouts and durations count only the test binaries, so a slow cold build does not stretch mutant timeouts. On a large workspace, the first build in each mutation worker can take minutes; `--workers` limits how many cold builds run at once.
+A test that uses a name only head has stops its whole target from compiling on base. `prove` gives such a test the `missing_symbol` verdict, removes it and the imports of that name from base, and builds again, so the other changed tests in that target still run.
+
+Doc tests run with the suite, but a changed doc test is not a changed test: libtest names a doc test by its line, which differs between base and head.
+
+Each worktree builds its own target dir, and the first build in each one is cold. The runner's timeouts and durations count only the test binaries, so a slow cold build does not stretch mutant timeouts. Builds are also outside the budget: on a large workspace, the head, base, and canary builds can take minutes each, and a check can run that long past `--budget`. `--workers` limits how many cold builds run at once.
 
 ## The gate
 

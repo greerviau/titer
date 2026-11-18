@@ -73,15 +73,23 @@ impl Classifier {
         let lang = Lang::of(path);
         for (i, (config, tests, _)) in self.runners.iter().enumerate() {
             let rel = cwd_relative(path, &config.cwd);
+            // A cargo file under `src/` is source, even in a `tests` module dir: it can hold
+            // code that base must keep.
+            let in_src = config.kind == RunnerKind::Cargo && rel.split('/').any(|p| p == "src");
             if under(path, &config.cwd)
                 && lang.is_some_and(|l| runs_lang(config.kind, l))
                 && tests.is_match(&rel)
+                && !in_src
             {
                 return Role::Test { runner: i };
             }
         }
         for (i, (config, _, support)) in self.runners.iter().enumerate() {
-            if under(path, &config.cwd) && support.is_match(cwd_relative(path, &config.cwd)) {
+            let rel = cwd_relative(path, &config.cwd);
+            let rust_in_src = config.kind == RunnerKind::Cargo
+                && lang == Some(Lang::Rust)
+                && rel.split('/').any(|p| p == "src");
+            if under(path, &config.cwd) && support.is_match(&rel) && !rust_in_src {
                 return Role::Support { runner: i };
             }
         }
@@ -191,7 +199,7 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
                 }
                 let source = read_head(session, &path)?;
                 let mut changed = change.added.clone();
-                let mut test_lines = Vec::new();
+                let mut test_ranges = Vec::new();
                 if lang == Lang::Rust {
                     detection.rust_sources.push(path.clone());
                     let found =
@@ -201,15 +209,20 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
                     }
                     detection.tests.extend(found);
                     // Test code is never a mutant's target and never makes a change touch
-                    // source.
-                    test_lines = lang::rust::test_lines(&source);
+                    // source. A line it shares with other code still counts.
+                    let test_lines = lang::rust::test_lines(&source);
+                    test_ranges = lang::rust::test_ranges(&source);
                     changed.retain(|l| !test_lines.iter().any(|(s, e)| (*s..=*e).contains(l)));
                 }
                 if changed.is_empty() {
                     continue;
                 }
                 let mut functions = lang::find_functions(lang, &source);
-                functions.retain(|f| !test_lines.iter().any(|(s, e)| (*s..=*e).contains(&f.line)));
+                functions.retain(|f| {
+                    !test_ranges
+                        .iter()
+                        .any(|(s, e)| (*s..*e).contains(&f.start_byte))
+                });
                 let mut owners: BTreeSet<usize> = BTreeSet::new();
                 for line in &changed {
                     owners.extend(lang::innermost_function(&functions, *line));
@@ -323,6 +336,34 @@ mod tests {
         assert_eq!(c.role("web/scripts/build.py"), Role::NotAnalyzed);
         assert_eq!(c.role("scripts/deploy.py"), Role::NotAnalyzed);
         assert_eq!(c.role("api/README.md"), Role::NotAnalyzed);
+    }
+
+    #[test]
+    fn cargo_test_files_are_integration_tests_outside_src() {
+        let c = classifier("[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\"]\n");
+        assert_eq!(c.role("tests/api.rs"), Role::Test { runner: 0 });
+        assert_eq!(
+            c.role("crates/a/tests/common/mod.rs"),
+            Role::Test { runner: 0 }
+        );
+        assert_eq!(
+            c.role("tests/fixtures/data.json"),
+            Role::Support { runner: 0 }
+        );
+        for source in [
+            "src/tests.rs",
+            "src/tests/mod.rs",
+            "crates/a/src/x/tests/y.rs",
+        ] {
+            assert_eq!(
+                c.role(source),
+                Role::Source {
+                    runner: 0,
+                    lang: Lang::Rust
+                },
+                "{source}"
+            );
+        }
     }
 
     #[test]

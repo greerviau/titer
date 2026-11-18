@@ -59,9 +59,18 @@ mod tests {
 }
 "#;
 
-const API: &str = r#"#[test]
+// The import of double does not resolve on base, so setting aside the test that calls
+// double must also drop that name from the import.
+const API: &str = r#"use demo::{clamp, double};
+
+#[test]
 fn clamps_through_the_api() {
-    assert_eq!(demo::clamp(9, 3), 3);
+    assert_eq!(clamp(9, 3), 3);
+}
+
+#[test]
+fn doubles_through_the_api() {
+    assert_eq!(double(3), 6);
 }
 "#;
 
@@ -116,6 +125,7 @@ fn prove_splices_head_tests_into_base_and_sets_aside_tests_that_cannot_compile()
             "src/lib.rs::tests::clamps_high_values green assertion",
             "src/lib.rs::tests::doubles green missing_symbol",
             "tests/api.rs::clamps_through_the_api green assertion",
+            "tests/api.rs::doubles_through_the_api green missing_symbol",
         ],
         "{report:#}"
     );
@@ -138,8 +148,33 @@ fn prove_splices_head_tests_into_base_and_sets_aside_tests_that_cannot_compile()
 #[test]
 fn mutate_skips_test_code_and_treats_the_compile_error_canary_as_killed() {
     let repo = repo();
+    // A target dir in the checkout must not draw the build into the checkout.
+    let target = repo.path().join("target");
+    let config = format!(
+        "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\"]\nenv = {{ CARGO_TARGET_DIR = \"{}\" }}\n\n[mutate]\nbudget = \"300s\"\n",
+        target.display()
+    );
+    repo.write("titer.toml", &config);
+    repo.git(&["commit", "-qam", "target dir"]);
+    // Line 22 asserts inside a test; an agent may not mutate test code.
+    let mutants = repo.scratch().join("mutants.jsonl");
+    std::fs::write(
+        &mutants,
+        "{\"file\": \"src/lib.rs\", \"line\": 22, \"replacement\": \"        assert_eq!(clamp(5, 3), 4);\"}\n",
+    )
+    .unwrap();
+    let before = repo.checkout_state();
 
-    let output = repo.titer(&["check", "--json", "--only", "mutate", "--workers", "2"]);
+    let output = repo.titer(&[
+        "check",
+        "--json",
+        "--only",
+        "mutate",
+        "--workers",
+        "2",
+        "--mutants",
+        mutants.to_str().unwrap(),
+    ]);
 
     let report = stdout_json(&output);
     assert_schema_valid(&report);
@@ -158,6 +193,69 @@ fn mutate_skips_test_code_and_treats_the_compile_error_canary_as_killed() {
             "9 increment_int 3 killed",
             "9 swap_arithmetic / killed",
         ],
+        "{report:#}"
+    );
+    assert!(
+        report["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("lines 22-22 of src/lib.rs hold test code"),
+        "{report:#}"
+    );
+    assert!(!target.exists());
+    assert_eq!(repo.checkout_state(), before);
+}
+
+const LIMITS_BASE: &str = "pub const LIMIT: i32 = 2;\n";
+const LIMITS_HEAD: &str = r#"pub const LIMIT: i32 = 3;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn limit_is_positive() {
+        assert!(super::LIMIT > 0);
+    }
+}
+"#;
+const MAIN_BASE: &str = "const _: () = assert!(demo::LIMIT == 2);\n\nfn main() {}\n";
+const MAIN_HEAD: &str = r#"const _: () = assert!(demo::LIMIT == 3);
+
+fn main() {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn starts() {}
+}
+"#;
+
+#[test]
+fn a_mutant_that_breaks_one_selected_target_has_no_result() {
+    let repo = Fixture::new();
+    repo.write(
+        "titer.toml",
+        "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\"]\n\n[mutate]\nbudget = \"300s\"\n",
+    )
+    .write(".gitignore", "target\n")
+    .write("Cargo.toml", CARGO_TOML)
+    .write("src/lib.rs", LIMITS_BASE)
+    .write("src/main.rs", MAIN_BASE);
+    repo.commit_all("base");
+    repo.git(&["checkout", "-q", "-b", "fix"]);
+    repo.write("src/lib.rs", LIMITS_HEAD)
+        .write("src/main.rs", MAIN_HEAD);
+
+    let output = repo.titer(&["check", "--json", "--only", "mutate", "--workers", "1"]);
+
+    let report = stdout_json(&output);
+    assert_schema_valid(&report);
+    assert_eq!(
+        strings(
+            &report,
+            "mutants",
+            &["file", "line", "replacement", "outcome"]
+        ),
+        vec!["src/lib.rs 1 4 no_result", "src/main.rs 1 4 no_result",],
         "{report:#}"
     );
 }

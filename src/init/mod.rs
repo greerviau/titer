@@ -191,12 +191,13 @@ pub fn detect_runners(root: &Path) -> anyhow::Result<Vec<DetectedRunner>> {
         if let Some(r) = detect_vitest(&dir, &rel) {
             runners.push(r);
         }
-        // One cargo runner covers a workspace and every package under it; dirs come
-        // parents first.
-        let in_cargo_runner = runners.iter().any(|r| {
-            r.kind == "cargo" && (r.cwd == "." || rel.starts_with(&format!("{}/", r.cwd)))
-        });
-        if !in_cargo_runner && let Some(r) = detect_cargo(&dir, &rel) {
+        // One cargo runner covers a workspace and its members; dirs come parents first. A
+        // package that no workspace above it lists gets its own runner.
+        let member = runners
+            .iter()
+            .filter(|r| r.kind == "cargo")
+            .any(|r| workspace_member(&root.join(&r.cwd), &r.cwd, &rel));
+        if !member && let Some(r) = detect_cargo(&dir, &rel) {
             runners.push(r);
         }
         if let Some(r) = detect_python(&dir, &rel) {
@@ -292,6 +293,40 @@ fn detect_vitest(dir: &Path, rel: &str) -> Option<DetectedRunner> {
         ],
         start_dir: None,
     })
+}
+
+/// Whether the workspace whose root is `workspace_dir` (repo-relative `workspace_rel`)
+/// lists the package at repo-relative `rel` in `members` and not in `exclude`.
+fn workspace_member(workspace_dir: &Path, workspace_rel: &str, rel: &str) -> bool {
+    let inner = if workspace_rel == "." {
+        Some(rel)
+    } else {
+        rel.strip_prefix(&format!("{workspace_rel}/"))
+    };
+    let Some(inner) = inner else {
+        return false;
+    };
+    let Some(manifest) = std::fs::read_to_string(workspace_dir.join("Cargo.toml"))
+        .ok()
+        .and_then(|t| t.parse::<toml::Table>().ok())
+    else {
+        return false;
+    };
+    let Some(workspace) = manifest.get("workspace") else {
+        return false;
+    };
+    let matches = |key: &str| {
+        let globs: Vec<String> = workspace
+            .get(key)
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .map(|g| g.trim_end_matches('/').to_string())
+            .collect();
+        crate::detect::glob_set(&globs).is_ok_and(|set| set.is_match(inner))
+    };
+    matches("members") && !matches("exclude")
 }
 
 fn detect_cargo(dir: &Path, rel: &str) -> Option<DetectedRunner> {

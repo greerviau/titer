@@ -354,6 +354,10 @@ mod tests {
 "#;
         let functions = find_functions(Lang::Rust, rs);
         assert_eq!(complexity(Lang::Rust, rs, &functions[0]), 10);
+        let attributed = "#[inline]\npub fn g(x: bool) -> i32 {\n    if x { 1 } else { 2 }\n}\n";
+        let functions = find_functions(Lang::Rust, attributed);
+        assert_eq!(functions[0].line, 1);
+        assert_eq!(complexity(Lang::Rust, attributed, &functions[0]), 2);
     }
 
     #[test]

@@ -2,10 +2,10 @@
 //! libtest's plain output.
 //!
 //! A test id is the file and the path inside it, `src/math.rs::tests::muls`. The file maps
-//! to its package and target (`--lib`, `--bin`, or `--test`) and to its module path inside
-//! the target, which together give libtest's name, `math::tests::muls`. Filters match by
-//! substring, so a filter also selects tests that a parametrizing macro such as `rstest`
-//! generates under the test's name; results are read back by exact name or that prefix.
+//! to the targets that compile it (`--lib`, `--bin`, or `--test` of a package) and to its
+//! module path in each, which together give libtest's name, `math::tests::muls`. titer
+//! lists each target's tests and selects exact names: the test's own name, or each case a
+//! parametrizing macro such as `rstest` generates under it.
 //!
 //! The build runs before the tests, with its own generous timeout. The run's timeout and
 //! duration cover the test binaries only: each worktree's first build is cold, and counting
@@ -26,7 +26,11 @@ use super::{
     CompileError, Failure, FailureKind, FileError, RunRequest, Runner, Selection, Status, TestCase,
     TestOutcome, TestRun, cwd_relative, output_tail,
 };
+use crate::lang::{self, Lang, PythonStyle};
 use crate::process::RunOutput;
+use targets::{Target, targets_of};
+
+mod targets;
 
 /// How long a build may take. Builds do not hang the way tests can, and a cold build of a
 /// large workspace can take many minutes.
@@ -40,210 +44,140 @@ pub fn test_id(rel: &str, suite: &[String], name: &str) -> String {
     parts.join("::")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum Kind {
-    Lib,
-    Bin(String),
-    Test(String),
-}
-
-/// The compiled target that holds a file.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct Target {
-    package: Option<String>,
-    kind: Kind,
-    /// The target's root file, relative to the runner's cwd.
-    root: String,
-}
-
-impl Target {
-    fn args(&self) -> Vec<String> {
-        let mut args = Vec::new();
-        if let Some(package) = &self.package {
-            args.extend(["-p".to_string(), package.clone()]);
-        }
-        match &self.kind {
-            Kind::Lib => args.push("--lib".to_string()),
-            Kind::Bin(name) => args.extend(["--bin".to_string(), name.clone()]),
-            Kind::Test(name) => args.extend(["--test".to_string(), name.clone()]),
-        }
-        args
-    }
-}
-
-/// The target and module path of a cwd-relative file, from cargo's default layout. Files
-/// outside it, such as a module that a `#[path]` attribute names, have no target.
-fn target_of(cwd: &Path, rel: &str) -> Option<(Target, Vec<String>)> {
-    let (package_dir, package) = package_of(cwd, rel)?;
-    let in_package = if package_dir.is_empty() {
-        rel
-    } else {
-        rel.strip_prefix(&format!("{package_dir}/"))?
-    };
-    let dir = cwd.join(&package_dir);
-    let root = |file: &str| {
-        if package_dir.is_empty() {
-            file.to_string()
-        } else {
-            format!("{package_dir}/{file}")
-        }
-    };
-    let target = |kind: Kind, file: &str| Target {
-        package: package.clone(),
-        kind,
-        root: root(file),
-    };
-    let stem = |f: &str| f.strip_suffix(".rs").map(str::to_string);
-    let parts: Vec<&str> = in_package.split('/').collect();
-    let package_name = package.clone().unwrap_or_default();
-    Some(match parts.as_slice() {
-        ["src", "lib.rs"] => (target(Kind::Lib, "src/lib.rs"), Vec::new()),
-        ["src", "main.rs"] => (target(Kind::Bin(package_name), "src/main.rs"), Vec::new()),
-        ["src", "bin", file] => {
-            let name = stem(file)?;
-            let root = format!("src/bin/{file}");
-            (target(Kind::Bin(name), &root), Vec::new())
-        }
-        ["src", "bin", name, rest @ ..] => {
-            let root = format!("src/bin/{name}/main.rs");
-            let module = if rest == ["main.rs"] {
-                Vec::new()
-            } else {
-                module_path(rest)
-            };
-            (target(Kind::Bin(name.to_string()), &root), module)
-        }
-        ["src", rest @ ..] => {
-            let kind = if dir.join("src/lib.rs").is_file() {
-                (Kind::Lib, "src/lib.rs")
-            } else if dir.join("src/main.rs").is_file() {
-                (Kind::Bin(package_name), "src/main.rs")
-            } else {
-                return None;
-            };
-            (target(kind.0, kind.1), module_path(rest))
-        }
-        ["tests", file] => {
-            let name = stem(file)?;
-            (
-                target(Kind::Test(name), &format!("tests/{file}")),
-                Vec::new(),
-            )
-        }
-        ["tests", name, rest @ ..] => {
-            let root = format!("tests/{name}/main.rs");
-            if !dir.join(&root).is_file() {
-                return None;
-            }
-            let module = if rest == ["main.rs"] {
-                Vec::new()
-            } else {
-                module_path(rest)
-            };
-            (target(Kind::Test(name.to_string()), &root), module)
-        }
-        _ => return None,
-    })
-}
-
-/// `["a", "b.rs"]` and `["a", "b", "mod.rs"]` are module `a::b`.
-fn module_path(parts: &[&str]) -> Vec<String> {
-    let mut out: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
-    if out.last().is_some_and(|l| l == "mod.rs") {
-        out.pop();
-    } else if let Some(last) = out.last_mut() {
-        *last = last.trim_end_matches(".rs").to_string();
-    }
-    out
-}
-
-/// The nearest dir at or above `rel`'s dir, inside the cwd, with a `[package]` manifest:
-/// its cwd-relative path and the package name.
-fn package_of(cwd: &Path, rel: &str) -> Option<(String, Option<String>)> {
-    let mut dir = Path::new(rel).parent();
-    while let Some(d) = dir {
-        if let Ok(text) = std::fs::read_to_string(cwd.join(d).join("Cargo.toml"))
-            && let Ok(manifest) = text.parse::<toml::Table>()
-            && let Some(package) = manifest.get("package")
-        {
-            let name = package
-                .get("name")
-                .and_then(|n| n.as_str())
-                .map(str::to_string);
-            return Some((d.to_string_lossy().into_owned(), name));
-        }
-        dir = d.parent();
-    }
-    None
-}
-
-/// One cargo invocation: a target, or the whole configured suite, and its filters.
+/// One cargo invocation: a target and the tests wanted from it, or the whole suite.
 struct Group<'a> {
     target: Option<Target>,
-    /// libtest name filters; empty runs every test in the target.
-    filters: Vec<String>,
-    /// Selected cases and their libtest names.
-    cases: Vec<(&'a TestCase, String)>,
+    /// libtest names, each with the selected case it stands for.
+    wanted: Vec<(Option<&'a TestCase>, String)>,
 }
 
 fn groups<'a>(runner: &Runner, cwd: &Path, selection: &Selection<'a>) -> Vec<Group<'a>> {
     let rel = |f: &str| cwd_relative(f, &runner.config.cwd);
+    let mut by_target: BTreeMap<Target, Vec<(Option<&'a TestCase>, String)>> = BTreeMap::new();
+    let mut add = |file: &str, case: Option<&'a TestCase>, suite: &[String], name: &str| {
+        for (target, module) in targets_of(cwd, &rel(file)) {
+            let mut path = module;
+            path.extend(suite.iter().cloned());
+            path.push(name.to_string());
+            by_target
+                .entry(target)
+                .or_default()
+                .push((case, path.join("::")));
+        }
+    };
     match selection {
         Selection::Tests(cases) => {
-            let mut by_target: BTreeMap<Target, Vec<(&TestCase, String)>> = BTreeMap::new();
             for case in cases.iter() {
-                let Some((target, module)) = target_of(cwd, &rel(&case.file)) else {
-                    continue;
-                };
-                let mut path = module;
-                path.extend(case.suite.iter().cloned());
-                path.push(case.name.clone());
-                by_target
-                    .entry(target)
-                    .or_default()
-                    .push((case, path.join("::")));
+                add(&case.file, Some(case), &case.suite, &case.name);
             }
-            by_target
-                .into_iter()
-                .map(|(target, cases)| {
-                    let mut filters: Vec<String> = cases.iter().map(|(_, n)| n.clone()).collect();
-                    filters.dedup();
-                    Group {
-                        target: Some(target),
-                        filters,
-                        cases,
-                    }
-                })
-                .collect()
         }
+        // A file's own tests, not the rest of its target.
         Selection::Files(files) => {
-            let mut by_target: BTreeMap<Target, Option<Vec<String>>> = BTreeMap::new();
             for file in files.iter() {
-                let Some((target, module)) = target_of(cwd, &rel(file)) else {
-                    continue;
-                };
-                let entry = by_target.entry(target).or_insert_with(|| Some(Vec::new()));
-                match (entry.as_mut(), module.is_empty()) {
-                    // The target's root file selects the whole target.
-                    (_, true) => *entry = None,
-                    (Some(filters), false) => filters.push(format!("{}::", module.join("::"))),
-                    (None, false) => {}
+                let source = std::fs::read_to_string(cwd.join(rel(file))).unwrap_or_default();
+                for def in lang::find_tests(Lang::Rust, &source, PythonStyle::Pytest) {
+                    add(file, None, &def.suite, &def.name);
                 }
             }
-            by_target
-                .into_iter()
-                .map(|(target, filters)| Group {
-                    target: Some(target),
-                    filters: filters.unwrap_or_default(),
-                    cases: Vec::new(),
-                })
-                .collect()
         }
-        Selection::Suite => vec![Group {
-            target: None,
-            filters: Vec::new(),
-            cases: Vec::new(),
-        }],
+        Selection::Suite => {
+            return vec![Group {
+                target: None,
+                wanted: Vec::new(),
+            }];
+        }
+    }
+    by_target
+        .into_iter()
+        .map(|(target, wanted)| Group {
+            target: Some(target),
+            wanted,
+        })
+        .collect()
+}
+
+/// The exact libtest names to run for each wanted name: the name itself, or, when a macro
+/// such as `rstest` expands the test into a module of cases, every case under it.
+fn resolve<'a>(
+    wanted: &[(Option<&'a TestCase>, String)],
+    listed: &[String],
+) -> BTreeMap<String, Option<&'a TestCase>> {
+    let mut out = BTreeMap::new();
+    for (case, name) in wanted {
+        if listed.contains(name) {
+            out.insert(name.clone(), *case);
+            continue;
+        }
+        let prefix = format!("{name}::");
+        for l in listed.iter().filter(|l| l.starts_with(&prefix)) {
+            out.insert(l.clone(), *case);
+        }
+    }
+    out
+}
+
+/// Builds the group's target, or every test target for the suite. Returns false when the
+/// build did not succeed, after recording why.
+fn build(
+    runner: &Runner,
+    req: &RunRequest,
+    target_args: &[String],
+    run: &mut TestRun,
+) -> anyhow::Result<bool> {
+    let mut args = vec!["--no-run".to_string(), "--message-format=short".to_string()];
+    args.extend(target_args.iter().cloned());
+    let build = exec(runner, req, &args, Some(BUILD_TIMEOUT))?;
+    if build.timed_out {
+        run.timed_out = true;
+        return Ok(false);
+    }
+    if build.success() {
+        return Ok(true);
+    }
+    let errors = compile_errors(&build.stderr);
+    let summary = if errors.is_empty() {
+        output_tail(&build)
+    } else {
+        ERROR_LINE
+            .find_iter(&build.stderr)
+            .take(10)
+            .map(|m| m.as_str().trim())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    run.runner_error = Some(format!("the build failed:\n{summary}"));
+    run.compile_errors.extend(errors);
+    Ok(false)
+}
+
+/// The test names that the target's binary lists.
+fn list(runner: &Runner, req: &RunRequest, target_args: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut args = target_args.to_vec();
+    args.extend(["--", "--list", "--format", "terse"].map(String::from));
+    let out = exec(runner, req, &args, Some(BUILD_TIMEOUT))?;
+    Ok(out
+        .stdout
+        .lines()
+        .filter_map(|l| l.strip_suffix(": test"))
+        .map(str::to_string)
+        .collect())
+}
+
+/// The suite's arguments: every member of a workspace, unless the command picks packages.
+fn suite_args(runner: &Runner, cwd: &Path) -> Vec<String> {
+    let picks = runner
+        .config
+        .command
+        .iter()
+        .any(|a| a == "-p" || a.starts_with("--package"));
+    let workspace = std::fs::read_to_string(cwd.join("Cargo.toml"))
+        .ok()
+        .and_then(|t| t.parse::<toml::Table>().ok())
+        .is_some_and(|m| m.contains_key("workspace"));
+    if workspace && !picks {
+        vec!["--workspace".to_string()]
+    } else {
+        Vec::new()
     }
 }
 
@@ -260,31 +194,27 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
     };
     let sequential = matches!(req.selection, Selection::Tests(_));
     for group in groups(runner, &cwd, &req.selection) {
-        let target_args = group.target.as_ref().map(Target::args).unwrap_or_default();
-
-        let mut args = vec!["--no-run".to_string(), "--message-format=short".to_string()];
-        args.extend(target_args.iter().cloned());
-        let build = exec(runner, req, &args, Some(BUILD_TIMEOUT))?;
-        if build.timed_out {
-            run.timed_out = true;
-            break;
-        }
-        if !build.success() {
-            let errors = compile_errors(&build.stderr);
-            let summary = if errors.is_empty() {
-                output_tail(&build)
-            } else {
-                ERROR_LINE
-                    .find_iter(&build.stderr)
-                    .take(10)
-                    .map(|m| m.as_str().trim())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            run.runner_error = Some(format!("the build failed:\n{summary}"));
-            run.compile_errors.extend(errors);
+        let target_args = match &group.target {
+            Some(t) => t.args(),
+            None => suite_args(runner, &cwd),
+        };
+        if !build(runner, req, &target_args, &mut run)? {
+            if run.timed_out {
+                break;
+            }
             continue;
         }
+        let selected = match &group.target {
+            Some(_) => {
+                let listed = list(runner, req, &target_args)?;
+                let selected = resolve(&group.wanted, &listed);
+                if selected.is_empty() {
+                    continue;
+                }
+                Some(selected)
+            }
+            None => None,
+        };
 
         let remaining = req.timeout.map(|t| t.saturating_sub(run.duration));
         if remaining.is_some_and(|r| r.is_zero()) {
@@ -293,13 +223,21 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
         }
         let mut args = target_args;
         args.extend(["--".to_string(), "--color".to_string(), "never".to_string()]);
-        if sequential {
-            args.push("--test-threads=1".to_string());
+        if let Some(selected) = &selected {
+            args.push("--exact".to_string());
+            if sequential {
+                args.push("--test-threads=1".to_string());
+            }
+            args.extend(selected.keys().cloned());
         }
-        args.extend(group.filters.iter().cloned());
         let out = exec(runner, req, &args, remaining)?;
         run.duration += out.duration;
         run.max_rss_bytes = run.max_rss_bytes.max(out.max_rss_bytes);
+        let case_of = |name: &str| {
+            selected
+                .as_ref()
+                .and_then(|s| s.get(name).copied().flatten())
+        };
 
         let blocks = parse(&out.stdout);
         let files = binary_files(&out.stderr);
@@ -312,7 +250,7 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
             for (name, status) in &block.results {
                 failed |= matches!(status, Status::Failed(_));
                 run.outcomes.push(outcome(
-                    &group,
+                    case_of(name),
                     &file,
                     name,
                     status.clone(),
@@ -330,7 +268,7 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
             };
             match &block.running {
                 Some(name) => run.outcomes.push(outcome(
-                    &group,
+                    case_of(name),
                     &file,
                     name,
                     Status::Failed(failure),
@@ -361,35 +299,29 @@ fn exec(
 ) -> anyhow::Result<RunOutput> {
     let mut cmd = runner.command(req.worktree, args);
     cmd.env("CARGO_TERM_COLOR", "never");
-    // Each worktree builds into its own dir: a target dir shared through the environment
-    // would let one worktree's mutant overwrite another's binaries.
-    for (key, value) in [
-        (
-            "CARGO_TARGET_DIR",
-            req.worktree
-                .join(".titer-cache/cargo-target")
-                .into_os_string(),
-        ),
-        ("RUST_BACKTRACE", "0".into()),
-    ] {
-        if !runner.config.env.contains_key(key) {
-            cmd.env(key, value);
-        }
+    // Each worktree builds into its own dir, whatever the environment, the runner's `env`,
+    // or a cargo config says: a shared dir would let one worktree's mutant overwrite
+    // another's binaries, and a dir in the checkout would be a write to the checkout.
+    let target = req.worktree.join(".titer-cache/cargo-target");
+    cmd.env("CARGO_TARGET_DIR", &target)
+        .env("CARGO_BUILD_BUILD_DIR", &target);
+    if !runner.config.env.contains_key("RUST_BACKTRACE") {
+        cmd.env("RUST_BACKTRACE", "0");
     }
     crate::process::run(cmd, timeout, req.scratch)
 }
 
 /// The outcome for a reported libtest name. A selected case's outcome carries its id, so
 /// tests with one name in two targets stay apart.
-fn outcome(group: &Group, file: &str, name: &str, status: Status, cwd: &str) -> TestOutcome {
-    let case = group.cases.iter().find(|(_, n)| {
-        name == n
-            || name
-                .strip_prefix(n.as_str())
-                .is_some_and(|r| r.starts_with("::"))
-    });
+fn outcome(
+    case: Option<&TestCase>,
+    file: &str,
+    name: &str,
+    status: Status,
+    cwd: &str,
+) -> TestOutcome {
     match case {
-        Some((case, _)) => TestOutcome {
+        Some(case) => TestOutcome {
             id: Some(case.id.clone()),
             file: format!("./{}", cwd_relative(&case.file, cwd)),
             suite: case.suite.clone(),
@@ -594,13 +526,6 @@ fn failure_from(lines: &[&str]) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn module_paths_follow_the_file_layout() {
-        assert_eq!(module_path(&["math.rs"]), vec!["math"]);
-        assert_eq!(module_path(&["a", "mod.rs"]), vec!["a"]);
-        assert_eq!(module_path(&["a", "b.rs"]), vec!["a", "b"]);
-    }
 
     #[test]
     fn parses_results_sections_and_an_unfinished_test() {

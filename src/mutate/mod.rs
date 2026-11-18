@@ -158,6 +158,12 @@ pub fn generate(ctx: &Context) -> anyhow::Result<Vec<(Mutant, Job)>> {
         }
         let text = detect::read_head(&ctx.session, &source.file)?;
         let base = BaseHunks::load(&ctx.session, &source.file, source.lang)?;
+        // Test code that shares a changed line with source code is not a target.
+        let tests = if source.lang == Lang::Rust {
+            crate::lang::rust::test_ranges(&text)
+        } else {
+            Vec::new()
+        };
         for cand in operators::generate(
             source.lang,
             &text,
@@ -165,6 +171,12 @@ pub fn generate(ctx: &Context) -> anyhow::Result<Vec<(Mutant, Job)>> {
             &calls,
             &config.exclude_operators,
         ) {
+            if tests
+                .iter()
+                .any(|(s, e)| cand.start_byte < *e && *s < cand.end_byte)
+            {
+                continue;
+            }
             let mutated = cand.apply(&text);
             let mut mutant = mutant_from(
                 &ctx.runners[source.runner],
@@ -457,7 +469,9 @@ fn error_result(e: anyhow::Error) -> JobResult {
 }
 
 /// Killed when a selected test fails or the mutant breaks a selected file's import; survived
-/// when a selected test passed and none failed; no result when nothing executed.
+/// when a selected test passed, none failed, and every selected target built; no result
+/// otherwise. A target that does not build ran none of its tests, so a pass elsewhere is
+/// not a survivor.
 pub fn classify(run: &TestRun, plan: &Plan, cwd: &str) -> (MutantOutcome, Option<String>) {
     if run.timed_out {
         return (MutantOutcome::TimedOut, None);
@@ -485,7 +499,9 @@ pub fn classify(run: &TestRun, plan: &Plan, cwd: &str) -> (MutantOutcome, Option
                     Some(e.file.trim_start_matches("./").to_string()),
                 );
             }
-            if results.iter().any(|(_, r)| *r == CaseResult::Passed) {
+            if results.iter().any(|(_, r)| *r == CaseResult::Passed)
+                && run.compile_errors.is_empty()
+            {
                 return (MutantOutcome::Survived, None);
             }
         }
@@ -507,7 +523,7 @@ pub fn classify(run: &TestRun, plan: &Plan, cwd: &str) -> (MutantOutcome, Option
             if let Some(e) = run.file_errors.first() {
                 return (MutantOutcome::Killed, Some(e.file.clone()));
             }
-            if run.executed() > 0 {
+            if run.executed() > 0 && run.compile_errors.is_empty() {
                 return (MutantOutcome::Survived, None);
             }
         }

@@ -317,3 +317,107 @@ fn the_timeout_limits_the_tests_and_not_the_build() {
     assert!(run.compile_errors.is_empty(), "{run:?}");
     assert!(run.duration < Duration::from_secs(10), "{run:?}");
 }
+
+const NAMES: &str = r#"pub mod math;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn checks() {}
+
+    mod checks {
+        #[test]
+        fn unrelated() {
+            panic!("not the selected test");
+        }
+    }
+
+    // What a parametrizing macro such as rstest generates for `fn param`.
+    mod param {
+        #[test]
+        fn case_1() {}
+
+        #[test]
+        fn case_2() {
+            assert_eq!(1, 2);
+        }
+    }
+}
+"#;
+
+#[test]
+fn a_test_and_a_module_of_one_name_stay_apart_and_macro_cases_aggregate() {
+    let repo = fixture();
+    repo.write("rs/src/lib.rs", NAMES);
+    let runner = runner();
+    let checks = case(&runner, "rs/src/lib.rs", &["tests"], "checks");
+    let param = case(&runner, "rs/src/lib.rs", &["tests"], "param");
+
+    let run = run(
+        &repo,
+        &runner,
+        Selection::Tests(&[checks.clone(), param.clone()]),
+        None,
+    );
+
+    assert_eq!(run.result_for(&checks, "rs"), CaseResult::Passed, "{run:?}");
+    assert!(
+        !run.outcomes.iter().any(|o| o.name.contains("unrelated")),
+        "{run:?}"
+    );
+    let CaseResult::Failed(f) = run.result_for(&param, "rs") else {
+        panic!("{run:?}")
+    };
+    assert_eq!(f.kind, FailureKind::Assertion);
+    assert_eq!(run.executed(), 3, "{run:?}");
+}
+
+#[test]
+fn file_selection_runs_only_the_tests_in_that_file() {
+    let repo = fixture();
+    repo.write("rs/src/lib.rs", NAMES);
+    let runner = runner();
+
+    // The target's root file: its own tests, not the tests of the modules it declares.
+    let files = vec!["rs/src/lib.rs".to_string()];
+    let run = run(&repo, &runner, Selection::Files(&files), None);
+
+    let mut names: Vec<String> = run.outcomes.iter().map(|o| o.name.clone()).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "tests::checks",
+            "tests::checks::unrelated",
+            "tests::param::case_1",
+            "tests::param::case_2"
+        ]
+    );
+}
+
+#[test]
+fn the_suite_of_a_workspace_runs_every_member() {
+    let repo = Fixture::new();
+    repo.write(
+        "rs/Cargo.toml",
+        "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n\n[package]\nname = \"root\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .write("rs/src/lib.rs", "#[test]\nfn in_root() {}\n");
+    for member in ["a", "b"] {
+        repo.write(
+            &format!("rs/{member}/Cargo.toml"),
+            &format!("[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .write(
+            &format!("rs/{member}/src/lib.rs"),
+            &format!("#[test]\nfn in_{member}() {{}}\n"),
+        );
+    }
+    let runner = runner();
+
+    let run = run(&repo, &runner, Selection::Suite, None);
+
+    let mut names: Vec<String> = run.outcomes.iter().map(|o| o.name.clone()).collect();
+    names.sort();
+    assert_eq!(names, vec!["in_a", "in_b", "in_root"], "{run:?}");
+}

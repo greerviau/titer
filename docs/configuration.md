@@ -71,11 +71,15 @@ Defaults per kind:
 | pytest | `**/test_*.py`, `**/*_test.py` | `**/conftest.py`, `tests/**`, `test/**` | `.venv`, `venv` |
 | unittest | `**/test*.py` | `**/conftest.py`, `tests/**`, `test/**` | `.venv`, `venv` |
 | vitest | `**/*.{test,spec}.{ts,tsx,mts,cts,js,jsx,mjs,cjs}` | `**/__tests__/**`, `**/__mocks__/**`, `**/__snapshots__/**`, `**/__fixtures__/**`, `**/test-utils/**`, `**/test-setup.*`, `**/setupTests.*`, `**/vitest.setup.*`, `test/**`, `tests/**` | `node_modules` |
-| cargo | `**/tests/**/*.rs`, `**/tests.rs` | `**/tests/**`, `**/testdata/**`, `**/snapshots/**` | none |
+| cargo | `**/tests/**/*.rs` | `**/tests/**`, `**/testdata/**`, `**/snapshots/**` | none |
 
 Python commands should not sync the environment. Use `uv run --no-sync`, because worktrees share the checkout's `.venv`.
 
-A cargo runner's command is `cargo test` plus any flags the repo needs, such as `["cargo", "test", "--features", "postgres"]`. Put the runner's `cwd` at the workspace root. A cargo runner also finds the unit tests inside source files, so its `test_globs` cover only integration tests and `tests.rs` files. Each worktree builds into its own target dir, so titer ignores `CARGO_TARGET_DIR` unless `env` sets it.
+A cargo runner's command is `cargo test` plus any flags the repo needs, such as `["cargo", "test", "--features", "postgres"]`. titer picks the packages, targets, and test names itself, so the command must not contain `--`, `--quiet`, `--workspace`, `--exclude`, a target flag such as `--lib` or `--tests`, `--no-run`, `--message-format`, or `--target-dir`. Put the runner's `cwd` at the workspace root.
+
+A cargo runner finds the unit tests inside source files by their attributes, so its `test_globs` cover only integration tests. A file under a `src` dir is never a test file or a support file, even in a `tests` module dir, because it can hold source code that base must keep.
+
+Each worktree builds into its own target dir. titer sets `CARGO_TARGET_DIR` for every cargo command and overrides the environment, `env`, and cargo config, so no build writes into the checkout or into a dir that worktrees share.
 
 ## gate
 

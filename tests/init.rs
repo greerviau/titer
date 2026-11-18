@@ -252,3 +252,39 @@ fn init_detects_a_cargo_workspace_once_at_its_root() {
     );
     assert!(!stdout.contains("cwd ="), "{stdout}");
 }
+
+#[test]
+fn init_gives_a_nested_crate_outside_the_workspace_its_own_runner() {
+    let repo = Fixture::new();
+    repo.write(".gitignore", "target\n")
+        .write(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/skip\"]\n",
+        )
+        .write("src/lib.rs", "")
+        .write(
+            "crates/member/Cargo.toml",
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .write("crates/member/src/lib.rs", "")
+        .write(
+            "crates/skip/Cargo.toml",
+            "[package]\nname = \"skip\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .write("crates/skip/src/lib.rs", "")
+        .write(
+            "fuzz/Cargo.toml",
+            "[package]\nname = \"fuzz\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .write("fuzz/src/lib.rs", "");
+    repo.commit_all("base");
+
+    let output = repo.titer(&["init", "--dry-run"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert_eq!(stdout.matches("kind = \"cargo\"").count(), 3, "{stdout}");
+    assert!(stdout.contains("cwd = \"crates/skip\""), "{stdout}");
+    assert!(stdout.contains("cwd = \"fuzz\""), "{stdout}");
+    assert!(!stdout.contains("cwd = \"crates/member\""), "{stdout}");
+}

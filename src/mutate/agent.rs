@@ -68,6 +68,19 @@ pub fn load(ctx: &Context, path: &Path) -> anyhow::Result<Loaded> {
             }
         };
         let end = spec.end_line.unwrap_or(spec.line);
+        let in_tests = crate::lang::Lang::of(&spec.file) == Some(crate::lang::Lang::Rust)
+            && crate::lang::rust::test_spans(&original)
+                .iter()
+                .any(|(s, e)| spec.line <= *e && *s <= end);
+        if in_tests {
+            warnings.push(format!(
+                "agent mutant on line {} skipped: lines {}-{end} of {} hold test code",
+                n + 1,
+                spec.line,
+                spec.file
+            ));
+            continue;
+        }
         let lines: Vec<&str> = original.split_inclusive('\n').collect();
         if spec.line == 0 || end < spec.line || end as usize > lines.len() {
             warnings.push(format!(
