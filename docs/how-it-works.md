@@ -63,7 +63,7 @@ Read the failure message of each proven test and check that it is the behavior t
 
 The head-green changed tests run against each mutant in parallel workers. If the change has no changed tests, the whole suite runs instead.
 
-Before any mutant, a canary raises at the top of a changed module. The canary must be killed. If it survives, the worktree is not loading the code titer mutates, for example because of an editable install, and the check exits 2. A Rust module runs no code when it loads, so its canary is a `compile_error!` instead, and a build that fails counts as killed.
+Before any mutant, a canary raises at the top of a changed module. Just before it raises, it writes a marker file. The canary must be killed, or leave its marker: a test that imports the module inside `try` and falls back on failure swallows the raise, but the marker shows the module loaded. If the canary survives without a marker, the worktree is not loading the code titer mutates, for example because of an editable install, and the check exits 2. A Rust module runs no code when it loads, so its canary is a `compile_error!` instead, and a build that fails counts as killed.
 
 A mutant whose code also appears in the base lines its hunk replaces gets `unchanged_from_base: true`. The change may only have moved or reformatted that code.
 

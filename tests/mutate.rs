@@ -1,6 +1,6 @@
 mod common;
 
-use common::{Fixture, assert_schema_valid, fixture_python, stdout_json};
+use common::{Fixture, assert_schema_valid, fixture_node_modules, fixture_python, stdout_json};
 use serde_json::Value;
 
 const CLAMP_BASE: &str = "def clamp(x, hi):\n    return x\n";
@@ -128,6 +128,63 @@ fn a_canary_that_survives_everywhere_exits_2() {
             .as_str()
             .unwrap()
             .contains("canary"),
+        "{report:#}"
+    );
+}
+
+#[test]
+fn a_test_that_catches_the_import_error_still_runs_its_mutants() {
+    let repo = repo("120s");
+    // An optional fast path: the test falls back when the module fails to import, which
+    // also swallows the canary, though the tests load the module and catch real mutants.
+    repo.write("app.py", CLAMP_HEAD).write(
+        "test_app.py",
+        &CLAMP_TEST.replace(
+            "from app import clamp\n",
+            "try:\n    from app import clamp\nexcept Exception:\n    def clamp(x, hi):\n        return min(x, hi)\n",
+        ),
+    );
+
+    let output = repo.titer(&["check", "--json", "--only", "mutate"]);
+
+    let report = stdout_json(&output);
+    assert_eq!(output.status.code(), Some(0), "{report:#}");
+    let mut got = outcomes(&report);
+    got.sort();
+    assert_eq!(
+        got.iter().map(|o| o.3.as_str()).collect::<Vec<_>>(),
+        ["killed", "survived", "killed"],
+        "{report:#}"
+    );
+}
+
+#[test]
+fn a_vitest_test_that_catches_the_import_error_still_runs_its_mutants() {
+    let repo = Fixture::new();
+    repo.write(".gitignore", "node_modules\n")
+        .write(
+            "titer.toml",
+            "[[runner]]\nkind = \"vitest\"\ncommand = [\"npx\", \"--no-install\", \"vitest\", \"run\"]\n",
+        )
+        .write("package.json", "{\n  \"type\": \"module\"\n}\n")
+        .write("src/half.ts", "export const half = (x: number) => x;\n");
+    std::os::unix::fs::symlink(fixture_node_modules(), repo.path().join("node_modules")).unwrap();
+    repo.commit_all("base");
+    repo.git(&["checkout", "-q", "-b", "fix"]);
+    repo.write("src/half.ts", "export const half = (x: number) => x / 2;\n")
+        .write(
+            "src/half.test.ts",
+            "import { it, expect } from \"vitest\";\n\nlet half: (x: number) => number;\ntry {\n  ({ half } = await import(\"./half\"));\n} catch {\n  half = (x) => x / 2;\n}\n\nit(\"halves\", () => {\n  expect(half(4)).toBe(2);\n});\n",
+        );
+
+    let output = repo.titer(&["check", "--json", "--only", "mutate"]);
+
+    let report = stdout_json(&output);
+    assert_eq!(output.status.code(), Some(0), "{report:#}");
+    let mutants = report["mutants"].as_array().unwrap();
+    assert!(!mutants.is_empty(), "{report:#}");
+    assert!(
+        mutants.iter().all(|m| m["outcome"] == "killed"),
         "{report:#}"
     );
 }
