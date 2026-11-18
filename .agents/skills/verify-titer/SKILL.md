@@ -29,7 +29,7 @@ The two versions match. `.fixture-deps/venv/bin/python -m pytest --version` prin
 
 ## Drive
 
-`scripts/check.sh MODE [titer check args...]` builds a fixture repo with `scripts/action-fixture.sh`, runs `titer check --json --markdown` in it, and writes the evidence. MODE is `proven` (a new test fails on base) or `unproven` (a new test never exercises the change). Extra arguments go to `titer check`.
+`scripts/check.sh MODE [titer check args...]` builds a fixture repo with `scripts/action-fixture.sh`, runs `titer check --json --markdown --annotations` in it, and writes the evidence. MODE is `proven` (a new test fails on base) or `unproven` (a new test never exercises the change). Extra arguments go to `titer check`.
 
 ```sh
 .agents/skills/verify-titer/scripts/check.sh proven
@@ -46,6 +46,7 @@ A real repo also works, such as a clone of a project that already has `titer.tom
 
 - `report.json`: the JSON report from stdout.
 - `summary.md`: the `--markdown` summary, the same text the Action posts as a PR comment.
+- `annotations.txt`: the `--annotations` workflow commands, which the Action prints so GitHub shows them on the diff.
 - `stderr.txt` and `exit-code.txt`.
 
 ## Cleanup

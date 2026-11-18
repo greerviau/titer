@@ -9,7 +9,7 @@
 
 ## How to reach it
 
-`titer check --markdown FILE` writes the summary. The GitHub Action (`action.yml`) runs the same command and posts the file as the job summary and, with `comment: true`, as a PR comment.
+`titer check --markdown FILE` writes the summary, and `--annotations FILE` writes the annotations. The GitHub Action (`action.yml`) passes both, posts the summary as the job summary and, with `comment: true`, as a PR comment, and prints the annotations so GitHub shows them on the diff.
 
 ## Driving it
 
@@ -18,7 +18,7 @@
 .agents/skills/verify-titer/scripts/check.sh unproven
 ```
 
-Read `summary.md` in the printed evidence directory. Annotations come from the Action's `annotations` step, which renders them from `report.json`; the unit tests in `src/summary.rs` cover their text.
+Read `summary.md` and `annotations.txt` in the printed evidence directory.
 
 ## Gotchas
 
