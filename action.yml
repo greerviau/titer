@@ -68,12 +68,20 @@ runs:
         annotations=$(mktemp "$RUNNER_TEMP/titer-annotations.XXXXXX")
         echo "report=$report" >> "$GITHUB_OUTPUT"
         echo "summary=$summary" >> "$GITHUB_OUTPUT"
+        # The commit reviewers see: the pull request head, even when the checkout is the
+        # merge commit GitHub builds for pull_request events.
+        checked_out=$(git rev-parse HEAD 2>/dev/null || true)
+        label="${TITER_PR_HEAD:-$checked_out}"
 
         # Publishes the summary, or a short one when titer wrote none, and exits with $1.
         finish() {
           code=$1
           if [ ! -s "$summary" ]; then
-            printf '<!-- titer-report -->\n### titer: could not run\n\n%s See the job log.\n' "$2" > "$summary"
+            if [ -n "$label" ]; then
+              printf '<!-- titer-report -->\n<!-- titer-commit: %s -->\n### titer: could not run for `%.7s`\n\n%s See the job log.\n' "$label" "$label" "$2" > "$summary"
+            else
+              printf '<!-- titer-report -->\n### titer: could not run\n\n%s See the job log.\n' "$2" > "$summary"
+            fi
           fi
           cat "$summary" >> "$GITHUB_STEP_SUMMARY"
           echo "exit-code=$code" >> "$GITHUB_OUTPUT"
@@ -116,13 +124,12 @@ runs:
         # Line numbers come from the commit checked out here. Links point at that commit. Diff
         # annotations need it to be the pull request's head; the default pull_request
         # checkout is a merge commit, whose lines can differ.
-        checked_out=$(git rev-parse HEAD)
         annotate="$TITER_ANNOTATIONS"
         if [ "$annotate" = true ] && [ -n "$TITER_PR_HEAD" ] && [ "$checked_out" != "$TITER_PR_HEAD" ]; then
           annotate=false
           echo "::notice::titer skips diff annotations because the checkout is not the pull request head. To get them, check out with ref set to github.event.pull_request.head.sha."
         fi
-        args=(--link-base "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$checked_out" --annotations "$annotations")
+        args=(--link-base "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$checked_out" --commit "$label" --annotations "$annotations")
         [ -n "$TITER_BASE" ] && args+=(--base "$TITER_BASE")
         # Quotes in the args input group words, as in a shell.
         eval "extra=($TITER_ARGS)"
@@ -140,6 +147,7 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
+        TITER_DEFAULT_TOKEN: ${{ inputs.github-token == github.token }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         SUMMARY: ${{ steps.check.outputs.summary }}
       run: |
@@ -159,19 +167,48 @@ runs:
             }
           }' "$SUMMARY" > "$body"
 
-        # Our comment: the oldest one with the marker that this token's account wrote. The
-        # default token posts as github-actions[bot].
-        login=$(gh api user --jq .login 2>/dev/null) || login="github-actions[bot]"
-        if ! ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
-          --jq ".[] | select(.user.login == \"$login\" and (.body | startswith(\"<!-- titer-report -->\"))) | .id"); then
-          echo "::warning::titer could not list the pull request's comments, so it did not post one"
+        # Our comments: those this token's account wrote that start with the marker. The
+        # default token posts as github-actions[bot]; for any other token, ask GitHub who it is.
+        if [ "$TITER_DEFAULT_TOKEN" = true ]; then
+          login="github-actions[bot]"
+        else
+          login=$(gh api user --jq .login 2>/dev/null) \
+            || login=$(gh api graphql -f query='{ viewer { login } }' --jq .data.viewer.login 2>/dev/null) \
+            || login=""
+        fi
+        ours=""
+        if [ -n "$login" ]; then
+          # Each line is: id, node id, commit. Only the marker at the very top of a body counts.
+          if ! ours=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            --jq ".[] | select(.user.login == \"$login\" and (.body | startswith(\"<!-- titer-report -->\"))) | [.id, .node_id, ((.body | capture(\"^<!-- titer-report -->\\r?\\n<!-- titer-commit: (?<c>[0-9a-f]+) -->\") | .c) // \"\")] | @tsv"); then
+            echo "::warning::titer could not list the pull request's comments, so it did not post one"
+            exit 0
+          fi
+        else
+          echo "::warning::titer cannot tell which account this token belongs to, so it posts a new comment and leaves earlier ones alone"
+        fi
+        commit=$(sed -n 's/^<!-- titer-commit: \([0-9a-f]*\) -->$/\1/p' "$SUMMARY" | head -1)
+
+        # A rerun on the same commit updates that commit's comment. A new commit gets a new
+        # comment, so the newest result sits next to the newest push.
+        current=""
+        if [ -n "$commit" ]; then
+          current=$(printf '%s\n' "$ours" | awk -F '\t' -v c="$commit" '$3 == c { id = $1 } END { print id }')
+        fi
+        if [ -n "$current" ]; then
+          if ! gh api --silent -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$current" -F "body=@$body"; then
+            echo "::warning::titer could not update its comment; the workflow needs pull-requests: write"
+            exit 0
+          fi
+        elif ! current=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F "body=@$body" --jq .id); then
+          echo "::warning::titer could not post its comment; the workflow needs pull-requests: write"
           exit 0
         fi
-        existing=$(printf '%s\n' "$ids" | sed -n '1p')
-        if [ -n "$existing" ]; then
-          gh api --silent -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" -F "body=@$body" \
-            || echo "::warning::titer could not update its comment; the workflow needs pull-requests: write"
-        else
-          gh api --silent "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F "body=@$body" \
-            || echo "::warning::titer could not post its comment; the workflow needs pull-requests: write"
-        fi
+
+        # Older results collapse as outdated. Comment ids grow over time, so a rerun of an
+        # earlier commit never hides the comment for a newer one.
+        printf '%s\n' "$ours" | while IFS="$(printf '\t')" read -r id node _; do
+          [ -n "$id" ] && [ "$id" -lt "$current" ] || continue
+          gh api graphql --silent -f query='mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { clientMutationId } }' -f id="$node" \
+            || echo "::warning::titer could not hide its earlier comment $id as outdated"
+        done

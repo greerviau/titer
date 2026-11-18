@@ -51,5 +51,5 @@ jobs:
         run: |
           test "$OUTCOME" = failure
           test "$CODE" = 1
-          grep -q '^### titer: proven$' "$PROVEN_SUMMARY"
-          grep -q '^### titer: unproven$' "$UNPROVEN_SUMMARY"
+          grep -Eq '^### titer: proven for `[0-9a-f]{7}`$' "$PROVEN_SUMMARY"
+          grep -Eq '^### titer: unproven for `[0-9a-f]{7}`$' "$UNPROVEN_SUMMARY"
