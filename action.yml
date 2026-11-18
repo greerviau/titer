@@ -44,31 +44,47 @@ runs:
         TITER_COMMAND: ${{ inputs.command }}
       run: |
         set -u
+        # Finds the dir whose manifest pins titer: the repo root, then each runner cwd.
+        pinned_dir=""
         command="$TITER_COMMAND"
         if [ -z "$command" ]; then
-          if [ -f package.json ] && grep -q '"titer"' package.json; then
-            command="npx --no-install titer"
-          elif [ -f pyproject.toml ] && grep -q 'titer' pyproject.toml; then
-            command="uv run --no-sync titer"
-          else
+          dirs="."
+          if [ -f titer.toml ]; then
+            dirs="$dirs $(sed -n 's/^cwd *= *"\(.*\)"/\1/p' titer.toml)"
+          fi
+          for dir in $dirs; do
+            if [ -f "$dir/package.json" ] && grep -Eq '"titer"[[:space:]]*:' "$dir/package.json"; then
+              command="npx --no-install titer"; pinned_dir="$dir"; break
+            fi
+            if [ -f "$dir/pyproject.toml" ] && grep -Eq "[\"']titer[[:space:]]*([=<>~!;[]|[\"'])" "$dir/pyproject.toml"; then
+              command="uv run --no-sync titer"; pinned_dir="$dir"; break
+            fi
+          done
+          if [ -z "$command" ]; then
             echo "::error::titer is not pinned in package.json or pyproject.toml; run titer init, or set the command input"
             echo "exit-code=2" >> "$GITHUB_OUTPUT"
             exit 2
           fi
         fi
+        # merge-base needs history: deepen a shallow checkout, and fetch a missing base.
+        if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+          git fetch --quiet --unshallow --no-tags origin || true
+        fi
         if [ -n "$TITER_BASE" ] && ! git rev-parse --verify --quiet "$TITER_BASE^{commit}" >/dev/null; then
           git fetch --quiet --no-tags origin "${TITER_BASE#origin/}:refs/remotes/$TITER_BASE" || true
         fi
-        report="$RUNNER_TEMP/titer-report.json"
-        summary="$RUNNER_TEMP/titer-summary.md"
-        base_args=()
-        [ -n "$TITER_BASE" ] && base_args=(--base "$TITER_BASE")
+        report=$(mktemp "$RUNNER_TEMP/titer-report.XXXXXX")
+        summary=$(mktemp "$RUNNER_TEMP/titer-summary.XXXXXX")
+        args=()
+        [ -n "$TITER_BASE" ] && args=(--base "$TITER_BASE")
+        # Quotes in the args input group words, as in a shell.
+        eval "extra=($TITER_ARGS)"
+        args+=("${extra[@]}")
         set +e
-        # shellcheck disable=SC2086
-        $command check --json --markdown "$summary" "${base_args[@]}" $TITER_ARGS > "$report"
+        ( [ -n "$pinned_dir" ] && cd "$pinned_dir"; $command check --json --markdown "$summary" "${args[@]}" ) > "$report"
         code=$?
         set -e
-        [ -f "$summary" ] && cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+        [ -s "$summary" ] && cat "$summary" >> "$GITHUB_STEP_SUMMARY"
         echo "exit-code=$code" >> "$GITHUB_OUTPUT"
         echo "report=$report" >> "$GITHUB_OUTPUT"
         case "$code" in
