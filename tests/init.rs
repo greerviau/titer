@@ -80,7 +80,7 @@ fn init_writes_a_config_that_check_runs_with_and_the_skill_for_both_harnesses() 
     );
     let package = std::fs::read_to_string(repo.path().join("web/package.json")).unwrap();
     assert!(
-        package.contains(&format!("\"titer\": \"{VERSION}\"")),
+        package.contains(&format!("\"@greerviau/titer\": \"{VERSION}\"")),
         "{package}"
     );
     for skill in [

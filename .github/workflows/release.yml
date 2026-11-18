@@ -2,7 +2,7 @@ name: Release
 
 # On a v* tag: build binaries and wheels, create the GitHub release, and publish to npm,
 # PyPI, and crates.io for each registry whose token is set as a repo secret (NPM_TOKEN,
-# PYPI_TOKEN, CARGO_REGISTRY_TOKEN). Then check `npx titer` and `uvx titer` on Linux x64
+# PYPI_TOKEN, CARGO_REGISTRY_TOKEN). Then check `npx @greerviau/titer` and `uvx titer` on Linux x64
 # and macOS arm64.
 
 on:
@@ -194,7 +194,7 @@ jobs:
         run: |
           version="${{ needs.version.outputs.version }}"
           for attempt in 1 2 3 4 5 6; do
-            if npx -y "titer@$version" --version | grep -qx "titer $version"; then exit 0; fi
+            if npx -y "@greerviau/titer@$version" --version | grep -qx "titer $version"; then exit 0; fi
             sleep 30
           done
           exit 1
