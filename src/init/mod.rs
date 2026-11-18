@@ -80,9 +80,14 @@ pub fn run(cwd: &Path, dry_run: bool, update: bool) -> anyhow::Result<Plan> {
         let dirs: Vec<String> = runners.iter().map(|r| r.cwd.clone()).collect();
         pin_dependencies(&root, &dirs, &mut plan)?;
     }
-    let skill = SKILL.replace("{version}", VERSION);
+    let skill = SKILL
+        .replace("{version}", VERSION)
+        .replace("{run}", &run_commands(&root, &plan));
     for path in SKILL_PATHS {
         plan.writes.push((root.join(path), skill.clone()));
+    }
+    for (path, _) in &plan.writes {
+        refuse_symlinks(&root, path)?;
     }
     if !dry_run {
         for (path, contents) in &plan.writes {
@@ -96,22 +101,81 @@ pub fn run(cwd: &Path, dry_run: bool, update: bool) -> anyhow::Result<Plan> {
     Ok(plan)
 }
 
-/// The titer version stamped in the repo skill, if the skill exists.
-pub fn skill_version(root: &Path) -> Option<String> {
-    SKILL_PATHS.iter().find_map(|p| {
-        let text = std::fs::read_to_string(root.join(p)).ok()?;
-        let start = text.find("<!-- titer-version: ")? + "<!-- titer-version: ".len();
-        let end = text[start..].find(" -->")? + start;
-        Some(text[start..end].to_string())
-    })
+/// Fails when any dir on the way to `path` inside the repo is a symlink, so `init` never
+/// writes into a directory shared with other repos or the user's own config.
+fn refuse_symlinks(root: &Path, path: &Path) -> anyhow::Result<()> {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let mut current = root.to_path_buf();
+    for part in rel.components() {
+        current.push(part);
+        if current.is_symlink() {
+            bail!(
+                "refusing to write {}: {} is a symlink, and titer writes only inside the repo",
+                path.display(),
+                current.display()
+            );
+        }
+    }
+    Ok(())
 }
 
-/// The warning `check` adds when the skill was written by another titer version.
+/// The skill's run instructions: one line per manifest that pins titer.
+fn run_commands(root: &Path, plan: &Plan) -> String {
+    let mut lines = Vec::new();
+    for (path, _) in &plan.writes {
+        let (Some(name), Some(dir)) = (path.file_name(), path.parent()) else {
+            continue;
+        };
+        let command = match name.to_str() {
+            Some("package.json") => "npx titer check --json",
+            Some("pyproject.toml") => "uv run titer check --json",
+            _ => continue,
+        };
+        let place = match rel_dir(root, dir).as_str() {
+            "." => "from the repo root".to_string(),
+            d => format!("from `{d}/`, where titer is pinned (it still checks the whole repo)"),
+        };
+        lines.push(format!("- `{command}` {place}"));
+    }
+    if lines.is_empty() {
+        lines.push("- `titer check --json` from the repo root".to_string());
+    }
+    lines.join("\n")
+}
+
+/// The titer version stamped in each copy of the repo skill; None for a missing copy.
+pub fn skill_versions(root: &Path) -> Vec<Option<String>> {
+    SKILL_PATHS
+        .iter()
+        .map(|p| {
+            let text = std::fs::read_to_string(root.join(p)).ok()?;
+            let start = text.find("<!-- titer-version: ")? + "<!-- titer-version: ".len();
+            let end = text[start..].find(" -->")? + start;
+            Some(text[start..end].to_string())
+        })
+        .collect()
+}
+
+/// The warning `check` adds when a copy of the skill is missing or was written by another
+/// titer version. A repo with no skill at all gets no warning.
 pub fn stamp_warning(root: &Path) -> Option<String> {
-    let stamped = skill_version(root)?;
-    (stamped != VERSION).then(|| {
+    let versions = skill_versions(root);
+    if versions.iter().all(Option::is_none) {
+        return None;
+    }
+    let stale: Vec<String> = SKILL_PATHS
+        .iter()
+        .zip(&versions)
+        .filter(|(_, v)| v.as_deref() != Some(VERSION))
+        .map(|(p, v)| match v {
+            Some(v) => format!("{p} (titer {v})"),
+            None => format!("{p} (missing)"),
+        })
+        .collect();
+    (!stale.is_empty()).then(|| {
         format!(
-            "the repo skill was written by titer {stamped}, and this is titer {VERSION}; run `titer init --update`"
+            "the repo skill is out of date for titer {VERSION}: {}; run `titer init --update`",
+            stale.join(", ")
         )
     })
 }
@@ -130,26 +194,32 @@ pub fn detect_runners(root: &Path) -> anyhow::Result<Vec<DetectedRunner>> {
         }
     }
     if runners.len() > 1 {
-        for r in &mut runners {
-            let base = if r.cwd == "." {
-                "root".to_string()
+        // Short names (the dir's last component) when they are unique, else the full path.
+        let short: Vec<String> = runners
+            .iter()
+            .map(|r| {
+                if r.cwd == "." {
+                    "root".to_string()
+                } else {
+                    r.cwd.rsplit('/').next().unwrap_or(&r.cwd).to_string()
+                }
+            })
+            .collect();
+        let unique = short
+            .iter()
+            .enumerate()
+            .all(|(i, n)| !short[..i].contains(n));
+        for (r, name) in runners.iter_mut().zip(short) {
+            r.name = if unique {
+                name
             } else {
-                r.cwd.replace('/', "-")
+                let base = if r.cwd == "." {
+                    "root".to_string()
+                } else {
+                    r.cwd.replace('/', "-")
+                };
+                format!("{base}-{}", r.kind)
             };
-            r.name = format!("{base}-{}", r.kind);
-        }
-        let names: Vec<String> = runners.iter().map(|r| r.name.clone()).collect();
-        // Prefer the dir name alone when it is unique.
-        for r in &mut runners {
-            let short = r.cwd.rsplit('/').next().unwrap_or(&r.cwd).to_string();
-            let clash = names
-                .iter()
-                .filter(|n| n.starts_with(&format!("{short}-")) || **n == short)
-                .count()
-                > 1;
-            if r.cwd != "." && !clash {
-                r.name = short;
-            }
         }
     }
     Ok(runners)
@@ -364,6 +434,16 @@ fn detect_indent(text: &str) -> String {
         .unwrap_or_else(|| "  ".to_string())
 }
 
+/// A package name after PEP 503 normalization, so Titer, titer, and ti_ter compare equal.
+fn normalize_name(name: &str) -> String {
+    name.trim()
+        .to_lowercase()
+        .split(['-', '_', '.'])
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 pub fn pin_python(text: &str) -> anyhow::Result<String> {
     let mut doc: toml_edit::DocumentMut =
         text.parse().context("pyproject.toml is not valid TOML")?;
@@ -384,7 +464,7 @@ pub fn pin_python(text: &str) -> anyhow::Result<String> {
         v.as_str().is_none_or(|s| {
             !s.split(['=', '<', '>', '~', '!', ' ', '[', ';'])
                 .next()
-                .is_some_and(|n| n == "titer")
+                .is_some_and(|n| normalize_name(n) == "titer")
         })
     });
     array.push(format!("titer=={VERSION}"));
@@ -409,7 +489,7 @@ mod tests {
 
     #[test]
     fn pins_python_dev_group_and_replaces_an_old_pin() {
-        let text = "[project]\nname = \"api\"\n\n[dependency-groups]\ndev = [\"pytest>=8\", \"titer==0.0.1\"]\n";
+        let text = "[project]\nname = \"api\"\n\n[dependency-groups]\ndev = [\"pytest>=8\", \"Titer==0.0.1\"]\n";
         let out = pin_python(text).unwrap();
         assert_eq!(
             out,

@@ -161,3 +161,61 @@ fn a_second_init_refuses_and_update_restamps_the_skill() {
         );
     }
 }
+
+#[test]
+fn init_never_writes_through_a_symlinked_skill_dir() {
+    let repo = monorepo();
+    let shared = repo.scratch().join("shared-skills");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::create_dir_all(repo.path().join(".agents/skills")).unwrap();
+    std::os::unix::fs::symlink(&shared, repo.path().join(".agents/skills/titer")).unwrap();
+
+    let output = repo.titer(&["init"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("symlink"));
+    assert!(std::fs::read_dir(&shared).unwrap().next().is_none());
+    assert!(!repo.path().join("titer.toml").exists());
+}
+
+#[test]
+fn runner_names_stay_unique_and_the_skill_runs_from_the_pinned_dir() {
+    let repo = Fixture::new();
+    repo.write(
+        "api/app/pyproject.toml",
+        "[project]\nname = \"a\"\nversion = \"0.1.0\"\n\n[tool.pytest.ini_options]\n",
+    )
+    .write(
+        "web/app/package.json",
+        "{\n  \"devDependencies\": {\n    \"vitest\": \"5.1.0\"\n  }\n}\n",
+    )
+    .write(
+        "web/app/src/x.test.ts",
+        "import { it } from \"vitest\";\nit(\"x\", () => {});\n",
+    );
+    repo.commit_all("base");
+
+    let output = repo.titer(&["init"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = std::fs::read_to_string(repo.path().join("titer.toml")).unwrap();
+    assert!(
+        config.contains("name = \"api-app-pytest\"")
+            && config.contains("name = \"web-app-vitest\""),
+        "{config}"
+    );
+    let skill = std::fs::read_to_string(repo.path().join(".claude/skills/titer/SKILL.md")).unwrap();
+    assert!(
+        skill.contains("- `npx titer check --json` from `web/app/`"),
+        "{skill}"
+    );
+    assert!(
+        skill.contains("- `uv run titer check --json` from `api/app/`"),
+        "{skill}"
+    );
+}

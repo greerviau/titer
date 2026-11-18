@@ -11,10 +11,9 @@ This repo uses titer to check that the tests in a change prove the change. Run i
 
 ## Run
 
-Run titer from the repo root through the version the repo pins:
+Run the version the repo pins:
 
-- npm projects: `npx titer check --json`
-- Python projects with uv: `uv run titer check --json`
+{run}
 
 titer compares the working tree, including untracked files, with the merge-base of `--base` (default: the remote default branch). It never modifies the checkout. A typical run takes under 2 minutes; `--budget 60s` makes it shorter.
 
