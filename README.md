@@ -112,6 +112,11 @@ permissions:
   contents: read
   pull-requests: write # only for comment: true
 
+# One run per pull request at a time, so two runs never post at once.
+concurrency:
+  group: titer-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 steps:
   - uses: actions/checkout@v4
     with:
@@ -128,7 +133,7 @@ The Action runs the repo's pinned titer (`npx --no-install titer` or `uv run --n
 
 - The job summary leads with a plain verdict (proven, unproven, or could not run), then lists survivors, lines no test runs, and weakened tests, with links to the pull request's head commit. The full test and mutant tables are collapsed.
 - With `annotations: true` (the default), survivors and weakened tests are warnings on their lines in the diff, and lines no test runs are notices.
-- With `comment: true`, the same summary is posted as a pull request comment whose heading names the commit checked. Each new head commit gets a new comment, and earlier titer comments collapse as outdated, so the newest result sits next to the newest push. A rerun on the same commit updates that commit's comment. This needs `pull-requests: write`. On pull requests from forks of a public repo, GitHub gives the token read access only, so the Action warns and skips the comment. Give the workflow a `concurrency` group per pull request, so two runs never post at once.
+- With `comment: true`, the same summary is posted as a pull request comment whose heading names the commit checked. Each new head commit gets a new comment, and earlier titer comments collapse as outdated, so the newest result sits next to the newest push. A rerun on the same commit updates that commit's comment. This needs `pull-requests: write`. On pull requests from forks of a public repo, GitHub gives the token read access only, so the Action warns and skips the comment.
 
 Annotations need the pull request head checked out, as above. The default `pull_request` checkout is a merge commit whose line numbers can differ, so the Action skips annotations there.
 
