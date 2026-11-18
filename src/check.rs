@@ -73,6 +73,9 @@ pub fn run(cwd: &Path, options: &CheckOptions) -> anyhow::Result<Report> {
     report.head_tree = Some(ctx.session.head_tree.clone());
     report.tiers = options.tiers.clone();
     report.not_analyzed = ctx.detection.not_analyzed.clone();
+    report
+        .warnings
+        .extend(crate::init::stamp_warning(ctx.session.git.root()));
 
     if ctx.wants(Tier::Scan) {
         let tier_started = Instant::now();

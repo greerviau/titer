@@ -83,10 +83,7 @@ fn parse_tier(text: &str) -> Result<Tier, String> {
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
     let code = match cli.command {
-        Command::Init { .. } => {
-            eprintln!("titer: init is not implemented yet");
-            exit::ERROR
-        }
+        Command::Init { dry_run, update } => run_init(dry_run, update),
         Command::Check(args) => run_check(args),
         Command::Exec { base, argv } => run_exec(base.as_deref(), &argv),
         Command::Schema => {
@@ -99,6 +96,33 @@ pub fn main() -> ExitCode {
         }
     };
     ExitCode::from(code)
+}
+
+fn run_init(dry_run: bool, update: bool) -> u8 {
+    let result = std::env::current_dir()
+        .map_err(anyhow::Error::from)
+        .and_then(|cwd| crate::init::run(&cwd, dry_run, update));
+    let plan = match result {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("titer: {e:#}");
+            return exit::ERROR;
+        }
+    };
+    let verb = if dry_run { "would write" } else { "wrote" };
+    for (path, contents) in &plan.writes {
+        println!("{verb} {}", path.display());
+        if dry_run && path.ends_with(crate::config::FILE_NAME) {
+            println!("{contents}");
+        }
+    }
+    for note in &plan.notes {
+        println!("next: {note}");
+    }
+    if !dry_run {
+        println!("next: review and commit these files");
+    }
+    exit::PASS
 }
 
 fn run_exec(base: Option<&str>, argv: &[String]) -> u8 {
