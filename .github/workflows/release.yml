@@ -191,12 +191,15 @@ jobs:
         with:
           node-version: 24
       - name: npx runs the published version
-        # npm took about 5 minutes to serve new packages on 0.1.1, so retry for 10.
+        # npm took about 5 minutes to serve new packages on 0.1.1, so retry for 10. Each
+        # attempt gets a fresh cache: npx keeps an install that skipped a platform package
+        # npm was not serving yet, and would rerun it on every retry.
         run: |
           version="${{ needs.version.outputs.version }}"
           for attempt in $(seq 21); do
             if [ "$attempt" -gt 1 ]; then sleep 30; fi
-            if npx -y "@greerviau/titer@$version" --version | grep -qx "titer $version"; then exit 0; fi
+            cache="$RUNNER_TEMP/npm-cache-$attempt"
+            if npm_config_cache="$cache" npx -y "@greerviau/titer@$version" --version | grep -qx "titer $version"; then exit 0; fi
           done
           exit 1
 
