@@ -6,10 +6,10 @@
 const { spawnSync } = require("node:child_process");
 
 const platforms = {
-  "linux-x64": "titer-linux-x64",
-  "linux-arm64": "titer-linux-arm64",
-  "darwin-arm64": "titer-darwin-arm64",
-  "darwin-x64": "titer-darwin-x64",
+  "linux-x64": "@greerviau/titer-linux-x64",
+  "linux-arm64": "@greerviau/titer-linux-arm64",
+  "darwin-arm64": "@greerviau/titer-darwin-arm64",
+  "darwin-x64": "@greerviau/titer-darwin-x64",
 };
 
 const key = `${process.platform}-${process.arch}`;

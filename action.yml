@@ -101,7 +101,7 @@ runs:
             dirs="$dirs $(sed -n 's/^cwd *= *"\(.*\)"/\1/p' titer.toml)"
           fi
           for dir in $dirs; do
-            if [ -f "$dir/package.json" ] && grep -Eq '"titer"[[:space:]]*:' "$dir/package.json"; then
+            if [ -f "$dir/package.json" ] && grep -Eq '"@greerviau/titer"[[:space:]]*:' "$dir/package.json"; then
               command="npx --no-install titer"; pinned_dir="$dir"; break
             fi
             if [ -f "$dir/pyproject.toml" ] && grep -Eq "[\"']titer[[:space:]]*([=<>~!;[]|[\"'])" "$dir/pyproject.toml"; then

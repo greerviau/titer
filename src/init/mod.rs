@@ -14,6 +14,8 @@ pub const SKILL_PATHS: [&str; 2] = [
     ".claude/skills/titer/SKILL.md",
 ];
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// npm refuses the unscoped name `titer` as too close to existing packages.
+const NPM_PACKAGE: &str = "@greerviau/titer";
 
 /// Dirs never searched for runners.
 const SKIP_DIRS: &[&str] = &[
@@ -413,7 +415,7 @@ pub fn pin_npm(text: &str) -> anyhow::Result<String> {
     dev.as_object_mut()
         .context("devDependencies is not an object")?
         .insert(
-            "titer".to_string(),
+            NPM_PACKAGE.to_string(),
             serde_json::Value::String(VERSION.to_string()),
         );
     let indent = detect_indent(text);
@@ -482,7 +484,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "{{\n    \"name\": \"web\",\n    \"devDependencies\": {{\n        \"vitest\": \"^5.1.0\",\n        \"titer\": \"{VERSION}\"\n    }},\n    \"scripts\": {{}}\n}}\n"
+                "{{\n    \"name\": \"web\",\n    \"devDependencies\": {{\n        \"vitest\": \"^5.1.0\",\n        \"@greerviau/titer\": \"{VERSION}\"\n    }},\n    \"scripts\": {{}}\n}}\n"
             )
         );
     }

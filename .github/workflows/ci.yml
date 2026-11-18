@@ -69,7 +69,7 @@ jobs:
         with:
           node-version: 24
       - run: cargo build --release --locked
-      - name: npx titer --version
+      - name: npx --no-install titer --version
         run: |
           work="$RUNNER_TEMP/npm"
           mkdir -p "$work/bins" "$work/consumer"
@@ -78,8 +78,8 @@ jobs:
           (cd "$work/pkgs/titer-${{ matrix.npm }}" && npm pack --pack-destination "$work")
           (cd "$work/pkgs/titer" && npm pack --pack-destination "$work")
           cd "$work/consumer" && npm init -y >/dev/null
-          npm install --no-audit --no-fund "$work"/titer-${{ matrix.npm }}-0.0.0-ci.tgz "$work"/titer-0.0.0-ci.tgz
-          npx titer --version
+          npm install --no-audit --no-fund "$work"/greerviau-titer-${{ matrix.npm }}-0.0.0-ci.tgz "$work"/greerviau-titer-0.0.0-ci.tgz
+          npx --no-install titer --version
       - name: uvx titer --version
         run: |
           uvx --from 'maturin>=1.9,<2' maturin build --release --locked --out "$RUNNER_TEMP/wheels"

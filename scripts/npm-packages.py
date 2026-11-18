@@ -5,9 +5,13 @@ Usage: scripts/npm-packages.py VERSION BINARIES_DIR OUT_DIR
 
 BINARIES_DIR holds one binary per npm platform, named titer-<platform> (for example
 titer-linux-x64). Platforms without a binary are left out of optionalDependencies.
+Packages are named under SCOPE, because npm refuses the unscoped name titer. Each is
+written to OUT_DIR/titer or OUT_DIR/titer-<platform>.
 """
 import json, shutil, sys
 from pathlib import Path
+
+SCOPE = "@greerviau"
 
 PLATFORMS = {
     "linux-x64": ("linux", "x64"),
@@ -30,8 +34,8 @@ for platform, (os_name, cpu) in PLATFORMS.items():
     binary = binaries / f"titer-{platform}"
     if not binary.exists():
         continue
-    name = f"titer-{platform}"
-    pkg = out / name
+    name = f"{SCOPE}/titer-{platform}"
+    pkg = out / f"titer-{platform}"
     (pkg / "bin").mkdir(parents=True, exist_ok=True)
     shutil.copy2(binary, pkg / "bin/titer")
     (pkg / "bin/titer").chmod(0o755)
@@ -45,7 +49,7 @@ shutil.copytree(root / "npm/titer", launcher, dirs_exist_ok=True)
 for doc in ["README.md", "LICENSE-MIT", "LICENSE-APACHE"]:
     shutil.copy2(root / doc, launcher / doc)
 manifest = {
-    "name": "titer",
+    "name": f"{SCOPE}/titer",
     **common,
     "description": "Check whether a change's tests test the change: fail-on-base, diff-scoped mutation, weakened-test scan, and CRAP.",
     "keywords": ["testing", "mutation-testing", "ci", "agents", "vitest", "pytest"],
@@ -55,4 +59,4 @@ manifest = {
     "optionalDependencies": built,
 }
 (launcher / "package.json").write_text(json.dumps(manifest, indent=2) + "\n")
-print("\n".join([*built, "titer"]))
+print("\n".join([*built, f"{SCOPE}/titer"]))
