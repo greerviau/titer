@@ -75,11 +75,11 @@ Defaults per kind:
 
 Python commands should not sync the environment. Use `uv run --no-sync`, because worktrees share the checkout's `.venv`.
 
-A cargo runner's command is `cargo test` plus any flags the repo needs, such as `["cargo", "test", "--features", "postgres"]`. titer picks the packages, targets, and test names itself, so the command must not contain `--`, `--quiet`, `--workspace`, `--exclude`, a target flag such as `--lib` or `--tests`, `--no-run`, `--message-format`, or `--target-dir`. Put the runner's `cwd` at the workspace root.
+A cargo runner's command is `cargo test` plus any flags the repo needs, such as `["cargo", "test", "--features", "postgres"]`. titer picks the packages, targets, test names, output format, and target dir itself. After `test`, the command accepts only `--features`/`-F`, `--all-features`, `--no-default-features`, `--release`, `--profile`, `--target`, `-j`/`--jobs`, `--config`, `-Z`, `--color`, `--locked`, `--offline`, `--frozen`, `--ignore-rust-version`, `--no-fail-fast`, and `-v`/`--verbose`. Anything may come before `test`, such as `+nightly`. Put the runner's `cwd` at the workspace root.
 
-A cargo runner finds the unit tests inside source files by their attributes, so its `test_globs` cover only integration tests. A file under a `src` dir is never a test file or a support file, even in a `tests` module dir, because it can hold source code that base must keep.
+A cargo runner asks `cargo metadata` for the packages and targets, and follows `mod` declarations to learn how cargo compiles each file. A file is a test file when cargo compiles it only as test code: in an integration test target, or under a `#[cfg(test)]` module. Any other Rust file is source, wherever it lives. `test_globs` apply only to files that no target reaches. A cargo runner finds unit tests inside source files by their attributes.
 
-Each worktree builds into its own target dir. titer sets `CARGO_TARGET_DIR` for every cargo command and overrides the environment, `env`, and cargo config, so no build writes into the checkout or into a dir that worktrees share.
+Each worktree builds into its own target dir. titer sets `CARGO_TARGET_DIR` for every cargo command and overrides the environment, `env`, and cargo config, so no build writes into the checkout or into a dir that worktrees share. A check that would build through a symlinked `.titer-cache` exits 2.
 
 ## gate
 

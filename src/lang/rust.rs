@@ -4,6 +4,8 @@
 //! treats those items as test code: their lines are never mutated, and prove splices head's
 //! test items into base's source file.
 
+use std::collections::BTreeMap;
+
 use tree_sitter::Node;
 
 use super::{FunctionDef, Lang, TestDef, children, end_line_of, line_of, text};
@@ -46,51 +48,77 @@ fn is_test_attribute(path: &str) -> bool {
     last == "test" || matches!(last, "rstest" | "test_case" | "quickcheck")
 }
 
-/// Whether an attribute marks a test: a test attribute, or `cfg_attr(condition, test)`,
-/// which makes the function a test when the build enables the condition.
+/// Whether an attribute marks a test: a test attribute, or `cfg_attr(condition, ...)` over
+/// one, which makes the function a test when the build enables the condition.
 fn marks_test(path: &str, whole: &str) -> bool {
     if is_test_attribute(path) {
         return true;
     }
-    if path != "cfg_attr" {
-        return false;
-    }
-    let Some(args) = whole
-        .strip_prefix("cfg_attr")
-        .map(str::trim)
-        .and_then(|a| a.strip_prefix('('))
-        .and_then(|a| a.strip_suffix(')'))
-    else {
+    let compact: String = whole.chars().filter(|c| !c.is_whitespace()).collect();
+    cfg_attr_marks_test(&compact)
+}
+
+fn cfg_attr_marks_test(attr: &str) -> bool {
+    let Some(args) = call_args(attr, "cfg_attr") else {
         return false;
     };
-    // The attributes after the condition, split at top-level commas.
-    let mut depth = 0;
-    let mut parts = vec![String::new()];
-    for c in args.chars() {
+    split_top_level(args).iter().skip(1).any(|a| {
+        let path = a.split('(').next().unwrap_or_default();
+        is_test_attribute(path) || cfg_attr_marks_test(a)
+    })
+}
+
+/// The text inside `name(...)`, with whitespace already removed.
+fn call_args<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    text.strip_prefix(name)?
+        .strip_prefix('(')?
+        .strip_suffix(')')
+}
+
+/// `a,b(c,d),e` split at commas outside parentheses and brackets.
+fn split_top_level(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut start) = (0i32, 0);
+    for (i, c) in text.char_indices() {
         match c {
             '(' | '[' => depth += 1,
             ')' | ']' => depth -= 1,
             ',' if depth == 0 => {
-                parts.push(String::new());
-                continue;
+                parts.push(&text[start..i]);
+                start = i + 1;
             }
             _ => {}
         }
-        parts.last_mut().expect("parts is never empty").push(c);
+    }
+    if start < text.len() {
+        parts.push(&text[start..]);
     }
     parts
-        .iter()
-        .skip(1)
-        .any(|p| is_test_attribute(p.trim().split('(').next().unwrap_or_default().trim()))
 }
 
+/// Whether a `cfg(...)` holds only in test builds: `cfg(test)`, `all(...)` with such a
+/// predicate, or `any(...)` of only such predicates.
 fn is_cfg_test(attr: &str) -> bool {
     let compact: String = attr.chars().filter(|c| !c.is_whitespace()).collect();
-    compact == "cfg(test)"
+    call_args(&compact, "cfg").is_some_and(requires_test)
+}
+
+fn requires_test(predicate: &str) -> bool {
+    if predicate == "test" {
+        return true;
+    }
+    if let Some(args) = call_args(predicate, "all") {
+        return split_top_level(args).into_iter().any(requires_test);
+    }
+    if let Some(args) = call_args(predicate, "any") {
+        let parts = split_top_level(args);
+        return !parts.is_empty() && parts.into_iter().all(requires_test);
+    }
+    false
 }
 
 /// Whether an item is test-only: marked `#[cfg(test)]` or a test function.
-fn is_test_item(item: Node, source: &str) -> bool {
+pub(crate) fn is_test_item(item: Node, source: &str) -> bool {
     attributes(item).0.into_iter().any(|a| {
         attribute_parts(a, source)
             .is_some_and(|(path, whole)| is_cfg_test(whole) || marks_test(path, whole))
@@ -129,6 +157,10 @@ fn walk_tests(container: Node, source: &str, suite: &mut Vec<String>, out: &mut 
                     end_line: end_line_of(child),
                     report_line: line_of(child),
                     skip: paths.contains(&"ignore"),
+                    parametrized: paths.iter().any(|p| {
+                        let last = p.rsplit("::").next().unwrap_or(p);
+                        matches!(last, "rstest" | "test_case" | "quickcheck")
+                    }),
                     start_byte: first.start_byte(),
                     end_byte: child.end_byte(),
                 });
@@ -201,12 +233,16 @@ fn impl_name(ty: Node, source: &str) -> String {
     }
 }
 
+/// A step into an inline module: its name, and how many non-test modules of that name
+/// come before it in its container. Two `#[cfg]` variants of one module stay apart.
+pub type Step = (String, usize);
+
 /// An outermost test-only item: one marked `#[cfg(test)]` or with a test attribute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestItem {
-    /// The names of the inline modules that contain the item, outermost first, or None
-    /// when another item, such as an `impl`, contains it.
-    pub container: Option<Vec<String>>,
+    /// The inline modules that contain the item, outermost first, or None when another
+    /// item, such as an `impl`, contains it.
+    pub container: Option<Vec<Step>>,
     /// The span from the item's first attribute to its end.
     pub start_byte: usize,
     pub end_byte: usize,
@@ -223,9 +259,10 @@ pub fn test_items(root: Node, source: &str) -> Vec<TestItem> {
 fn walk_items(
     node: Node,
     source: &str,
-    mut container: Option<&mut Vec<String>>,
+    mut container: Option<&mut Vec<Step>>,
     out: &mut Vec<TestItem>,
 ) {
+    let mut seen: std::collections::HashMap<String, usize> = Default::default();
     for child in children(node) {
         let kind = child.kind();
         if matches!(kind, "attribute_item" | "line_comment" | "block_comment") {
@@ -244,10 +281,14 @@ fn walk_items(
         }
         if kind == "mod_item" {
             if let Some(body) = child.child_by_field_name("body") {
+                let name = name_of(child, source).to_string();
+                let count = seen.entry(name.clone()).or_default();
+                let step = (name, *count);
+                *count += 1;
                 // A module inside an impl or function is not a container prove can find.
                 match container.as_deref_mut() {
                     Some(path) => {
-                        path.push(name_of(child, source).to_string());
+                        path.push(step);
                         walk_items(body, source, Some(path), out);
                         path.pop();
                     }
@@ -345,106 +386,282 @@ pub fn test_lines(source: &str) -> Vec<(u32, u32)> {
 /// Base's source file with its test items replaced by head's. Returns None when the test
 /// items are the same.
 ///
-/// A head test item replaces base's item of the same kind and name where base's stands. A
-/// new one goes right after the nearest item before it in head that base also has, so it
-/// sees the same `macro_rules!` definitions and items it sees in head. Base's test items
-/// that head lacks go away, and so do head's in a module base lacks: they could not compile
-/// on base anyway.
+/// Rust items can come in any order, except that a `macro_rules!` macro is visible only
+/// after its definition. So each head test item goes right after its anchor: the nearest
+/// non-test item before it in head that base also has, matched by kind, name (or text,
+/// for an unnamed item such as an item macro), and occurrence. A base test item with the
+/// same key and anchor is replaced where it stands. A module that base lacks becomes an
+/// empty shell around head's test items, which then compile on base only if they use
+/// nothing new. Base's test items that head lacks go away.
+///
+/// Returns None when splicing leaves base unchanged.
 pub fn splice_tests(base: &str, head: &str) -> Option<String> {
     let base_tree = Lang::Rust.parse(base)?;
     let head_tree = Lang::Rust.parse(head)?;
-    let base_items: Vec<TestItem> = test_items(base_tree.root_node(), base)
+    let mut paths: Vec<Vec<Step>> = test_items(base_tree.root_node(), base)
         .into_iter()
-        .filter(|i| i.container.is_some())
-        .collect();
-    let head_items: Vec<TestItem> = test_items(head_tree.root_node(), head)
-        .into_iter()
-        .filter(|i| i.container.is_some())
-        .collect();
-    let texts = |items: &[TestItem], source: &str| -> Vec<String> {
-        items
-            .iter()
-            .map(|i| source[i.start_byte..i.end_byte].to_string())
-            .collect()
-    };
-    if texts(&base_items, base) == texts(&head_items, head) {
-        return None;
-    }
-    let mut paths: Vec<Vec<String>> = base_items
-        .iter()
-        .chain(&head_items)
-        .filter_map(|i| i.container.clone())
+        .chain(test_items(head_tree.root_node(), head))
+        .filter_map(|i| i.container)
         .collect();
     paths.sort();
     paths.dedup();
-    // (start, end, replacement) in base's bytes.
-    let mut edits: Vec<(usize, usize, String)> = Vec::new();
-    for path in paths {
-        let Some(base_node) = container(base_tree.root_node(), base, &path) else {
+    let mut edits: Vec<Edit> = Vec::new();
+    // Head's test items in modules base lacks, by the deepest module base has and the
+    // first missing step.
+    let mut shells: BTreeMap<(Vec<Step>, String), Vec<ShellItem>> = BTreeMap::new();
+    for path in &paths {
+        let Some(head_node) = container(head_tree.root_node(), head, path) else {
+            // Only base has the module: its test items go.
+            if let Some(base_node) = container(base_tree.root_node(), base, path) {
+                for e in entries(base_node, base).iter().filter(|e| e.test) {
+                    edits.push(Edit::remove(
+                        indent_start(base, e.start),
+                        line_end(base, e.end),
+                    ));
+                }
+            }
+            continue;
+        };
+        let head_entries = entries(head_node, head);
+        let Some(base_node) = container(base_tree.root_node(), base, path) else {
+            let have = (0..path.len())
+                .rev()
+                .find(|n| container(base_tree.root_node(), base, &path[..*n]).is_some())
+                .unwrap_or(0);
+            let rest: Vec<String> = path[have + 1..].iter().map(|(n, _)| n.clone()).collect();
+            let key = (path[..have].to_vec(), path[have].0.clone());
+            for e in head_entries.iter().filter(|e| e.test) {
+                shells.entry(key.clone()).or_default().push((
+                    rest.clone(),
+                    head[indent_start(head, e.start)..e.end].to_string(),
+                ));
+            }
             continue;
         };
         let base_entries = entries(base_node, base);
-        let head_entries = container(head_tree.root_node(), head, &path)
-            .map(|n| entries(n, head))
-            .unwrap_or_default();
-        let base_index = |key: &Key| {
-            base_entries
-                .iter()
-                .position(|e| e.key.as_ref() == Some(key))
-        };
-        for e in base_entries.iter().filter(|e| e.test) {
-            let kept = e.key.as_ref().is_some_and(|k| {
-                head_entries
-                    .iter()
-                    .any(|h| h.test && h.key.as_ref() == Some(k))
-            });
-            if !kept {
-                edits.push((e.start, e.end, String::new()));
-            }
-        }
-        for (i, h) in head_entries.iter().enumerate().filter(|(_, h)| h.test) {
-            let text = &head[h.start..h.end];
-            if let Some(b) = h.key.as_ref().and_then(base_index)
-                && base_entries[b].test
-            {
-                edits.push((base_entries[b].start, base_entries[b].end, text.to_string()));
-                continue;
-            }
-            let anchor = head_entries[..i]
+        // The base index of the nearest non-test head item before head entry `i` that
+        // base also has.
+        let anchor = |i: usize| -> Option<usize> {
+            head_entries[..i]
                 .iter()
                 .rev()
-                .find_map(|p| p.key.as_ref().and_then(base_index));
+                .filter(|e| !e.test)
+                .find_map(|e| base_entries.iter().position(|t| !t.test && t.key == e.key))
+        };
+        let mut kept: Vec<usize> = Vec::new();
+        // Where the last head test item went, by anchor, so the next one with that anchor
+        // follows it.
+        let mut cursor: Option<(Option<usize>, usize)> = None;
+        for (i, h) in head_entries.iter().enumerate().filter(|(_, h)| h.test) {
+            let text = &head[h.start..h.end];
+            let at = anchor(i);
+            let same = base_entries.iter().enumerate().position(|(b, e)| {
+                e.test
+                    && e.key.is_some()
+                    && e.key == h.key
+                    && !kept.contains(&b)
+                    && base_anchor(&base_entries, &head_entries, b) == at
+            });
+            if let Some(b) = same {
+                kept.push(b);
+                edits.push(Edit::replace(
+                    base_entries[b].start,
+                    base_entries[b].end,
+                    text,
+                ));
+                cursor = Some((at, base_entries[b].end));
+                continue;
+            }
             let indent = &head[indent_start(head, h.start)..h.start];
-            match anchor {
-                Some(b) => {
-                    let at = base_entries[b].end;
-                    edits.push((at, at, format!("\n{indent}{text}")));
+            let after = match cursor {
+                Some((a, end)) if a == at => Some(end),
+                _ => at.map(|a| base_entries[a].end),
+            };
+            match after {
+                Some(end) => {
+                    edits.push(Edit::insert(end, format!("\n{indent}{text}")));
+                    cursor = Some((at, end));
                 }
                 None => {
-                    let (at, after) = match base_entries.first() {
-                        Some(first) => (
-                            first.start,
-                            &base[indent_start(base, first.start)..first.start],
-                        ),
-                        None => (container_end(base_node, base), ""),
+                    // Before every item base has; past the indentation of the first one, or
+                    // inside an empty container.
+                    let (start, lead) = match base_entries.first() {
+                        Some(first) => (indent_start(base, first.start), String::new()),
+                        None => {
+                            let end = container_end(base_node, base);
+                            let nl = if base[..end].ends_with('\n') {
+                                ""
+                            } else {
+                                "\n"
+                            };
+                            (end, nl.to_string())
+                        }
                     };
-                    edits.push((at, at, format!("{text}\n{after}")));
+                    edits.push(Edit::insert(start, format!("{lead}{indent}{text}\n")));
                 }
             }
         }
+        for (b, e) in base_entries.iter().enumerate() {
+            if e.test && !kept.contains(&b) {
+                edits.push(Edit::remove(
+                    indent_start(base, e.start),
+                    line_end(base, e.end),
+                ));
+            }
+        }
     }
-    // Apply from the end; at one offset, the insertions after an item come before its
-    // removal, and keep head's order among themselves.
-    edits.sort_by_key(|(start, _, _)| *start);
+    for ((have, first), items) in shells {
+        let Some(node) = container(base_tree.root_node(), base, &have) else {
+            continue;
+        };
+        let at = container_end(node, base);
+        let lead = if base[..at].ends_with('\n') { "" } else { "\n" };
+        edits.push(Edit::insert(at, format!("{lead}{}", shell(&first, &items))));
+    }
+    edits.sort_by_key(|e| (e.start, e.end > e.start));
     let mut out = base.to_string();
-    for (start, end, replacement) in edits.into_iter().rev() {
-        out.replace_range(start..end, &replacement);
+    for e in edits.into_iter().rev() {
+        out.replace_range(e.start..e.end, &e.text);
     }
-    Some(out)
+    (out != base).then_some(out)
 }
 
-/// `source` without the imports of `names`: a `use` of one of them goes away, and one of
-/// them leaves a `use` list. Only `use` declarations at the top of a list are read.
+/// Just past the newline that ends the line `at` is on, when only whitespace follows `at`
+/// there; else `at`.
+fn line_end(source: &str, at: usize) -> usize {
+    match source[at..].find('\n') {
+        Some(i) if source[at..at + i].trim().is_empty() => at + i + 1,
+        None if source[at..].trim().is_empty() => source.len(),
+        _ => at,
+    }
+}
+
+/// The anchor of base entry `b`, as an index into base's entries: the nearest non-test
+/// entry before it that head also has.
+fn base_anchor(base: &[Entry], head: &[Entry], b: usize) -> Option<usize> {
+    base[..b].iter().enumerate().rev().find_map(|(i, e)| {
+        (!e.test && e.key.is_some() && head.iter().any(|h| !h.test && h.key == e.key)).then_some(i)
+    })
+}
+
+/// A test item for a shell module: the module names below the shell, and its text.
+type ShellItem = (Vec<String>, String);
+
+/// `mod name { ... }` around test items, with nested shells for deeper modules.
+fn shell(name: &str, items: &[ShellItem]) -> String {
+    let mut body = String::new();
+    let mut nested: BTreeMap<String, Vec<ShellItem>> = BTreeMap::new();
+    for (rest, text) in items {
+        match rest.split_first() {
+            None => {
+                body.push_str(text);
+                body.push('\n');
+            }
+            Some((first, deeper)) => nested
+                .entry(first.clone())
+                .or_default()
+                .push((deeper.to_vec(), text.clone())),
+        }
+    }
+    for (inner, items) in nested {
+        body.push_str(&shell(&inner, &items));
+    }
+    format!("mod {name} {{\n{body}}}\n")
+}
+
+/// One edit of base's bytes.
+struct Edit {
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+impl Edit {
+    fn insert(at: usize, text: String) -> Edit {
+        Edit {
+            start: at,
+            end: at,
+            text,
+        }
+    }
+
+    fn remove(start: usize, end: usize) -> Edit {
+        Edit {
+            start,
+            end,
+            text: String::new(),
+        }
+    }
+
+    fn replace(start: usize, end: usize, text: &str) -> Edit {
+        Edit {
+            start,
+            end,
+            text: text.to_string(),
+        }
+    }
+}
+
+/// The last path segment a use tree imports: `n` for `demo::api::n` and for
+/// `demo::n as m`.
+fn imported(node: Node, source: &str) -> String {
+    let path = match node.kind() {
+        "use_as_clause" => node.child_by_field_name("path").unwrap_or(node),
+        _ => node,
+    };
+    let t = text(path, source);
+    t.rsplit("::").next().unwrap_or(t).to_string()
+}
+
+/// A use tree without the imports of `names`, or None when nothing is left of it.
+fn kept_tree(node: Node, source: &str, names: &[&str]) -> Option<String> {
+    match node.kind() {
+        "scoped_use_list" | "use_list" => {
+            let list = if node.kind() == "use_list" {
+                node
+            } else {
+                node.child_by_field_name("list")?
+            };
+            let items = children(list);
+            let kept: Vec<String> = items
+                .iter()
+                .filter_map(|i| kept_tree(*i, source, names))
+                .collect();
+            if kept.is_empty() {
+                return None;
+            }
+            let unchanged = kept.len() == items.len()
+                && kept.iter().zip(&items).all(|(k, i)| k == text(*i, source));
+            if unchanged {
+                return Some(text(node, source).to_string());
+            }
+            let inner = format!("{{{}}}", kept.join(", "));
+            Some(match node.child_by_field_name("path") {
+                Some(path) => format!("{}::{inner}", text(path, source)),
+                None => inner,
+            })
+        }
+        "use_wildcard" => Some(text(node, source).to_string()),
+        _ => (!names.contains(&imported(node, source).as_str()))
+            .then(|| text(node, source).to_string()),
+    }
+}
+
+fn use_declarations<'t>(root: Node<'t>) -> Vec<Node<'t>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "use_declaration" {
+            out.push(node);
+        } else {
+            stack.extend(children(node));
+        }
+    }
+    out
+}
+
+/// `source` without the imports of `names`: a `use` left with nothing goes away, and a
+/// `use` list keeps the rest.
 pub fn remove_imports(source: &str, names: &[&str]) -> String {
     if names.is_empty() {
         return source.to_string();
@@ -452,77 +669,56 @@ pub fn remove_imports(source: &str, names: &[&str]) -> String {
     let Some(tree) = Lang::Rust.parse(source) else {
         return source.to_string();
     };
-    let last = |n: Node| -> String {
-        let path = match n.kind() {
-            "use_as_clause" => n.child_by_field_name("path").unwrap_or(n),
-            _ => n,
-        };
-        let t = text(path, source);
-        t.rsplit("::").next().unwrap_or(t).to_string()
-    };
-    let mut cuts: Vec<(usize, usize)> = Vec::new();
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
-        if node.kind() != "use_declaration" {
-            stack.extend(children(node));
-            continue;
-        }
-        let Some(arg) = node.child_by_field_name("argument") else {
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for decl in use_declarations(tree.root_node()) {
+        let Some(arg) = decl.child_by_field_name("argument") else {
             continue;
         };
-        match arg.kind() {
-            "identifier" | "scoped_identifier" | "use_as_clause" => {
-                if names.contains(&last(arg).as_str()) {
-                    cuts.push((indent_start(source, node.start_byte()), node.end_byte()));
-                }
+        match kept_tree(arg, source, names) {
+            None => edits.push((
+                indent_start(source, decl.start_byte()),
+                line_end(source, decl.end_byte()),
+                String::new(),
+            )),
+            Some(kept) if kept != text(arg, source) => {
+                edits.push((arg.start_byte(), arg.end_byte(), kept));
             }
-            "scoped_use_list" => {
-                let Some(list) = arg.child_by_field_name("list") else {
-                    continue;
-                };
-                let items = children(list);
-                let gone: Vec<Node> = items
-                    .iter()
-                    .copied()
-                    .filter(|i| i.kind() != "use_list" && names.contains(&last(*i).as_str()))
-                    .collect();
-                if gone.is_empty() {
-                    continue;
-                }
-                if gone.len() == items.len() {
-                    cuts.push((indent_start(source, node.start_byte()), node.end_byte()));
-                    continue;
-                }
-                for item in gone {
-                    // The item and the comma after it, or else the comma before it.
-                    let next = item.next_sibling().filter(|n| n.kind() == ",");
-                    let prev = item.prev_sibling().filter(|n| n.kind() == ",");
-                    let (start, end) = match (next, prev) {
-                        (Some(comma), _) => {
-                            let after = comma
-                                .next_sibling()
-                                .map_or(comma.end_byte(), |n| n.start_byte());
-                            (item.start_byte(), after)
-                        }
-                        (None, Some(comma)) => (comma.start_byte(), item.end_byte()),
-                        (None, None) => (item.start_byte(), item.end_byte()),
-                    };
-                    cuts.push((start, end));
-                }
-            }
-            _ => {}
+            Some(_) => {}
         }
     }
-    cuts.sort();
+    edits.sort_by_key(|e| e.0);
     let mut out = source.to_string();
-    for (start, end) in cuts.into_iter().rev() {
-        out.replace_range(start..end, "");
+    for (start, end, text) in edits.into_iter().rev() {
+        out.replace_range(start..end, &text);
     }
     out
 }
 
-/// An item's kind, name, and how many items of that kind and name come before it in its
-/// container.
+/// The names a file's code can use for the imported `name`: the name itself, and each
+/// alias a `use ... as` gives it.
+pub fn local_names(source: &str, name: &str) -> Vec<String> {
+    let mut out = vec![name.to_string()];
+    let Some(tree) = Lang::Rust.parse(source) else {
+        return out;
+    };
+    let mut stack = use_declarations(tree.root_node());
+    while let Some(node) = stack.pop() {
+        if node.kind() == "use_as_clause"
+            && imported(node, source) == name
+            && let Some(alias) = node.child_by_field_name("alias")
+        {
+            let alias = text(alias, source).to_string();
+            if !out.contains(&alias) {
+                out.push(alias);
+            }
+        }
+        stack.extend(children(node));
+    }
+    out
+}
+
+/// An item's kind, its name (or its text, for an unnamed item), and how many items with
+/// that kind and name come before it in its container.
 type Key = (String, String, usize);
 
 /// One item of a container, from its first attribute to its end.
@@ -546,17 +742,14 @@ fn entries(container: Node, source: &str) -> Vec<Entry> {
         .map(|n| {
             let name = match n.kind() {
                 "impl_item" => n.child_by_field_name("type").map(|t| text(t, source)),
-                "use_declaration" => Some(text(n, source)),
                 _ => n.child_by_field_name("name").map(|t| text(t, source)),
-            };
-            let key = name.map(|name| {
-                let k = (n.kind().to_string(), name.to_string());
-                let count = seen.entry(k.clone()).or_default();
-                *count += 1;
-                (k.0, k.1, *count - 1)
-            });
+            }
+            .unwrap_or_else(|| text(n, source));
+            let k = (n.kind().to_string(), name.to_string());
+            let count = seen.entry(k.clone()).or_default();
+            *count += 1;
             Entry {
-                key,
+                key: Some((k.0, k.1, *count - 1)),
                 test: is_test_item(n, source),
                 start: attributes(n).1.start_byte(),
                 end: n.end_byte(),
@@ -579,15 +772,18 @@ fn indent_start(source: &str, at: usize) -> usize {
 }
 
 /// The body of the inline module at `path`: the file itself for the root.
-fn container<'t>(root: Node<'t>, source: &str, path: &[String]) -> Option<Node<'t>> {
+fn container<'t>(root: Node<'t>, source: &str, path: &[Step]) -> Option<Node<'t>> {
     let mut node = root;
-    for name in path {
-        let module = children(node).into_iter().find(|c| {
-            c.kind() == "mod_item"
-                && name_of(*c, source) == name
-                && !is_test_item(*c, source)
-                && c.child_by_field_name("body").is_some()
-        })?;
+    for (name, occurrence) in path {
+        let module = children(node)
+            .into_iter()
+            .filter(|c| {
+                c.kind() == "mod_item"
+                    && name_of(*c, source) == name
+                    && !is_test_item(*c, source)
+                    && c.child_by_field_name("body").is_some()
+            })
+            .nth(*occurrence)?;
         node = module.child_by_field_name("body")?;
     }
     Some(node)
@@ -748,11 +944,30 @@ fn top_level() {}
         let source = "use demo::{clamp, double, other as o};\nuse demo::double;\nuse demo::{double};\nuse std::fmt;\n";
         assert_eq!(
             remove_imports(source, &["double"]),
-            "use demo::{clamp, other as o};\n\n\nuse std::fmt;\n"
+            "use demo::{clamp, other as o};\nuse std::fmt;\n"
         );
         assert_eq!(
             remove_imports("use demo::{clamp, double};\n", &["double", "clamp"]),
-            "\n"
+            ""
+        );
+        assert_eq!(
+            remove_imports("use demo::{n, x, y};\n", &["x", "y"]),
+            "use demo::{n};\n"
+        );
+        assert_eq!(
+            remove_imports("use demo::{api::{new_api, n}, m};\n", &["new_api"]),
+            "use demo::{api::{n}, m};\n"
+        );
+        assert_eq!(
+            remove_imports("use demo::new_api as renamed;\nfn f() {}\n", &["new_api"]),
+            "fn f() {}\n"
+        );
+        assert_eq!(
+            local_names(
+                "use demo::new_api as renamed;\nuse demo::{x::new_api};\n",
+                "new_api"
+            ),
+            vec!["new_api", "renamed"]
         );
     }
 
@@ -762,6 +977,13 @@ fn top_level() {}
         let tests = find_tests(Lang::Rust, source, PythonStyle::Pytest);
         assert_eq!(summary(&tests), vec!["gated 1-2 fn 2"]);
         assert_eq!(test_lines(source), vec![(1, 2)]);
+        let nested = "#[cfg_attr(all(), cfg_attr(all(), test))]\nfn deep() {}\n";
+        assert_eq!(
+            summary(&find_tests(Lang::Rust, nested, PythonStyle::Pytest)),
+            vec!["deep 1-2 fn 2"]
+        );
+        let gated = "#[cfg(all(test, unix))]\nfn helper() -> i32 {\n    1\n}\n#[cfg(any(test, unix))]\nfn real() {}\n#[cfg(not(test))]\nfn prod() {}\n";
+        assert_eq!(test_lines(gated), vec![(1, 4)]);
     }
 
     #[test]
@@ -816,10 +1038,17 @@ mod gone {
 }
 "#;
         let spliced = splice_tests(base, head).unwrap();
+        // Head's root tests follow `add`, the item before them in head that base has; the
+        // module base lacks becomes a shell.
         assert_eq!(
             spliced,
             r#"pub fn add(a: i32, b: i32) -> i32 {
     a - b
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn new() {}
 }
 
 mod inner {
@@ -832,14 +1061,65 @@ mod inner {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn new() {}
+mod gone {
+    #[cfg(test)]
+    mod tests {}
 }
 "#
         );
         assert_eq!(splice_tests(head, head), None);
+    }
+
+    #[test]
+    fn splices_handle_renames_moves_shells_and_twin_modules() {
+        // A renamed first test: the removal and the insertion share an offset.
+        let base = "#[test]\nfn old() {}\n\npub fn f() {}\n";
+        let head = "#[test]\nfn new() {}\n\npub fn f() {}\n";
+        assert_eq!(
+            splice_tests(base, head).unwrap(),
+            "#[test]\nfn new() {}\n\npub fn f() {}\n"
+        );
+
+        // A test that moved past a second macro definition moves on base too.
+        let base = "macro_rules! v { () => { 1 }; }\n#[test]\nfn t() { assert_eq!(v!(), 2); }\nmacro_rules! v { () => { 2 }; }\n";
+        let head = "macro_rules! v { () => { 1 }; }\nmacro_rules! v { () => { 2 }; }\n#[test]\nfn t() { assert_eq!(v!(), 2); }\n";
+        assert_eq!(
+            splice_tests(base, head).unwrap(),
+            "macro_rules! v { () => { 1 }; }\nmacro_rules! v { () => { 2 }; }\n#[test]\nfn t() { assert_eq!(v!(), 2); }\n"
+        );
+
+        // A new test after an item macro follows it on base.
+        let base = "make_want!();\npub fn f() {}\n";
+        let head = "make_want!();\n#[test]\nfn uses_want() {}\npub fn f() {}\n";
+        assert_eq!(
+            splice_tests(base, head).unwrap(),
+            "make_want!();\n#[test]\nfn uses_want() {}\npub fn f() {}\n"
+        );
+
+        // The same test moved between modules is a change.
+        let base = "mod a {\n    #[test]\n    fn t() {}\n}\nmod b {}\n";
+        let head = "mod a {}\nmod b {\n    #[test]\n    fn t() {}\n}\n";
+        assert_eq!(
+            splice_tests(base, head).unwrap(),
+            "mod a {\n}\nmod b {\n    #[test]\n    fn t() {}\n}\n"
+        );
+
+        // A test in the second of two same-named modules goes into the second.
+        let base = "#[cfg(unix)]\nmod os {}\n#[cfg(windows)]\nmod os {}\n";
+        let head =
+            "#[cfg(unix)]\nmod os {}\n#[cfg(windows)]\nmod os {\n    #[test]\n    fn t() {}\n}\n";
+        assert_eq!(
+            splice_tests(base, head).unwrap(),
+            "#[cfg(unix)]\nmod os {}\n#[cfg(windows)]\nmod os {\n    #[test]\n    fn t() {}\n}\n"
+        );
+
+        // A module base lacks becomes an empty shell around head's tests.
+        let base = "pub fn n() -> i32 {\n    1\n}\n";
+        let head = "pub fn n() -> i32 {\n    1\n}\n\nmod fresh {\n    pub fn new() {}\n\n    #[cfg(test)]\n    mod tests {\n        #[test]\n        fn calls_n() {\n            assert_eq!(crate::n(), 1);\n        }\n    }\n}\n";
+        assert_eq!(
+            splice_tests(base, head).unwrap(),
+            "pub fn n() -> i32 {\n    1\n}\nmod fresh {\n    #[cfg(test)]\n    mod tests {\n        #[test]\n        fn calls_n() {\n            assert_eq!(crate::n(), 1);\n        }\n    }\n}\n"
+        );
     }
 
     #[test]

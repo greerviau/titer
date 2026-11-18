@@ -304,7 +304,13 @@ fn blame(
                     .map_or("", |d| &head_text[d.start_byte..d.end_byte]);
                 errors.iter().find(|e| {
                     let outside = !defs.iter().any(|d| (d.line..=d.end_line).contains(&e.line));
-                    outside && missing_name(&e.message).is_some_and(|n| mentions(text, &n))
+                    // The test may call the name through an alias its file imports it as.
+                    outside
+                        && missing_name(&e.message).is_some_and(|n| {
+                            lang::rust::local_names(&head_text, &n)
+                                .iter()
+                                .any(|local| mentions(text, local))
+                        })
                 })
             };
             if let Some(error) = inside {

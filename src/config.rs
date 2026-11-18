@@ -148,13 +148,8 @@ impl TryFrom<RawRunner> for RunnerConfig {
                     .to_string(),
             );
         }
-        if raw.kind == RunnerKind::Cargo
-            && let Some(flag) = raw.command.iter().find(|a| is_reserved_cargo_flag(a))
-        {
-            return Err(format!(
-                "a cargo command must not contain {flag:?}: titer chooses the packages, targets, \
-                 test names, output format, and target dir itself"
-            ));
+        if raw.kind == RunnerKind::Cargo {
+            check_cargo_command(&raw.command)?;
         }
         let cwd = normalize_rel(&raw.cwd)?;
         Ok(RunnerConfig {
@@ -175,33 +170,59 @@ impl TryFrom<RawRunner> for RunnerConfig {
     }
 }
 
-/// Cargo arguments that would override titer's selection of packages, targets, tests, and
-/// output, or point the build at a shared target dir.
-fn is_reserved_cargo_flag(arg: &str) -> bool {
-    const FLAGS: &[&str] = &[
-        "--",
-        "-q",
-        "--quiet",
-        "--workspace",
-        "--all",
-        "--exclude",
-        "--lib",
-        "--bin",
-        "--bins",
-        "--test",
-        "--tests",
-        "--example",
-        "--examples",
-        "--bench",
-        "--benches",
-        "--all-targets",
-        "--doc",
-        "--no-run",
-        "--message-format",
-        "--target-dir",
+/// A cargo command is a prefix that ends in `test`, such as `["cargo", "+nightly", "test"]`,
+/// then only flags that leave titer's choice of packages, targets, tests, output format,
+/// and target dir alone.
+fn check_cargo_command(command: &[String]) -> Result<(), String> {
+    const WITH_VALUE: &[&str] = &[
+        "--features",
+        "-F",
+        "--profile",
+        "--target",
+        "-j",
+        "--jobs",
+        "--config",
+        "-Z",
+        "--color",
     ];
-    let flag = arg.split_once('=').map_or(arg, |(f, _)| f);
-    FLAGS.contains(&flag)
+    const SWITCHES: &[&str] = &[
+        "--all-features",
+        "--no-default-features",
+        "--release",
+        "--locked",
+        "--offline",
+        "--frozen",
+        "--ignore-rust-version",
+        "--no-fail-fast",
+        "-v",
+        "-vv",
+        "--verbose",
+    ];
+    let Some(at) = command.iter().position(|a| a == "test") else {
+        return Err(
+            "a cargo command must run `cargo test`, such as [\"cargo\", \"test\"]".to_string(),
+        );
+    };
+    let mut args = command[at + 1..].iter();
+    while let Some(arg) = args.next() {
+        let flag = arg.split_once('=').map_or(arg.as_str(), |(f, _)| f);
+        if WITH_VALUE.contains(&flag) {
+            if !arg.contains('=') && args.next().is_none() {
+                return Err(format!("{arg:?} in the cargo command needs a value"));
+            }
+            continue;
+        }
+        if SWITCHES.contains(&arg.as_str()) {
+            continue;
+        }
+        return Err(format!(
+            "a cargo command must not contain {arg:?}: titer chooses the packages, targets, \
+             tests, output format, and target dir. After `test` it accepts {} and {}",
+            WITH_VALUE.join(", "),
+            SWITCHES.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 /// Normalizes a repo-relative path: no leading `./`, no trailing slash, `.` for the root.
@@ -437,6 +458,14 @@ mod tests {
     }
 
     #[test]
+    fn cargo_commands_accept_build_flags_with_their_values() {
+        let config = Config::parse(
+            "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"+nightly\", \"test\", \"--features\", \"pg\", \"--release\", \"-j\", \"2\", \"--config=net.offline=true\"]\n",
+        );
+        assert!(config.is_ok(), "{config:?}");
+    }
+
+    #[test]
     fn rejects_configs_that_cannot_run() {
         let cases = [
             ("", "at least one [[runner]]"),
@@ -475,6 +504,22 @@ mod tests {
             (
                 "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\", \"--target-dir=/tmp/t\"]",
                 "must not contain \"--target-dir=/tmp/t\"",
+            ),
+            (
+                "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\", \"-p\", \"beta\"]",
+                "must not contain \"-p\"",
+            ),
+            (
+                "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\", \"-qj1\"]",
+                "must not contain \"-qj1\"",
+            ),
+            (
+                "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\", \"unrelated\"]",
+                "must not contain \"unrelated\"",
+            ),
+            (
+                "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"build\"]",
+                "must run `cargo test`",
             ),
             (
                 "[[runner]]\nkind = \"pytest\"\ncommand = [\"x\"]\n[mutate]\nbudget = \"soon\"",

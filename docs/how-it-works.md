@@ -74,7 +74,7 @@ Each survivor gets two follow-up runs:
 
 Mutant outcomes are `killed`, `timed_out`, `survived`, `not_executed`, `caught_by_other`, `not_run` (the budget ran out first), and `no_result`.
 
-A mutant that leaves any selected target unbuildable gets `no_result`, unless a test in a target that built fails. A compile error is never a kill, and a pass in one target is not a survivor while another target cannot build.
+A mutant that leaves any selected target unbuildable or unlistable gets `no_result`, unless a test in a target that built fails. A compile or link error is never a kill, and a pass in one target is not a survivor while another target cannot run.
 
 Agents can add their own mutants with `--mutants`. See the [CLI reference](cli.md#agent-mutants).
 
@@ -94,11 +94,11 @@ Rust keeps unit tests in the source file they test. titer reads `#[cfg(test)]` i
 
 - A changed test inside a source file is a changed test. `#[cfg_attr(condition, test)]` also marks a test.
 - Test code is never mutated, and a change that edits only test code does not touch source. Code that shares a line with test code is still source.
-- `prove` keeps base's source code and replaces its test items with head's, in place. A new test item goes right after the nearest item before it in head that base also has, so it sees the same `macro_rules!` definitions it sees in head. A file marked `#![cfg(test)]` is test code throughout and goes onto base whole.
+- `prove` keeps base's source code and replaces its test items with head's. Each head test item goes right after the nearest non-test item before it in head that base also has, so it sees the same `macro_rules!` definitions it sees in head. A test module inside a module that base lacks goes into an empty module of that name. A file that cargo compiles only as test code, such as one under `#[cfg(test)] mod unit;` or `#![cfg(test)]`, goes onto base whole.
 
-titer maps each file to the targets that compile it by following `mod` declarations, including `#[path]`, from each target's root. A module that several targets declare, such as `tests/common/mod.rs`, belongs to each of them. It lists each target's tests and selects exact names; a test that a macro such as `rstest` expands into cases selects every case.
+titer asks `cargo metadata` for packages and targets, and maps each file to the targets that compile it by following `mod` declarations, including `#[path]`, from each target's root. A module that several targets declare, such as `tests/common/mod.rs`, belongs to each of them. It lists each target's tests and selects exact names; a test that a macro such as `rstest` expands into cases selects every case.
 
-A test that uses a name only head has stops its whole target from compiling on base. `prove` gives such a test the `missing_symbol` verdict, removes it and the imports of that name from base, and builds again, so the other changed tests in that target still run.
+A test that uses a name only head has stops its whole target from compiling on base. `prove` gives such a test the `missing_symbol` verdict, removes it and the imports of that name (including an alias) from base, and builds again, so the other changed tests in that target still run.
 
 Doc tests run with the suite, but a changed doc test is not a changed test: libtest names a doc test by its line, which differs between base and head.
 

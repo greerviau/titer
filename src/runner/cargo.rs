@@ -2,10 +2,11 @@
 //! libtest's plain output.
 //!
 //! A test id is the file and the path inside it, `src/math.rs::tests::muls`. The file maps
-//! to the targets that compile it (`--lib`, `--bin`, or `--test` of a package) and to its
-//! module path in each, which together give libtest's name, `math::tests::muls`. titer
-//! lists each target's tests and selects exact names: the test's own name, or each case a
-//! parametrizing macro such as `rstest` generates under it.
+//! to the targets that compile it (`--lib`, `--bin`, `--test`, or `--example` of a
+//! package) and to its module paths in each, which together give libtest's names, such as
+//! `math::tests::muls`. titer lists each target's tests and selects exact names: the
+//! test's own name, or, for a test that a macro such as `rstest` expands, each case under
+//! its name. A target that does not build or list leaves the run incomplete.
 //!
 //! The build runs before the tests, with its own generous timeout. The run's timeout and
 //! duration cover the test binaries only: each worktree's first build is cold, and counting
@@ -26,11 +27,11 @@ use super::{
     CompileError, Failure, FailureKind, FileError, RunRequest, Runner, Selection, Status, TestCase,
     TestOutcome, TestRun, cwd_relative, output_tail,
 };
-use crate::lang::{self, Lang, PythonStyle};
+use crate::lang::{self, Lang, PythonStyle, TestDef};
 use crate::process::RunOutput;
-use targets::{Target, targets_of};
+use targets::Target;
 
-mod targets;
+pub mod targets;
 
 /// How long a build may take. Builds do not hang the way tests can, and a cold build of a
 /// large workspace can take many minutes.
@@ -44,39 +45,63 @@ pub fn test_id(rel: &str, suite: &[String], name: &str) -> String {
     parts.join("::")
 }
 
-/// One cargo invocation: a target and the tests wanted from it, or the whole suite.
+/// A libtest name to select, the case it stands for, and whether a macro expands it into
+/// a module of cases.
+struct Wanted<'a> {
+    case: Option<&'a TestCase>,
+    name: String,
+    parametrized: bool,
+}
+
+/// One target and the tests wanted from it, or the whole suite.
 struct Group<'a> {
     target: Option<Target>,
-    /// libtest names, each with the selected case it stands for.
-    wanted: Vec<(Option<&'a TestCase>, String)>,
+    wanted: Vec<Wanted<'a>>,
 }
 
 fn groups<'a>(runner: &Runner, cwd: &Path, selection: &Selection<'a>) -> Vec<Group<'a>> {
     let rel = |f: &str| cwd_relative(f, &runner.config.cwd);
-    let mut by_target: BTreeMap<Target, Vec<(Option<&'a TestCase>, String)>> = BTreeMap::new();
-    let mut add = |file: &str, case: Option<&'a TestCase>, suite: &[String], name: &str| {
-        for (target, module) in targets_of(cwd, &rel(file)) {
-            let mut path = module;
-            path.extend(suite.iter().cloned());
-            path.push(name.to_string());
-            by_target
-                .entry(target)
-                .or_default()
-                .push((case, path.join("::")));
+    let index = targets::index(&runner.config.command, cwd);
+    let mut by_target: BTreeMap<Target, Vec<Wanted<'a>>> = BTreeMap::new();
+    let mut defs: BTreeMap<String, Vec<TestDef>> = BTreeMap::new();
+    let mut tests_in = |file: &str| -> Vec<TestDef> {
+        defs.entry(file.to_string())
+            .or_insert_with(|| {
+                let source = std::fs::read_to_string(cwd.join(file)).unwrap_or_default();
+                lang::find_tests(Lang::Rust, &source, PythonStyle::Pytest)
+            })
+            .clone()
+    };
+    let mut add = |file: &str, case: Option<&'a TestCase>, def: &TestDef| {
+        for r in index.refs(file) {
+            let mut path = r.module.clone();
+            path.extend(def.suite.iter().cloned());
+            path.push(def.name.clone());
+            by_target.entry(r.target.clone()).or_default().push(Wanted {
+                case,
+                name: path.join("::"),
+                parametrized: def.parametrized,
+            });
         }
     };
     match selection {
         Selection::Tests(cases) => {
             for case in cases.iter() {
-                add(&case.file, Some(case), &case.suite, &case.name);
+                let file = rel(&case.file);
+                let def = tests_in(&file)
+                    .into_iter()
+                    .find(|d| d.name == case.name && d.suite == case.suite);
+                if let Some(def) = def {
+                    add(&file, Some(case), &def);
+                }
             }
         }
         // A file's own tests, not the rest of its target.
         Selection::Files(files) => {
             for file in files.iter() {
-                let source = std::fs::read_to_string(cwd.join(rel(file))).unwrap_or_default();
-                for def in lang::find_tests(Lang::Rust, &source, PythonStyle::Pytest) {
-                    add(file, None, &def.suite, &def.name);
+                let file = rel(file);
+                for def in tests_in(&file) {
+                    add(&file, None, &def);
                 }
             }
         }
@@ -96,22 +121,35 @@ fn groups<'a>(runner: &Runner, cwd: &Path, selection: &Selection<'a>) -> Vec<Gro
         .collect()
 }
 
-/// The exact libtest names to run for each wanted name: the name itself, or, when a macro
-/// such as `rstest` expands the test into a module of cases, every case under it.
-fn resolve<'a>(
-    wanted: &[(Option<&'a TestCase>, String)],
-    listed: &[String],
-) -> BTreeMap<String, Option<&'a TestCase>> {
+/// The exact libtest names to run: each wanted name that the target lists, and for a test
+/// that a macro expands, each case under its name.
+fn resolve<'a>(wanted: &[Wanted<'a>], listed: &[String]) -> BTreeMap<String, Option<&'a TestCase>> {
     let mut out = BTreeMap::new();
-    for (case, name) in wanted {
-        if listed.contains(name) {
-            out.insert(name.clone(), *case);
-            continue;
+    for w in wanted {
+        if listed.contains(&w.name) {
+            out.insert(w.name.clone(), w.case);
+        } else if w.parametrized {
+            let prefix = format!("{}::", w.name);
+            for l in listed.iter().filter(|l| l.starts_with(&prefix)) {
+                out.insert(l.clone(), w.case);
+            }
         }
-        let prefix = format!("{name}::");
-        for l in listed.iter().filter(|l| l.starts_with(&prefix)) {
-            out.insert(l.clone(), *case);
+    }
+    out
+}
+
+/// Exact names in batches that stay well under the OS limit on argument size.
+fn batches(names: Vec<String>) -> Vec<Vec<String>> {
+    const LIMIT: usize = 64 * 1024;
+    let mut out: Vec<Vec<String>> = vec![Vec::new()];
+    let mut size = 0;
+    for name in names {
+        if size + name.len() > LIMIT && !out.last().is_some_and(Vec::is_empty) {
+            out.push(Vec::new());
+            size = 0;
         }
+        size += name.len() + 1;
+        out.last_mut().expect("out is never empty").push(name);
     }
     out
 }
@@ -129,6 +167,7 @@ fn build(
     let build = exec(runner, req, &args, Some(BUILD_TIMEOUT))?;
     if build.timed_out {
         run.timed_out = true;
+        run.incomplete = true;
         return Ok(false);
     }
     if build.success() {
@@ -147,34 +186,41 @@ fn build(
     };
     run.runner_error = Some(format!("the build failed:\n{summary}"));
     run.compile_errors.extend(errors);
+    run.incomplete = true;
     Ok(false)
 }
 
-/// The test names that the target's binary lists.
-fn list(runner: &Runner, req: &RunRequest, target_args: &[String]) -> anyhow::Result<Vec<String>> {
+/// The test names that the target's binary lists, or why it could not list them.
+fn list(
+    runner: &Runner,
+    req: &RunRequest,
+    target_args: &[String],
+) -> anyhow::Result<Result<Vec<String>, String>> {
     let mut args = target_args.to_vec();
     args.extend(["--", "--list", "--format", "terse"].map(String::from));
     let out = exec(runner, req, &args, Some(BUILD_TIMEOUT))?;
-    Ok(out
+    if out.timed_out || !out.success() {
+        return Ok(Err(format!(
+            "cannot list the tests of {}:\n{}",
+            target_args.join(" "),
+            output_tail(&out)
+        )));
+    }
+    Ok(Ok(out
         .stdout
         .lines()
         .filter_map(|l| l.strip_suffix(": test"))
         .map(str::to_string)
-        .collect())
+        .collect()))
 }
 
-/// The suite's arguments: every member of a workspace, unless the command picks packages.
-fn suite_args(runner: &Runner, cwd: &Path) -> Vec<String> {
-    let picks = runner
-        .config
-        .command
-        .iter()
-        .any(|a| a == "-p" || a.starts_with("--package"));
+/// The suite's arguments: every member of a workspace.
+fn suite_args(cwd: &Path) -> Vec<String> {
     let workspace = std::fs::read_to_string(cwd.join("Cargo.toml"))
         .ok()
         .and_then(|t| t.parse::<toml::Table>().ok())
         .is_some_and(|m| m.contains_key("workspace"));
-    if workspace && !picks {
+    if workspace {
         vec!["--workspace".to_string()]
     } else {
         Vec::new()
@@ -191,12 +237,13 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
         max_rss_bytes: 0,
         runner_error: None,
         compile_errors: Vec::new(),
+        incomplete: false,
     };
     let sequential = matches!(req.selection, Selection::Tests(_));
-    for group in groups(runner, &cwd, &req.selection) {
+    'groups: for group in groups(runner, &cwd, &req.selection) {
         let target_args = match &group.target {
             Some(t) => t.args(),
-            None => suite_args(runner, &cwd),
+            None => suite_args(&cwd),
         };
         if !build(runner, req, &target_args, &mut run)? {
             if run.timed_out {
@@ -206,7 +253,14 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
         }
         let selected = match &group.target {
             Some(_) => {
-                let listed = list(runner, req, &target_args)?;
+                let listed = match list(runner, req, &target_args)? {
+                    Ok(listed) => listed,
+                    Err(why) => {
+                        run.runner_error = Some(why);
+                        run.incomplete = true;
+                        continue;
+                    }
+                };
                 let selected = resolve(&group.wanted, &listed);
                 if selected.is_empty() {
                     continue;
@@ -215,80 +269,93 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
             }
             None => None,
         };
-
-        let remaining = req.timeout.map(|t| t.saturating_sub(run.duration));
-        if remaining.is_some_and(|r| r.is_zero()) {
-            run.timed_out = true;
-            break;
-        }
-        let mut args = target_args;
-        args.extend(["--".to_string(), "--color".to_string(), "never".to_string()]);
-        if let Some(selected) = &selected {
-            args.push("--exact".to_string());
-            if sequential {
-                args.push("--test-threads=1".to_string());
-            }
-            args.extend(selected.keys().cloned());
-        }
-        let out = exec(runner, req, &args, remaining)?;
-        run.duration += out.duration;
-        run.max_rss_bytes = run.max_rss_bytes.max(out.max_rss_bytes);
+        let names: Vec<Vec<String>> = match &selected {
+            Some(s) => batches(s.keys().cloned().collect()),
+            None => vec![Vec::new()],
+        };
         let case_of = |name: &str| {
             selected
                 .as_ref()
                 .and_then(|s| s.get(name).copied().flatten())
         };
-
-        let blocks = parse(&out.stdout);
-        let files = binary_files(&out.stderr);
         let mut failed = false;
-        for (i, block) in blocks.iter().enumerate() {
-            let file = match &group.target {
-                Some(t) => format!("./{}", t.root),
-                None => files.get(i).cloned().unwrap_or_default(),
-            };
-            for (name, status) in &block.results {
-                failed |= matches!(status, Status::Failed(_));
-                run.outcomes.push(outcome(
-                    case_of(name),
-                    &file,
-                    name,
-                    status.clone(),
-                    &runner.config.cwd,
-                ));
+        for batch in names {
+            let remaining = req.timeout.map(|t| t.saturating_sub(run.duration));
+            if remaining.is_some_and(|r| r.is_zero()) {
+                run.timed_out = true;
+                break 'groups;
             }
-            if block.finished || out.timed_out {
-                continue;
+            let mut args = target_args.clone();
+            args.extend(["--".to_string(), "--color".to_string(), "never".to_string()]);
+            if selected.is_some() {
+                args.push("--exact".to_string());
+                if sequential {
+                    args.push("--test-threads=1".to_string());
+                }
+                args.extend(batch);
             }
-            failed = true;
-            let failure = Failure {
-                kind: FailureKind::Exception,
-                exception_type: None,
-                message: format!("the test binary crashed: {}", crash_reason(&out)),
-            };
-            match &block.running {
-                Some(name) => run.outcomes.push(outcome(
-                    case_of(name),
-                    &file,
-                    name,
-                    Status::Failed(failure),
-                    &runner.config.cwd,
-                )),
-                None => run.file_errors.push(FileError { file, failure }),
+            let out = exec(runner, req, &args, remaining)?;
+            run.duration += out.duration;
+            run.max_rss_bytes = run.max_rss_bytes.max(out.max_rss_bytes);
+            failed |= read_output(&out, &group, &case_of, &runner.config.cwd, &mut run);
+            if out.timed_out {
+                run.timed_out = true;
+                break 'groups;
             }
-        }
-        if blocks.is_empty() && !out.success() && !out.timed_out {
-            run.runner_error = Some(output_tail(&out));
-        }
-        if out.timed_out {
-            run.timed_out = true;
-            break;
         }
         if failed && req.fail_fast {
             break;
         }
     }
     Ok(run)
+}
+
+/// Adds one invocation's results to the run. Returns whether any test failed or crashed.
+fn read_output<'a>(
+    out: &RunOutput,
+    group: &Group,
+    case_of: &dyn Fn(&str) -> Option<&'a TestCase>,
+    cwd: &str,
+    run: &mut TestRun,
+) -> bool {
+    let blocks = parse(&out.stdout);
+    let files = binary_files(&out.stderr);
+    let mut failed = false;
+    for (i, block) in blocks.iter().enumerate() {
+        let file = match &group.target {
+            Some(t) => format!("./{}", t.root),
+            None => files.get(i).cloned().unwrap_or_default(),
+        };
+        for (name, status) in &block.results {
+            failed |= matches!(status, Status::Failed(_));
+            run.outcomes
+                .push(outcome(case_of(name), &file, name, status.clone(), cwd));
+        }
+        if block.finished || out.timed_out {
+            continue;
+        }
+        failed = true;
+        let failure = Failure {
+            kind: FailureKind::Exception,
+            exception_type: None,
+            message: format!("the test binary crashed: {}", crash_reason(out)),
+        };
+        match &block.running {
+            Some(name) => run.outcomes.push(outcome(
+                case_of(name),
+                &file,
+                name,
+                Status::Failed(failure),
+                cwd,
+            )),
+            None => run.file_errors.push(FileError { file, failure }),
+        }
+    }
+    if blocks.is_empty() && !out.success() && !out.timed_out {
+        run.runner_error = Some(output_tail(out));
+        run.incomplete = true;
+    }
+    failed
 }
 
 fn exec(
@@ -302,7 +369,18 @@ fn exec(
     // Each worktree builds into its own dir, whatever the environment, the runner's `env`,
     // or a cargo config says: a shared dir would let one worktree's mutant overwrite
     // another's binaries, and a dir in the checkout would be a write to the checkout.
-    let target = req.worktree.join(".titer-cache/cargo-target");
+    let cache = req.worktree.join(".titer-cache");
+    let target = cache.join("cargo-target");
+    // A symlinked dir, such as one linked in from the checkout as a dependency dir, would
+    // lead the build out of the worktree.
+    for dir in [&cache, &target] {
+        if dir.is_symlink() {
+            anyhow::bail!(
+                "refusing to build into {}: it is a symlink out of the worktree",
+                dir.display()
+            );
+        }
+    }
     cmd.env("CARGO_TARGET_DIR", &target)
         .env("CARGO_BUILD_BUILD_DIR", &target);
     if !runner.config.env.contains_key("RUST_BACKTRACE") {

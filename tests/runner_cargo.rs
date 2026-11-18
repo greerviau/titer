@@ -332,7 +332,24 @@ mod tests {
         }
     }
 
-    // What a parametrizing macro such as rstest generates for `fn param`.
+    // An inactive test, and a module of the same name whose tests are not its cases.
+    #[cfg(any())]
+    #[test]
+    fn inactive() {}
+
+    mod inactive {
+        #[test]
+        fn unrelated() {
+            panic!("not the selected test");
+        }
+    }
+
+    // `fn param` as the source spells it, and the module of cases rstest makes of it. The
+    // cfg keeps the unresolvable attribute out of the build.
+    #[cfg(any())]
+    #[rstest]
+    fn param() {}
+
     mod param {
         #[test]
         fn case_1() {}
@@ -352,11 +369,12 @@ fn a_test_and_a_module_of_one_name_stay_apart_and_macro_cases_aggregate() {
     let runner = runner();
     let checks = case(&runner, "rs/src/lib.rs", &["tests"], "checks");
     let param = case(&runner, "rs/src/lib.rs", &["tests"], "param");
+    let inactive = case(&runner, "rs/src/lib.rs", &["tests"], "inactive");
 
     let run = run(
         &repo,
         &runner,
-        Selection::Tests(&[checks.clone(), param.clone()]),
+        Selection::Tests(&[checks.clone(), param.clone(), inactive.clone()]),
         None,
     );
 
@@ -369,6 +387,7 @@ fn a_test_and_a_module_of_one_name_stay_apart_and_macro_cases_aggregate() {
         panic!("{run:?}")
     };
     assert_eq!(f.kind, FailureKind::Assertion);
+    assert_eq!(run.result_for(&inactive, "rs"), CaseResult::NotRun);
     assert_eq!(run.executed(), 3, "{run:?}");
 }
 
@@ -389,6 +408,7 @@ fn file_selection_runs_only_the_tests_in_that_file() {
         vec![
             "tests::checks",
             "tests::checks::unrelated",
+            "tests::inactive::unrelated",
             "tests::param::case_1",
             "tests::param::case_2"
         ]
@@ -420,4 +440,51 @@ fn the_suite_of_a_workspace_runs_every_member() {
     let mut names: Vec<String> = run.outcomes.iter().map(|o| o.name.clone()).collect();
     names.sort();
     assert_eq!(names, vec!["in_a", "in_b", "in_root"], "{run:?}");
+}
+
+#[test]
+fn a_target_that_fails_to_link_makes_the_run_incomplete() {
+    let repo = fixture();
+    repo.write(
+        "rs/src/main.rs",
+        "#[link(name = \"titer_no_such_library\")]\nunsafe extern \"C\" {\n    fn titer_missing();\n}\n\nfn main() {\n    unsafe { titer_missing() }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn starts() {}\n}\n",
+    );
+    let runner = runner();
+    let adds = case(&runner, "rs/src/lib.rs", &["tests"], "adds");
+    let starts = case(&runner, "rs/src/main.rs", &["tests"], "starts");
+
+    let run = run(
+        &repo,
+        &runner,
+        Selection::Tests(&[adds.clone(), starts.clone()]),
+        None,
+    );
+
+    assert_eq!(run.result_for(&adds, "rs"), CaseResult::Passed, "{run:?}");
+    assert_eq!(run.result_for(&starts, "rs"), CaseResult::NotRun);
+    assert!(run.incomplete, "{run:?}");
+}
+
+#[test]
+fn a_symlinked_build_dir_is_refused() {
+    let repo = fixture();
+    let outside = repo.scratch().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, repo.path().join(".titer-cache")).unwrap();
+    let runner = runner();
+    let adds = case(&runner, "rs/src/lib.rs", &["tests"], "adds");
+    let scratch = repo.scratch().join("run");
+
+    let err = runner
+        .run(&RunRequest {
+            worktree: repo.path(),
+            selection: Selection::Tests(std::slice::from_ref(&adds)),
+            fail_fast: false,
+            timeout: None,
+            scratch: &scratch,
+        })
+        .unwrap_err();
+
+    assert!(err.to_string().contains("symlink"), "{err:#}");
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
 }

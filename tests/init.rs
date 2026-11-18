@@ -259,9 +259,15 @@ fn init_gives_a_nested_crate_outside_the_workspace_its_own_runner() {
     repo.write(".gitignore", "target\n")
         .write(
             "Cargo.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/skip\"]\n",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nhelper = { path = \"helper\" }\n\n[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/skip\"]\n",
         )
         .write("src/lib.rs", "")
+        // A path dependency joins the workspace without a members entry.
+        .write(
+            "helper/Cargo.toml",
+            "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .write("helper/src/lib.rs", "")
         .write(
             "crates/member/Cargo.toml",
             "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
@@ -287,4 +293,5 @@ fn init_gives_a_nested_crate_outside_the_workspace_its_own_runner() {
     assert!(stdout.contains("cwd = \"crates/skip\""), "{stdout}");
     assert!(stdout.contains("cwd = \"fuzz\""), "{stdout}");
     assert!(!stdout.contains("cwd = \"crates/member\""), "{stdout}");
+    assert!(!stdout.contains("cwd = \"helper\""), "{stdout}");
 }

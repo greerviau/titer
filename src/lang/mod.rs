@@ -66,6 +66,8 @@ pub struct TestDef {
     /// Statically skipped: `it.skip`, `it.todo`, `xit`, inside `describe.skip`, or Rust's
     /// `#[ignore]`.
     pub skip: bool,
+    /// Rust only: a macro such as `rstest` expands the test into a module of cases.
+    pub parametrized: bool,
     /// The byte span of the test, including decorators.
     pub start_byte: usize,
     pub end_byte: usize,

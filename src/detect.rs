@@ -2,6 +2,7 @@
 //! touches.
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use globset::{GlobSet, GlobSetBuilder};
@@ -27,6 +28,9 @@ pub enum Role {
 /// Assigns repo-relative paths to runners and roles.
 pub struct Classifier {
     runners: Vec<(RunnerConfig, GlobSet, GlobSet)>,
+    /// The checkout, when the classifier may read it to learn which files cargo compiles
+    /// as tests.
+    root: Option<PathBuf>,
 }
 
 pub fn glob_set(globs: &[String]) -> anyhow::Result<GlobSet> {
@@ -55,6 +59,7 @@ fn under(path: &str, cwd: &str) -> bool {
 }
 
 impl Classifier {
+    /// A classifier from paths and globs alone.
     pub fn new(runners: &[Runner]) -> anyhow::Result<Classifier> {
         let runners = runners
             .iter()
@@ -66,30 +71,76 @@ impl Classifier {
                 ))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(Classifier { runners })
+        Ok(Classifier {
+            runners,
+            root: None,
+        })
+    }
+
+    /// A classifier that also reads the checkout at `root`, which holds head, for cargo's
+    /// module layout. It never writes there.
+    pub fn in_checkout(runners: &[Runner], root: &Path) -> anyhow::Result<Classifier> {
+        let mut classifier = Classifier::new(runners)?;
+        classifier.root = Some(root.to_path_buf());
+        Ok(classifier)
+    }
+
+    /// The runners whose cwd contains `path`, deepest first.
+    fn containing(&self, path: &str) -> Vec<usize> {
+        let mut out: Vec<usize> = (0..self.runners.len())
+            .filter(|i| under(path, &self.runners[*i].0.cwd))
+            .collect();
+        let depth = |i: &usize| {
+            let cwd = &self.runners[*i].0.cwd;
+            if cwd == "." { 0 } else { cwd.len() }
+        };
+        out.sort_by_key(|i| std::cmp::Reverse(depth(i)));
+        out
+    }
+
+    /// For a cargo runner: whether cargo compiles the file only as test code, or None when
+    /// titer cannot tell from the checkout.
+    fn cargo_test_code(&self, config: &RunnerConfig, rel: &str) -> Option<bool> {
+        let root = self.root.as_ref()?;
+        let index = crate::runner::cargo::targets::index(&config.command, &root.join(&config.cwd));
+        let refs = index.refs(rel);
+        if refs.is_empty() {
+            return None;
+        }
+        Some(refs.iter().all(|r| {
+            r.test_only || matches!(r.target.kind, crate::runner::cargo::targets::Kind::Test(_))
+        }))
     }
 
     pub fn role(&self, path: &str) -> Role {
         let lang = Lang::of(path);
-        for (i, (config, tests, _)) in self.runners.iter().enumerate() {
+        let runners = self.containing(path);
+        for &i in &runners {
+            let (config, tests, _) = &self.runners[i];
+            if !lang.is_some_and(|l| runs_lang(config.kind, l)) {
+                continue;
+            }
             let rel = cwd_relative(path, &config.cwd);
-            // A cargo file under `src/` is source, even in a `tests` module dir: it can hold
-            // code that base must keep.
-            let in_src = config.kind == RunnerKind::Cargo && rel.split('/').any(|p| p == "src");
-            if under(path, &config.cwd)
-                && lang.is_some_and(|l| runs_lang(config.kind, l))
-                && tests.is_match(&rel)
-                && !in_src
-            {
+            if config.kind == RunnerKind::Cargo {
+                // What cargo compiles decides; without that, a file under `src/` is source,
+                // even in a `tests` module dir, since it can hold code that base must keep.
+                let test = self
+                    .cargo_test_code(config, &rel)
+                    .unwrap_or_else(|| tests.is_match(&rel) && !rel.split('/').any(|p| p == "src"));
+                if test {
+                    return Role::Test { runner: i };
+                }
+                continue;
+            }
+            if tests.is_match(&rel) {
                 return Role::Test { runner: i };
             }
         }
-        for (i, (config, _, support)) in self.runners.iter().enumerate() {
+        for &i in &runners {
+            let (config, _, support) = &self.runners[i];
             let rel = cwd_relative(path, &config.cwd);
-            let rust_in_src = config.kind == RunnerKind::Cargo
-                && lang == Some(Lang::Rust)
-                && rel.split('/').any(|p| p == "src");
-            if under(path, &config.cwd) && support.is_match(&rel) && !rust_in_src {
+            let cargo_rust = config.kind == RunnerKind::Cargo && lang == Some(Lang::Rust);
+            if support.is_match(&rel) && !cargo_rust {
                 return Role::Support { runner: i };
             }
         }
@@ -97,21 +148,10 @@ impl Classifier {
             return Role::NotAnalyzed;
         };
         // The runner with the deepest cwd that contains the file and runs its language.
-        self.runners
-            .iter()
-            .enumerate()
-            .filter(|(_, (config, _, _))| under(path, &config.cwd) && runs_lang(config.kind, lang))
-            .max_by_key(|(_, (config, _, _))| {
-                if config.cwd == "." {
-                    0
-                } else {
-                    config.cwd.len()
-                }
-            })
-            .map_or(Role::NotAnalyzed, |(runner, _)| Role::Source {
-                runner,
-                lang,
-            })
+        runners
+            .into_iter()
+            .find(|i| runs_lang(self.runners[*i].0.kind, lang))
+            .map_or(Role::NotAnalyzed, |runner| Role::Source { runner, lang })
     }
 
     /// True for test and support files of any runner.
@@ -172,7 +212,7 @@ pub fn python_style(kind: RunnerKind) -> PythonStyle {
 }
 
 pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection> {
-    let classifier = Classifier::new(runners)?;
+    let classifier = Classifier::in_checkout(runners, session.git.root())?;
     let mut detection = Detection::default();
     for change in &session.changes.files {
         if change.status == FileStatus::Deleted {

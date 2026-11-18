@@ -295,8 +295,9 @@ fn detect_vitest(dir: &Path, rel: &str) -> Option<DetectedRunner> {
     })
 }
 
-/// Whether the workspace whose root is `workspace_dir` (repo-relative `workspace_rel`)
-/// lists the package at repo-relative `rel` in `members` and not in `exclude`.
+/// Whether cargo counts the package at repo-relative `rel` as a member of the workspace
+/// rooted at `workspace_dir` (repo-relative `workspace_rel`), listed or joined as a path
+/// dependency. `cargo metadata` decides; it reads the manifests and writes nothing.
 fn workspace_member(workspace_dir: &Path, workspace_rel: &str, rel: &str) -> bool {
     let inner = if workspace_rel == "." {
         Some(rel)
@@ -306,27 +307,11 @@ fn workspace_member(workspace_dir: &Path, workspace_rel: &str, rel: &str) -> boo
     let Some(inner) = inner else {
         return false;
     };
-    let Some(manifest) = std::fs::read_to_string(workspace_dir.join("Cargo.toml"))
-        .ok()
-        .and_then(|t| t.parse::<toml::Table>().ok())
-    else {
-        return false;
-    };
-    let Some(workspace) = manifest.get("workspace") else {
-        return false;
-    };
-    let matches = |key: &str| {
-        let globs: Vec<String> = workspace
-            .get(key)
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v.as_str())
-            .map(|g| g.trim_end_matches('/').to_string())
-            .collect();
-        crate::detect::glob_set(&globs).is_ok_and(|set| set.is_match(inner))
-    };
-    matches("members") && !matches("exclude")
+    let command = ["cargo".to_string(), "test".to_string()];
+    crate::runner::cargo::targets::index(&command, workspace_dir)
+        .members
+        .iter()
+        .any(|m| m == inner)
 }
 
 fn detect_cargo(dir: &Path, rel: &str) -> Option<DetectedRunner> {

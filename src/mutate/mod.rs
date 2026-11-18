@@ -499,9 +499,7 @@ pub fn classify(run: &TestRun, plan: &Plan, cwd: &str) -> (MutantOutcome, Option
                     Some(e.file.trim_start_matches("./").to_string()),
                 );
             }
-            if results.iter().any(|(_, r)| *r == CaseResult::Passed)
-                && run.compile_errors.is_empty()
-            {
+            if results.iter().any(|(_, r)| *r == CaseResult::Passed) && !run.incomplete {
                 return (MutantOutcome::Survived, None);
             }
         }
@@ -523,7 +521,7 @@ pub fn classify(run: &TestRun, plan: &Plan, cwd: &str) -> (MutantOutcome, Option
             if let Some(e) = run.file_errors.first() {
                 return (MutantOutcome::Killed, Some(e.file.clone()));
             }
-            if run.executed() > 0 && run.compile_errors.is_empty() {
+            if run.executed() > 0 && !run.incomplete {
                 return (MutantOutcome::Survived, None);
             }
         }

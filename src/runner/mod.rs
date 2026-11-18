@@ -110,6 +110,9 @@ pub struct TestRun {
     /// Compile errors that stopped the build. A run with compile errors executed nothing
     /// they affect, so they are never a test failure.
     pub compile_errors: Vec<CompileError>,
+    /// Some selected tests could not run: a target did not build, or its test list could
+    /// not be read. A pass elsewhere in such a run is not a survivor.
+    pub incomplete: bool,
 }
 
 impl TestRun {

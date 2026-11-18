@@ -39,7 +39,7 @@ pub struct Loaded {
 pub fn load(ctx: &Context, path: &Path) -> anyhow::Result<Loaded> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read --mutants {}", path.display()))?;
-    let classifier = Classifier::new(&ctx.runners)?;
+    let classifier = Classifier::in_checkout(&ctx.runners, ctx.session.git.root())?;
     let mut out = Vec::new();
     let mut warnings = Vec::new();
     for (n, raw) in text.lines().enumerate() {

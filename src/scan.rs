@@ -14,7 +14,7 @@ use crate::runner::Runner;
 use crate::session::Session;
 
 pub fn scan(session: &Session, runners: &[Runner]) -> anyhow::Result<Vec<Finding>> {
-    let classifier = Classifier::new(runners)?;
+    let classifier = Classifier::in_checkout(runners, session.git.root())?;
     let mut findings = Vec::new();
     for change in &session.changes.files {
         let path = change.path();
@@ -316,7 +316,7 @@ static RS_ASSERT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(?:debug_|prop_)?assert(?:_\w+)?!|#\[should_panic").unwrap());
 
 fn assertions(lang: Lang, text: &str) -> usize {
-    let text = strip_comments(lang, text);
+    let text = code_of(lang, text);
     let re = match lang {
         Lang::Python => &PY_ASSERT,
         Lang::TypeScript | Lang::Tsx => &TS_ASSERT,
@@ -341,7 +341,7 @@ static TS_MATCHER: LazyLock<Regex> =
 
 /// Matcher names and how often each occurs.
 fn matchers(lang: Lang, text: &str) -> BTreeMap<String, usize> {
-    let text = strip_comments(lang, text);
+    let text = code_of(lang, text);
     let mut out: BTreeMap<String, usize> = BTreeMap::new();
     if lang.is_python() {
         for caps in PY_ASSERT_METHOD.captures_iter(&text) {
@@ -478,25 +478,49 @@ fn inline_snapshots(lang: Lang, text: &str) -> Vec<String> {
         .collect()
 }
 
+/// The text that assertions and matchers are counted in: comments dropped, and for Rust
+/// the contents of string literals too, so a quoted `assert!` does not count.
+fn code_of(lang: Lang, text: &str) -> String {
+    if lang == Lang::Rust {
+        strip_rust_nodes(
+            text,
+            &["line_comment", "block_comment"],
+            &["string_literal", "raw_string_literal"],
+        )
+    } else {
+        strip_comments(lang, text)
+    }
+}
+
 /// Drops Rust comments as the parser finds them, so `//` inside a string stays.
 fn strip_rust_comments(text: &str) -> String {
+    strip_rust_nodes(text, &["line_comment", "block_comment"], &[])
+}
+
+/// `text` without the nodes of the `dropped` kinds, and with the nodes of the `emptied`
+/// kinds replaced by an empty string literal.
+fn strip_rust_nodes(text: &str, dropped: &[&str], emptied: &[&str]) -> String {
     let Some(tree) = Lang::Rust.parse(text) else {
         return TS_COMMENT.replace_all(text, "").into_owned();
     };
-    let mut cuts = Vec::new();
+    let mut cuts: Vec<(std::ops::Range<usize>, &str)> = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
-        if matches!(node.kind(), "line_comment" | "block_comment") {
-            cuts.push(node.byte_range());
+        if dropped.contains(&node.kind()) {
+            cuts.push((node.byte_range(), ""));
+            continue;
+        }
+        if emptied.contains(&node.kind()) {
+            cuts.push((node.byte_range(), "\"\""));
             continue;
         }
         let mut cursor = node.walk();
         stack.extend(node.children(&mut cursor));
     }
-    cuts.sort_by_key(|r| r.start);
+    cuts.sort_by_key(|(r, _)| r.start);
     let mut out = text.to_string();
-    for range in cuts.into_iter().rev() {
-        out.replace_range(range, "");
+    for (range, with) in cuts.into_iter().rev() {
+        out.replace_range(range, with);
     }
     out
 }
@@ -698,6 +722,8 @@ mod tests {
         let head = "#[test]\nfn t() {\n    let s = \"http://example\"; assert_eq!(f(1), 1); assert_eq!(f(2), 2);\n    // assert_eq!(f(3), 3);\n}\n";
         assert_eq!(assertions(Lang::Rust, head), 2);
         assert!(compare(Lang::Rust, PythonStyle::Pytest, "tests/a.rs", base, head).is_empty());
+        let quoted = "#[test]\nfn t() {\n    let _ = \"assert!(true)\"; assert_eq!(f(2), 2);\n}\n";
+        assert_eq!(assertions(Lang::Rust, quoted), 1);
     }
 
     #[test]
