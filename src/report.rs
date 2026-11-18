@@ -267,6 +267,9 @@ pub struct Mutant {
     /// The test that killed the mutant, when known.
     pub killed_by: Option<String>,
     pub duration_ms: Option<u64>,
+    /// The mutated code also appears in the base lines that this hunk replaces, so the change
+    /// may only have moved or reformatted it. A survivor here may predate the change.
+    pub unchanged_from_base: bool,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]

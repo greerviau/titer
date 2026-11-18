@@ -47,7 +47,7 @@ for doc in ["README.md", "LICENSE-MIT", "LICENSE-APACHE"]:
 manifest = {
     "name": "titer",
     **common,
-    "description": "Prove that a change's tests test the change: fail-on-base, diff-scoped mutation, weakened-test scan, and CRAP.",
+    "description": "Check whether a change's tests test the change: fail-on-base, diff-scoped mutation, weakened-test scan, and CRAP.",
     "keywords": ["testing", "mutation-testing", "ci", "agents", "vitest", "pytest"],
     "bin": {"titer": "bin/titer.js"},
     "files": ["bin/titer.js", "README.md", "LICENSE-MIT", "LICENSE-APACHE"],

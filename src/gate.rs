@@ -141,6 +141,7 @@ mod tests {
             outcome,
             killed_by: None,
             duration_ms: None,
+            unchanged_from_base: false,
         }
     }
 

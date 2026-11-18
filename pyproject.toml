@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "titer"
-description = "Prove that a change's tests test the change: fail-on-base, diff-scoped mutation, weakened-test scan, and CRAP."
+description = "Check whether a change's tests test the change: fail-on-base, diff-scoped mutation, weakened-test scan, and CRAP."
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 requires-python = ">=3.8"

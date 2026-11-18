@@ -12,10 +12,12 @@ use anyhow::bail;
 
 use crate::check::Context;
 use crate::detect::{self, glob_set};
+use crate::diff::FileChange;
 use crate::lang::Lang;
 use crate::prove::HeadRun;
 use crate::report::{Mutant, MutantOutcome, MutantSource};
 use crate::runner::{CaseResult, RunRequest, Runner, Selection, Status, TestCase, TestRun};
+use crate::session::Session;
 use crate::worktree::Worktree;
 
 use operators::{CallFilter, Candidate};
@@ -152,6 +154,7 @@ pub fn generate(ctx: &Context) -> anyhow::Result<Vec<(Mutant, Job)>> {
             continue;
         }
         let text = detect::read_head(&ctx.session, &source.file)?;
+        let base = BaseHunks::load(&ctx.session, &source.file)?;
         for cand in operators::generate(
             source.lang,
             &text,
@@ -160,13 +163,15 @@ pub fn generate(ctx: &Context) -> anyhow::Result<Vec<(Mutant, Job)>> {
             &config.exclude_operators,
         ) {
             let mutated = cand.apply(&text);
+            let mut mutant = mutant_from(
+                &ctx.runners[source.runner],
+                &source.file,
+                &cand,
+                MutantSource::Generated,
+            );
+            mutant.unchanged_from_base = base.contains(cand.line, &text[cand.context.clone()]);
             all.push((
-                mutant_from(
-                    &ctx.runners[source.runner],
-                    &source.file,
-                    &cand,
-                    MutantSource::Generated,
-                ),
+                mutant,
                 Job {
                     runner: source.runner,
                     file: source.file.clone(),
@@ -199,7 +204,79 @@ pub fn mutant_from(runner: &Runner, file: &str, cand: &Candidate, source: Mutant
         outcome: MutantOutcome::NotRun,
         killed_by: None,
         duration_ms: None,
+        unchanged_from_base: false,
     }
+}
+
+/// The base text that each hunk of one source file replaces.
+pub struct BaseHunks {
+    change: Option<FileChange>,
+    base: Vec<String>,
+}
+
+impl BaseHunks {
+    pub fn load(session: &Session, file: &str) -> anyhow::Result<BaseHunks> {
+        let change = session.changes.get(file).cloned();
+        let base = match change.as_ref().and_then(|c| c.old_path.as_deref()) {
+            Some(old) => session
+                .git
+                .read_blob(&session.base_sha, old)?
+                .map(|b| {
+                    String::from_utf8_lossy(&b)
+                        .lines()
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        Ok(BaseHunks { change, base })
+    }
+
+    /// Whether `code`, which starts on head `line`, also appears in the base lines that the
+    /// line's hunk replaces. That suggests the change moved or reformatted it.
+    pub fn contains(&self, line: u32, code: &str) -> bool {
+        let Some(change) = &self.change else {
+            return false;
+        };
+        let replaced: Vec<&str> = change
+            .replaced(line)
+            .iter()
+            .filter_map(|n| self.base.get(*n as usize - 1).map(String::as_str))
+            .collect();
+        contains_tokens(&replaced.join("\n"), code)
+    }
+}
+
+/// Whether `needle`'s tokens appear contiguously in `haystack`'s, ignoring whitespace. Tokens
+/// are runs of word characters and single other characters, so `if x` does not match
+/// `if x_old` and a line split across several matches the one-line original.
+pub fn contains_tokens(haystack: &str, needle: &str) -> bool {
+    let needle = tokens(needle);
+    !needle.is_empty() && tokens(haystack).windows(needle.len()).any(|w| w == needle)
+}
+
+fn tokens(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut word: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        let is_word = c.is_alphanumeric() || c == '_';
+        if let Some(start) = word
+            && !is_word
+        {
+            out.push(&text[start..i]);
+            word = None;
+        }
+        if is_word {
+            word.get_or_insert(i);
+        } else if !c.is_whitespace() {
+            out.push(&text[i..i + c.len_utf8()]);
+        }
+    }
+    if let Some(start) = word {
+        out.push(&text[start..]);
+    }
+    out
 }
 
 /// Mutation workers: the smaller of cores minus 1 and 70% of available memory over the
@@ -726,6 +803,19 @@ fn follow_up(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_matches_base_by_tokens_not_whitespace() {
+        let base = "  if (!aligned) return <p className={LARGE}>{card.target_language}</p>;";
+        assert!(contains_tokens(base, "className={LARGE}"));
+        assert!(contains_tokens(base, "if (!aligned)"));
+        assert!(contains_tokens("if x > hi: return hi", "x >\n  hi"));
+        assert!(!contains_tokens("if x_old:", "if x"));
+        assert!(!contains_tokens("a > b", "a > c"));
+        assert!(!contains_tokens("a >= b", "a > b"));
+        assert!(!contains_tokens("anything", "  "));
+        assert!(contains_tokens("s = \"caf\u{e9}\"", "\"caf\u{e9}\""));
+    }
 
     #[test]
     fn workers_are_bounded_by_cores_and_memory() {

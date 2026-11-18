@@ -22,6 +22,14 @@ pub struct FileChange {
     pub added: BTreeSet<u32>,
     /// 1-based lines in base that head removes or modifies.
     pub removed: BTreeSet<u32>,
+    pub hunks: Vec<Hunk>,
+}
+
+/// One hunk of a zero-context diff: the base lines it removes and the head lines it adds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hunk {
+    pub removed: Vec<u32>,
+    pub added: Vec<u32>,
 }
 
 impl FileChange {
@@ -31,6 +39,16 @@ impl FileChange {
             .as_deref()
             .or(self.old_path.as_deref())
             .expect("a change has a path")
+    }
+
+    /// The base lines replaced by the hunk that adds head `line`. Empty when the hunk only
+    /// adds lines or no hunk adds `line`.
+    pub fn replaced(&self, line: u32) -> &[u32] {
+        self.hunks
+            .iter()
+            .find(|h| h.added.contains(&line))
+            .map(|h| h.removed.as_slice())
+            .unwrap_or_default()
     }
 }
 
@@ -56,6 +74,7 @@ impl ChangeSet {
                     binary: false,
                     added: BTreeSet::new(),
                     removed: BTreeSet::new(),
+                    hunks: Vec::new(),
                 });
                 continue;
             }
@@ -86,8 +105,12 @@ impl ChangeSet {
                 change.binary = true;
             } else if let Some(hunk) = line.strip_prefix("@@ ") {
                 if let Some((old, new)) = parse_hunk(hunk) {
-                    change.removed.extend(old);
-                    change.added.extend(new);
+                    change.removed.extend(old.iter().copied());
+                    change.added.extend(new.iter().copied());
+                    change.hunks.push(Hunk {
+                        removed: old,
+                        added: new,
+                    });
                 }
             }
         }
@@ -242,6 +265,9 @@ index 1111111..2222222 100644
             file.removed.iter().copied().collect::<Vec<_>>(),
             vec![3, 20, 21]
         );
+        assert_eq!(file.replaced(4), &[3]);
+        assert_eq!(file.replaced(12), &[] as &[u32]);
+        assert_eq!(file.replaced(5), &[] as &[u32]);
     }
 
     #[test]
