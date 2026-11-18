@@ -219,3 +219,36 @@ fn runner_names_stay_unique_and_the_skill_runs_from_the_pinned_dir() {
         "{skill}"
     );
 }
+
+#[test]
+fn init_detects_a_cargo_workspace_once_at_its_root() {
+    let repo = Fixture::new();
+    repo.write(".gitignore", "target\n")
+        .write("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n")
+        .write(
+            "crates/calc/Cargo.toml",
+            "[package]\nname = \"calc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .write(
+            "crates/calc/src/lib.rs",
+            "pub fn one() -> i32 {\n    1\n}\n",
+        );
+    repo.commit_all("base");
+
+    let output = repo.titer(&["init", "--dry-run"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches("[[runner]]").count(), 1, "{stdout}");
+    assert!(stdout.contains("kind = \"cargo\""), "{stdout}");
+    assert!(
+        stdout.contains("command = [\"cargo\", \"test\"]"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("cwd ="), "{stdout}");
+}

@@ -20,6 +20,9 @@
 
 Check `exit-code.txt` and `report.json`. The report must match `schema/report.schema.json`.
 
+For a cargo runner, use `.agents/skills/verify-titer/scripts/check-rust.sh` (exit 0). It covers unit tests inside a source file, the base splice, a test set aside as `missing_symbol` because it does not compile on base, and the compile-error canary.
+
 ## Gotchas
 
 - `--only` limits the tiers, which changes the headline and the gate reasons.
+- A cargo check builds each worktree from cold. A real crate with dependencies takes a minute or more; mutant `duration_ms` counts the test binary only, not the rebuild.

@@ -1,5 +1,6 @@
 //! Runner adapters: select tests, run them through the repo's own command, and parse results.
 
+pub mod cargo;
 pub mod pytest;
 pub mod unittest;
 pub mod vitest;
@@ -24,7 +25,8 @@ pub struct TestCase {
     /// Enclosing classes or `describe` titles, outermost first.
     pub suite: Vec<String>,
     pub name: String,
-    /// The runner-native selector: a pytest node id, a unittest dotted id, or `file:line`.
+    /// The runner-native selector: a pytest node id, a unittest dotted id, `file:line`, or
+    /// `file::path::to::test` for cargo.
     pub id: String,
     /// Statically marked skipped, such as `it.skip`. vitest runs such a test when it is
     /// selected by line, so its result is skipped whatever the runner reports.
@@ -87,6 +89,15 @@ pub struct FileError {
     pub failure: Failure,
 }
 
+/// A compile error that kept the selected tests from building.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompileError {
+    /// The path as the compiler reported it, relative to the workspace root or absolute.
+    pub file: String,
+    pub line: u32,
+    pub message: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct TestRun {
     pub outcomes: Vec<TestOutcome>,
@@ -96,6 +107,9 @@ pub struct TestRun {
     pub max_rss_bytes: u64,
     /// Set when the runner itself failed, for example on a usage error, and gave no results.
     pub runner_error: Option<String>,
+    /// Compile errors that stopped the build. A run with compile errors executed nothing
+    /// they affect, so they are never a test failure.
+    pub compile_errors: Vec<CompileError>,
 }
 
 impl TestRun {
@@ -206,6 +220,7 @@ impl Runner {
             RunnerKind::Pytest => pytest::node_id(&rel, suite, name),
             RunnerKind::Unittest => unittest::test_id(&rel, &self.config.start_dir, suite, name),
             RunnerKind::Vitest => vitest::test_id(&rel, line),
+            RunnerKind::Cargo => cargo::test_id(&rel, suite, name),
         }
     }
 
@@ -215,6 +230,7 @@ impl Runner {
             RunnerKind::Pytest => pytest::run(self, req),
             RunnerKind::Unittest => unittest::run(self, req),
             RunnerKind::Vitest => vitest::run(self, req),
+            RunnerKind::Cargo => cargo::run(self, req),
         }
     }
 

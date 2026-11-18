@@ -131,6 +131,7 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
             duration: out.duration,
             max_rss_bytes: out.max_rss_bytes,
             runner_error,
+            compile_errors: Vec::new(),
         });
     }
 }
@@ -182,6 +183,7 @@ fn empty_run(out: &crate::process::RunOutput) -> TestRun {
         duration: out.duration,
         max_rss_bytes: out.max_rss_bytes,
         runner_error: None,
+        compile_errors: Vec::new(),
     }
 }
 

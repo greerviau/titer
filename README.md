@@ -11,7 +11,7 @@ titer is a CLI that coding agents and CI jobs call. It contains no model and nev
 
 titer gathers evidence. It cannot show that a change is correct: a test that fails on base detects a difference from base, and a reviewer still checks that the difference is the intended one.
 
-titer supports Python, TypeScript, TSX, and JavaScript, with pytest, unittest, and vitest. It runs on Linux and macOS.
+titer supports Python, TypeScript, TSX, JavaScript, and Rust, with pytest, unittest, vitest, and cargo test. It runs on Linux and macOS.
 
 ## Install
 

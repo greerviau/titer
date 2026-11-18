@@ -9,7 +9,7 @@ base = "origin/main"            # optional default for --base
 
 [[runner]]
 name = "api"                    # unique; defaults to the kind
-kind = "unittest"               # pytest, unittest, or vitest
+kind = "unittest"               # pytest, unittest, vitest, or cargo
 cwd = "services/api"            # repo-relative; globs and paths below are relative to it
 command = ["uv", "run", "--no-sync", "python", "-m", "unittest"]
 start_dir = "tests"             # unittest only: the dir dotted ids are relative to
@@ -55,7 +55,7 @@ Add one `[[runner]]` table per test project. A monorepo lists several.
 | Key | Default | Meaning |
 |---|---|---|
 | `name` | the kind | A unique name for the runner. |
-| `kind` | required | `pytest`, `unittest`, or `vitest`. |
+| `kind` | required | `pytest`, `unittest`, `vitest`, or `cargo`. |
 | `cwd` | `.` | The repo-relative directory the command runs in. Globs and paths in this table are relative to it. |
 | `command` | required | The repo's own command prefix. titer appends the runner's selection arguments. |
 | `start_dir` | none | unittest only: the top-level dir that dotted ids are relative to. |
@@ -71,8 +71,11 @@ Defaults per kind:
 | pytest | `**/test_*.py`, `**/*_test.py` | `**/conftest.py`, `tests/**`, `test/**` | `.venv`, `venv` |
 | unittest | `**/test*.py` | `**/conftest.py`, `tests/**`, `test/**` | `.venv`, `venv` |
 | vitest | `**/*.{test,spec}.{ts,tsx,mts,cts,js,jsx,mjs,cjs}` | `**/__tests__/**`, `**/__mocks__/**`, `**/__snapshots__/**`, `**/__fixtures__/**`, `**/test-utils/**`, `**/test-setup.*`, `**/setupTests.*`, `**/vitest.setup.*`, `test/**`, `tests/**` | `node_modules` |
+| cargo | `**/tests/**/*.rs`, `**/tests.rs` | `**/tests/**`, `**/testdata/**`, `**/snapshots/**` | none |
 
 Python commands should not sync the environment. Use `uv run --no-sync`, because worktrees share the checkout's `.venv`.
+
+A cargo runner's command is `cargo test` plus any flags the repo needs, such as `["cargo", "test", "--features", "postgres"]`. Put the runner's `cwd` at the workspace root. A cargo runner also finds the unit tests inside source files, so its `test_globs` cover only integration tests and `tests.rs` files. Each worktree builds into its own target dir, so titer ignores `CARGO_TARGET_DIR` unless `env` sets it.
 
 ## gate
 

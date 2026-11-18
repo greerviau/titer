@@ -45,7 +45,8 @@ pub fn glob_set(globs: &[String]) -> anyhow::Result<GlobSet> {
 fn runs_lang(kind: RunnerKind, lang: Lang) -> bool {
     match kind {
         RunnerKind::Pytest | RunnerKind::Unittest => lang.is_python(),
-        RunnerKind::Vitest => !lang.is_python(),
+        RunnerKind::Vitest => lang.is_ts(),
+        RunnerKind::Cargo => lang == Lang::Rust,
     }
 }
 
@@ -133,8 +134,12 @@ pub struct Detection {
     pub tests: Vec<TestCase>,
     /// Test and support files that changed and exist in head, with their runner.
     pub test_paths: Vec<(usize, String)>,
-    /// Test files (not support files) that changed and exist in head.
+    /// Test files (not support files) that changed and exist in head, and Rust source files
+    /// whose changed tests they hold.
     pub test_files: Vec<(usize, String)>,
+    /// Rust source files that changed and exist in head. They hold their own unit tests,
+    /// so prove splices head's test items into base's copy of each.
+    pub rust_sources: Vec<String>,
     pub sources: Vec<SourceFile>,
     pub functions: Vec<ChangedFunction>,
     /// Changed files titer does not analyze.
@@ -176,26 +181,8 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
                 detection.test_files.push((runner, path.clone()));
                 let source = read_head(session, &path)?;
                 let lang = Lang::of(&path).expect("test files have a language");
-                let r = &runners[runner];
-                for def in lang::find_tests(lang, &source, python_style(r.config.kind)) {
-                    if !change
-                        .added
-                        .iter()
-                        .any(|l| (def.line..=def.end_line).contains(l))
-                    {
-                        continue;
-                    }
-                    detection.tests.push(TestCase {
-                        runner: r.name().to_string(),
-                        file: path.clone(),
-                        line: def.report_line,
-                        end_line: def.end_line,
-                        id: r.test_id(&path, &def.suite, &def.name, def.report_line),
-                        suite: def.suite,
-                        name: def.name,
-                        skip: def.skip,
-                    });
-                }
+                let found = changed_tests(&runners[runner], &path, lang, &source, &change.added);
+                detection.tests.extend(found);
             }
             Role::Support { runner } => detection.test_paths.push((runner, path)),
             Role::Source { runner, lang } => {
@@ -203,9 +190,28 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
                     continue;
                 }
                 let source = read_head(session, &path)?;
-                let functions = lang::find_functions(lang, &source);
+                let mut changed = change.added.clone();
+                let mut test_lines = Vec::new();
+                if lang == Lang::Rust {
+                    detection.rust_sources.push(path.clone());
+                    let found =
+                        changed_tests(&runners[runner], &path, lang, &source, &change.added);
+                    if !found.is_empty() {
+                        detection.test_files.push((runner, path.clone()));
+                    }
+                    detection.tests.extend(found);
+                    // Test code is never a mutant's target and never makes a change touch
+                    // source.
+                    test_lines = lang::rust::test_lines(&source);
+                    changed.retain(|l| !test_lines.iter().any(|(s, e)| (*s..=*e).contains(l)));
+                }
+                if changed.is_empty() {
+                    continue;
+                }
+                let mut functions = lang::find_functions(lang, &source);
+                functions.retain(|f| !test_lines.iter().any(|(s, e)| (*s..=*e).contains(&f.line)));
                 let mut owners: BTreeSet<usize> = BTreeSet::new();
-                for line in &change.added {
+                for line in &changed {
                     owners.extend(lang::innermost_function(&functions, *line));
                 }
                 for i in owners {
@@ -219,13 +225,37 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
                     runner,
                     file: path,
                     lang,
-                    changed: change.added.clone(),
+                    changed,
                 });
             }
             Role::NotAnalyzed => detection.not_analyzed.push(path),
         }
     }
     Ok(detection)
+}
+
+/// The tests in `source` whose spans intersect a changed line.
+fn changed_tests(
+    runner: &Runner,
+    path: &str,
+    lang: Lang,
+    source: &str,
+    added: &BTreeSet<u32>,
+) -> Vec<TestCase> {
+    lang::find_tests(lang, source, python_style(runner.config.kind))
+        .into_iter()
+        .filter(|def| added.iter().any(|l| (def.line..=def.end_line).contains(l)))
+        .map(|def| TestCase {
+            runner: runner.name().to_string(),
+            file: path.to_string(),
+            line: def.report_line,
+            end_line: def.end_line,
+            id: runner.test_id(path, &def.suite, &def.name, def.report_line),
+            suite: def.suite,
+            name: def.name,
+            skip: def.skip,
+        })
+        .collect()
 }
 
 pub fn read_head(session: &Session, path: &str) -> anyhow::Result<String> {

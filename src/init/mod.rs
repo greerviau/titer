@@ -73,7 +73,7 @@ pub fn run(cwd: &Path, dry_run: bool, update: bool) -> anyhow::Result<Plan> {
         let runners = detect_runners(&root)?;
         if runners.is_empty() {
             bail!(
-                "found no pytest, unittest, or vitest project; write titer.toml by hand (see docs/configuration.md)"
+                "found no pytest, unittest, vitest, or cargo project; write titer.toml by hand (see docs/configuration.md)"
             );
         }
         let text = render_config(&runners);
@@ -185,10 +185,18 @@ pub fn stamp_warning(root: &Path) -> Option<String> {
 pub fn detect_runners(root: &Path) -> anyhow::Result<Vec<DetectedRunner>> {
     let mut dirs = Vec::new();
     collect_dirs(root, root, 0, &mut dirs);
-    let mut runners = Vec::new();
+    let mut runners: Vec<DetectedRunner> = Vec::new();
     for dir in dirs {
         let rel = rel_dir(root, &dir);
         if let Some(r) = detect_vitest(&dir, &rel) {
+            runners.push(r);
+        }
+        // One cargo runner covers a workspace and every package under it; dirs come
+        // parents first.
+        let in_cargo_runner = runners.iter().any(|r| {
+            r.kind == "cargo" && (r.cwd == "." || rel.starts_with(&format!("{}/", r.cwd)))
+        });
+        if !in_cargo_runner && let Some(r) = detect_cargo(&dir, &rel) {
             runners.push(r);
         }
         if let Some(r) = detect_python(&dir, &rel) {
@@ -282,6 +290,21 @@ fn detect_vitest(dir: &Path, rel: &str) -> Option<DetectedRunner> {
             "vitest".into(),
             "run".into(),
         ],
+        start_dir: None,
+    })
+}
+
+fn detect_cargo(dir: &Path, rel: &str) -> Option<DetectedRunner> {
+    let text = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+    let manifest: toml::Table = text.parse().ok()?;
+    if !manifest.contains_key("package") && !manifest.contains_key("workspace") {
+        return None;
+    }
+    Some(DetectedRunner {
+        name: "cargo".to_string(),
+        kind: "cargo",
+        cwd: rel.to_string(),
+        command: vec!["cargo".into(), "test".into()],
         start_dir: None,
     })
 }

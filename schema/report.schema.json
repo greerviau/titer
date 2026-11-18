@@ -308,7 +308,7 @@
           "$ref": "#/$defs/HeadStatus"
         },
         "id": {
-          "description": "The runner-native id: a pytest node id, a unittest dotted id, or `file:line` for vitest.",
+          "description": "The runner-native id: a pytest node id, a unittest dotted id, `file:line` for vitest, or `file::path::to::test` for cargo.",
           "type": "string"
         },
         "line": {
@@ -429,7 +429,7 @@
         },
         {
           "const": "missing_symbol",
-          "description": "Fails on base because a name exists only in head. Not proof.",
+          "description": "Fails on base because a name exists only in head, or does not compile against base. Not proof.",
           "type": "string"
         },
         {

@@ -180,12 +180,20 @@ const TS_FUNCTIONS: &[&str] = &[
     "class",
 ];
 
+const RS_FUNCTIONS: &[&str] = &[
+    "function_item",
+    "closure_expression",
+    "impl_item",
+    "trait_item",
+    "mod_item",
+];
+
 fn decisions(lang: Lang, node: Node, source: &str, top: bool) -> u32 {
     let kind = node.kind();
-    let nested = if lang.is_python() {
-        PY_FUNCTIONS
-    } else {
-        TS_FUNCTIONS
+    let nested = match lang {
+        Lang::Python => PY_FUNCTIONS,
+        Lang::TypeScript | Lang::Tsx => TS_FUNCTIONS,
+        Lang::Rust => RS_FUNCTIONS,
     };
     // The decorated definition wraps the function itself; only deeper functions are nested.
     let wrapped = node
@@ -194,7 +202,16 @@ fn decisions(lang: Lang, node: Node, source: &str, top: bool) -> u32 {
     if !top && (kind == "decorated_definition" || (nested.contains(&kind) && !wrapped)) {
         return 0;
     }
-    let own = if lang.is_python() {
+    let own = if lang == Lang::Rust {
+        match kind {
+            "if_expression" | "for_expression" | "while_expression" | "match_arm" => 1,
+            "binary_expression" => node
+                .child_by_field_name("operator")
+                .is_some_and(|op| matches!(&source[op.byte_range()], "&&" | "||"))
+                as u32,
+            _ => 0,
+        }
+    } else if lang.is_python() {
         matches!(
             kind,
             "if_statement"
@@ -314,6 +331,29 @@ mod tests {
         let functions = find_functions(Lang::TypeScript, ts);
         // case, case, ??, &&, ternary: 5, plus 1.
         assert_eq!(complexity(Lang::TypeScript, ts, &functions[0]), 6);
+    }
+
+    #[test]
+    fn rust_complexity_counts_branches_arms_and_logical_operators() {
+        let rs = r#"fn f(x: i32, xs: &[i32]) -> i32 {
+    if x > 0 && x < 10 {
+        for y in xs {
+            match y {
+                0 => {}
+                1 => {}
+                _ => {}
+            }
+        }
+    } else if let Some(z) = xs.first() {
+        let _ = z;
+    }
+    let g = |z: i32| if z > 0 { 1 } else { 2 };
+    while x > 0 || x < -1 {}
+    g(x)
+}
+"#;
+        let functions = find_functions(Lang::Rust, rs);
+        assert_eq!(complexity(Lang::Rust, rs, &functions[0]), 10);
     }
 
     #[test]

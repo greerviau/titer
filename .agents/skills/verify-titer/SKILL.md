@@ -36,7 +36,15 @@ The two versions match. `.fixture-deps/venv/bin/python -m pytest --version` prin
 .agents/skills/verify-titer/scripts/check.sh unproven --only prove
 ```
 
-It prints the evidence directory. For a scenario the two modes do not cover, build a repo by hand the way `scripts/action-fixture.sh` does: `git init -b main`, write `titer.toml`, commit a base, change files on a branch, then run `target/debug/titer check --json --markdown FILE`.
+It prints the evidence directory.
+
+`scripts/check-rust.sh [titer check args...]` builds a cargo fixture whose change fixes one function and adds another, with tests for both in one `mod tests`. It runs `titer init --dry-run` before the opt-in and `titer check` after, and also records whether the checkout's status changed and what titer left in `$TITER_TMPDIR`. Expect exit 0, an `assertion` and a `missing_symbol` verdict, and one `>=` survivor.
+
+```sh
+.agents/skills/verify-titer/scripts/check-rust.sh
+```
+
+For a scenario the two modes do not cover, build a repo by hand the way `scripts/action-fixture.sh` does: `git init -b main`, write `titer.toml`, commit a base, change files on a branch, then run `target/debug/titer check --json --markdown FILE`.
 
 A real repo also works, such as a clone of a project that already has `titer.toml`. Clone it outside this checkout and run `target/debug/titer check --base <base sha> --json --markdown FILE` from its root. titer never modifies the checkout it runs in.
 
@@ -48,6 +56,7 @@ A real repo also works, such as a clone of a project that already has `titer.tom
 - `summary.md`: the `--markdown` summary, the same text the Action posts as a PR comment.
 - `annotations.txt`: the `--annotations` workflow commands, which the Action prints so GitHub shows them on the diff.
 - `stderr.txt` and `exit-code.txt`.
+- `check-rust.sh` only: `init-dry-run.txt`, `checkout-status.txt` (`unchanged` when the checkout's status did not change), and `leftover-tmp.txt` (empty when titer cleaned up).
 
 ## Cleanup
 

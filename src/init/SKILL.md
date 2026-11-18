@@ -21,7 +21,7 @@ titer compares the working tree, including untracked files, with the merge-base 
 
 - 0: the gate passes.
 - 1: the gate fails. By default this means the change is unproven: no changed test fails on base, and the changed tests kill no mutant of the changed lines.
-- 2: the check could not run. Read `gate.reasons`. Common causes are a changed test that fails on head (fix it first), a config error, or a canary that survived (the test run loads code from outside the worktree, for example through an editable install).
+- 2: the check could not run. Read `gate.reasons`. Common causes are a changed test that fails on head (fix it first), a config error, or a canary that survived (the test run loads code from outside the worktree, for example through an editable install or a Cargo path dependency outside the repo).
 
 ## Read the report
 

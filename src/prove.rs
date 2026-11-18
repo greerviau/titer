@@ -6,12 +6,14 @@ use std::time::Duration;
 
 use regex::Regex;
 
+use crate::config::RunnerKind;
 use crate::detect::{Detection, read_head};
 use crate::imports::{self, Trees};
-use crate::lang::{self, Lang};
+use crate::lang::{self, Lang, PythonStyle};
 use crate::report::{HeadStatus, TestResult, Verdict};
 use crate::runner::{
-    CaseResult, Failure, FailureKind, RunRequest, Runner, Selection, TestCase, TestRun,
+    CaseResult, CompileError, Failure, FailureKind, RunRequest, Runner, Selection, TestCase,
+    TestRun, same_file,
 };
 use crate::session::Session;
 use crate::worktree::Worktree;
@@ -142,19 +144,20 @@ pub fn prove(
             read_base: &read_base,
             aliases: &aliases,
         };
-        let statics = static_verdicts(session, runner, head, &trees)?;
+        let mut statics = static_verdicts(session, runner, head, &trees)?;
         let green = head.green();
         let base_run = if green.is_empty() {
             None
         } else {
-            let timeout = head.run.duration * 3 + Duration::from_secs(10);
-            Some(runner.run(&RunRequest {
-                worktree: &base.path,
-                selection: Selection::Tests(&green),
-                fail_fast: false,
-                timeout: Some(timeout),
-                scratch: &session.run_dir.join("logs"),
-            })?)
+            Some(run_base(
+                session,
+                runner,
+                detection,
+                head,
+                green,
+                base,
+                &mut statics,
+            )?)
         };
         for (i, case) in head.cases.iter().enumerate() {
             let status = head.status(i);
@@ -199,6 +202,177 @@ pub fn prove(
         }
     }
     Ok(results)
+}
+
+/// Runs the head-green changed tests on base. A Rust test that does not compile against
+/// base stops its whole target from building, so each round sets aside the tests that the
+/// compile errors fall in as missing symbols, and builds again without them.
+fn run_base(
+    session: &Session,
+    runner: &Runner,
+    detection: &Detection,
+    head: &HeadRun,
+    mut selected: Vec<TestCase>,
+    base: &Worktree,
+    statics: &mut [Option<String>],
+) -> anyhow::Result<TestRun> {
+    let timeout = head.run.duration * 3 + Duration::from_secs(10);
+    let mut set_aside: Vec<TestCase> = Vec::new();
+    loop {
+        let run = runner.run(&RunRequest {
+            worktree: &base.path,
+            selection: Selection::Tests(&selected),
+            fail_fast: false,
+            timeout: Some(timeout),
+            scratch: &session.run_dir.join("logs"),
+        })?;
+        if runner.config.kind != RunnerKind::Cargo || run.compile_errors.is_empty() {
+            return Ok(run);
+        }
+        let blamed = blame(&run.compile_errors, &selected, base, session)?;
+        if blamed.is_empty() {
+            return Ok(run);
+        }
+        for (case, message) in &blamed {
+            if let Some(i) = head.cases.iter().position(|c| c == case) {
+                statics[i] = Some(message.clone());
+            }
+            set_aside.push(case.clone());
+        }
+        selected.retain(|c| !set_aside.contains(c));
+        let mut files: Vec<&str> = blamed.iter().map(|(c, _)| c.file.as_str()).collect();
+        files.sort();
+        files.dedup();
+        for file in files {
+            let head_text = read_head(session, file)?;
+            let without = remove_tests(&head_text, file, &set_aside);
+            write_base_copy(session, detection, base, file, &without)?;
+        }
+        if selected.is_empty() {
+            return Ok(run);
+        }
+    }
+}
+
+/// The selected tests that compile errors fall in, each with its first error. An error
+/// inside a test blames that test. An error outside every test, such as in a `use`, blames
+/// the tests in its file that name what it reports missing.
+fn blame(
+    errors: &[CompileError],
+    selected: &[TestCase],
+    base: &Worktree,
+    session: &Session,
+) -> anyhow::Result<Vec<(TestCase, String)>> {
+    let mut out: Vec<(TestCase, String)> = Vec::new();
+    let mut files: Vec<&str> = selected.iter().map(|c| c.file.as_str()).collect();
+    files.sort();
+    files.dedup();
+    for file in files {
+        let errors: Vec<&CompileError> =
+            errors.iter().filter(|e| same_file(&e.file, file)).collect();
+        if errors.is_empty() {
+            continue;
+        }
+        let compiled = std::fs::read_to_string(base.path.join(file)).unwrap_or_default();
+        let defs = lang::find_tests(Lang::Rust, &compiled, PythonStyle::Pytest);
+        let head_text = read_head(session, file)?;
+        let head_defs = lang::find_tests(Lang::Rust, &head_text, PythonStyle::Pytest);
+        for case in selected.iter().filter(|c| c.file == file) {
+            let inside = errors.iter().find(|e| {
+                defs.iter().any(|d| {
+                    (d.line..=d.end_line).contains(&e.line)
+                        && d.name == case.name
+                        && d.suite == case.suite
+                })
+            });
+            let named = || {
+                let text = head_defs
+                    .iter()
+                    .find(|d| d.report_line == case.line)
+                    .map_or("", |d| &head_text[d.start_byte..d.end_byte]);
+                errors.iter().find(|e| {
+                    let outside = !defs.iter().any(|d| (d.line..=d.end_line).contains(&e.line));
+                    outside && missing_name(&e.message).is_some_and(|n| mentions(text, &n))
+                })
+            };
+            if let Some(error) = inside.or_else(named) {
+                out.push((case.clone(), error.message.clone()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+static BACKTICKED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`]+)`").unwrap());
+
+/// The name a compile error reports missing: the last path segment of its first quoted
+/// name, `mul` for "unresolved import `demo::mul`".
+fn missing_name(message: &str) -> Option<String> {
+    let quoted = BACKTICKED.captures(message)?.get(1)?.as_str();
+    let last = quoted.rsplit("::").next().unwrap_or(quoted);
+    let name: String = last
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+fn mentions(text: &str, name: &str) -> bool {
+    Regex::new(&format!(r"\b{}\b", regex::escape(name))).is_ok_and(|re| re.is_match(text))
+}
+
+/// `source` without the tests in `cases` that belong to `file`.
+fn remove_tests(source: &str, file: &str, cases: &[TestCase]) -> String {
+    let mut spans: Vec<(usize, usize)> = lang::find_tests(Lang::Rust, source, PythonStyle::Pytest)
+        .into_iter()
+        .filter(|d| {
+            cases
+                .iter()
+                .any(|c| c.file == file && c.name == d.name && c.suite == d.suite)
+        })
+        .map(|d| (d.start_byte, d.end_byte))
+        .collect();
+    spans.sort();
+    let mut out = source.to_string();
+    for (start, end) in spans.into_iter().rev() {
+        out.replace_range(start..end, "");
+    }
+    out
+}
+
+/// Writes head's tests for `file` into the base worktree: the whole file for a test path,
+/// or base's source with head's test items spliced in for a Rust source file.
+fn write_base_copy(
+    session: &Session,
+    detection: &Detection,
+    base: &Worktree,
+    file: &str,
+    head_text: &str,
+) -> anyhow::Result<()> {
+    if !detection.rust_sources.iter().any(|f| f == file) {
+        return base.write(file, head_text.as_bytes());
+    }
+    let Some(original) = session.git.read_blob(&session.base_sha, file)? else {
+        return Ok(());
+    };
+    let original = String::from_utf8_lossy(&original);
+    let spliced =
+        lang::rust::splice_tests(&original, head_text).unwrap_or_else(|| original.to_string());
+    base.write(file, spliced.as_bytes())
+}
+
+/// Splices head's test items into base's copy of each changed Rust source file. Base's
+/// source code stays, so the tests run against it.
+pub fn splice_rust_sources(
+    session: &Session,
+    detection: &Detection,
+    base: &Worktree,
+) -> anyhow::Result<()> {
+    for file in &detection.rust_sources {
+        let head_text = read_head(session, file)?;
+        write_base_copy(session, detection, base, file, &head_text)?;
+    }
+    Ok(())
 }
 
 /// The static import check's message for each changed test, when it imports a name that

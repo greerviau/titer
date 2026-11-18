@@ -31,6 +31,7 @@ pub enum RunnerKind {
     Pytest,
     Unittest,
     Vitest,
+    Cargo,
 }
 
 impl RunnerKind {
@@ -39,6 +40,7 @@ impl RunnerKind {
             RunnerKind::Pytest => "pytest",
             RunnerKind::Unittest => "unittest",
             RunnerKind::Vitest => "vitest",
+            RunnerKind::Cargo => "cargo",
         }
     }
 
@@ -47,6 +49,9 @@ impl RunnerKind {
             RunnerKind::Pytest => &["**/test_*.py", "**/*_test.py"],
             RunnerKind::Unittest => &["**/test*.py"],
             RunnerKind::Vitest => &["**/*.{test,spec}.{ts,tsx,mts,cts,js,jsx,mjs,cjs}"],
+            // Integration tests, and unit tests split out of a source file into `tests.rs`.
+            // Unit tests inside source files are found by their attributes instead.
+            RunnerKind::Cargo => &["**/tests/**/*.rs", "**/tests.rs"],
         };
         globs.iter().map(|g| g.to_string()).collect()
     }
@@ -66,6 +71,7 @@ impl RunnerKind {
                 "test/**",
                 "tests/**",
             ],
+            RunnerKind::Cargo => &["**/tests/**", "**/testdata/**", "**/snapshots/**"],
         };
         globs.iter().map(|g| g.to_string()).collect()
     }
@@ -74,6 +80,9 @@ impl RunnerKind {
         let deps: &[&str] = match self {
             RunnerKind::Pytest | RunnerKind::Unittest => &[".venv", "venv"],
             RunnerKind::Vitest => &["node_modules"],
+            // A shared target dir would let one worktree's build overwrite another's
+            // binaries, so each worktree builds its own.
+            RunnerKind::Cargo => &[],
         };
         deps.iter().map(|d| d.to_string()).collect()
     }
@@ -108,7 +117,8 @@ pub struct RunnerConfig {
     pub kind: RunnerKind,
     /// Repo-relative directory the command runs in. Globs and paths below are relative to it.
     pub cwd: String,
-    /// The repo's own command prefix, for example `["uv", "run", "--no-sync", "python", "-m", "pytest"]`.
+    /// The repo's own command prefix, for example `["uv", "run", "--no-sync", "python", "-m", "pytest"]`
+    /// or `["cargo", "test"]`.
     pub command: Vec<String>,
     /// Files that contain tests.
     pub test_globs: Vec<String>,
@@ -371,6 +381,22 @@ mod tests {
         assert_eq!(config.mutate.budget, Duration::from_secs(90));
         assert_eq!(config.mutate.exclude_operators, vec![Operator::RemoveCall]);
         assert_eq!(config.crap.threshold, 30.0);
+    }
+
+    #[test]
+    fn cargo_runners_default_to_rust_test_paths_and_no_deps() {
+        let config =
+            Config::parse("[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\"]\n")
+                .unwrap();
+        let cargo = &config.runners[0];
+        assert_eq!(cargo.name, "cargo");
+        assert_eq!(cargo.kind, RunnerKind::Cargo);
+        assert_eq!(cargo.test_globs, vec!["**/tests/**/*.rs", "**/tests.rs"]);
+        assert_eq!(
+            cargo.support_globs,
+            vec!["**/tests/**", "**/testdata/**", "**/snapshots/**"]
+        );
+        assert!(cargo.deps.is_empty());
     }
 
     #[test]

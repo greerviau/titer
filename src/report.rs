@@ -171,7 +171,7 @@ pub enum Verdict {
     Assertion,
     /// Raises another exception from the code under test on base. Proof.
     Exception,
-    /// Fails on base because a name exists only in head. Not proof.
+    /// Fails on base because a name exists only in head, or does not compile against base. Not proof.
     MissingSymbol,
     /// Green on base. Informational.
     PassesOnBase,
@@ -192,7 +192,7 @@ impl Verdict {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TestResult {
-    /// The runner-native id: a pytest node id, a unittest dotted id, or `file:line` for vitest.
+    /// The runner-native id: a pytest node id, a unittest dotted id, `file:line` for vitest, or `file::path::to::test` for cargo.
     pub id: String,
     pub runner: String,
     /// Repo-relative path.
