@@ -97,7 +97,15 @@ pub fn run(cwd: &Path, options: &CheckOptions) -> anyhow::Result<Report> {
         }
         if ctx.wants(Tier::Mutate) {
             let tier_started = Instant::now();
-            match mutate::run(&ctx, &heads, head, Vec::new()) {
+            let agent = match &ctx.options.mutants {
+                Some(path) => mutate::agent::load(&ctx, path)?,
+                None => mutate::agent::Loaded {
+                    mutants: Vec::new(),
+                    warnings: Vec::new(),
+                },
+            };
+            report.warnings.extend(agent.warnings);
+            match mutate::run(&ctx, &heads, head, agent.mutants) {
                 Ok(mutation) => {
                     report.mutants = mutation.mutants;
                     report.warnings.extend(mutation.warnings);

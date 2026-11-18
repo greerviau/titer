@@ -244,3 +244,79 @@ fn survivors_split_into_not_executed_and_caught_by_other_tests() {
         "{caught:#}"
     );
 }
+
+#[test]
+fn agent_mutants_run_like_generated_ones_and_are_tagged() {
+    let repo = repo("120s");
+    repo.write("app.py", CLAMP_HEAD)
+        .write("test_app.py", CLAMP_TEST);
+    let mutants = repo.scratch().join("mutants.jsonl");
+    std::fs::write(
+        &mutants,
+        concat!(
+            "{\"file\": \"app.py\", \"line\": 3, \"replacement\": \"        return x\", \"id\": \"keep-x\"}\n",
+            "{\"file\": \"app.py\", \"line\": 2, \"end_line\": 3, \"replacement\": \"    if x >= hi:\\n        return hi\"}\n",
+            "{\"file\": \"README.md\", \"line\": 1, \"replacement\": \"x\"}\n",
+        ),
+    )
+    .unwrap();
+
+    let output = repo.titer(&[
+        "check",
+        "--json",
+        "--only",
+        "mutate",
+        "--mutants",
+        mutants.to_str().unwrap(),
+    ]);
+
+    let report = stdout_json(&output);
+    assert_schema_valid(&report);
+    assert_eq!(output.status.code(), Some(0), "{report:#}");
+    let agent: Vec<(String, String, String)> = report["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["source"] == "agent")
+        .map(|m| {
+            (
+                m["id"].as_str().unwrap().to_string(),
+                m["operator"].as_str().unwrap().to_string(),
+                m["outcome"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        agent,
+        vec![
+            ("keep-x".into(), "agent".into(), "killed".into()),
+            ("app.py:2:agent:2".into(), "agent".into(), "survived".into()),
+        ]
+    );
+    let warnings = report["warnings"].to_string();
+    assert!(
+        warnings.contains("README.md is not a source file"),
+        "{warnings}"
+    );
+}
+
+#[test]
+fn a_malformed_mutants_file_exits_2() {
+    let repo = repo("120s");
+    repo.write("app.py", CLAMP_HEAD)
+        .write("test_app.py", CLAMP_TEST);
+    let mutants = repo.scratch().join("mutants.jsonl");
+    std::fs::write(&mutants, "{not json}\n").unwrap();
+
+    let output = repo.titer(&[
+        "check",
+        "--json",
+        "--only",
+        "mutate",
+        "--mutants",
+        mutants.to_str().unwrap(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--mutants"));
+}
