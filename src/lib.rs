@@ -14,6 +14,7 @@ pub mod process;
 pub mod prove;
 pub mod report;
 pub mod runner;
+pub mod scan;
 pub mod session;
 pub mod tmp;
 pub mod worktree;

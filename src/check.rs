@@ -10,6 +10,7 @@ use crate::process;
 use crate::prove::{self, HeadRun};
 use crate::report::{Gate, Report, Tier};
 use crate::runner::Runner;
+use crate::scan;
 use crate::session::Session;
 use crate::worktree::Worktree;
 
@@ -72,6 +73,11 @@ pub fn run(cwd: &Path, options: &CheckOptions) -> anyhow::Result<Report> {
     report.tiers = options.tiers.clone();
     report.not_analyzed = ctx.detection.not_analyzed.clone();
 
+    if ctx.wants(Tier::Scan) {
+        let tier_started = Instant::now();
+        report.findings = scan::scan(&ctx.session, &ctx.runners)?;
+        report.timing.scan_ms = Some(elapsed_ms(tier_started));
+    }
     if ctx.wants(Tier::Prove) || ctx.wants(Tier::Mutate) {
         let Some((heads, head)) = head_tier(&ctx, &mut report)? else {
             report.timing.total_ms = elapsed_ms(started);

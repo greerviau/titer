@@ -99,6 +99,8 @@ fn walk_tests(
                         end_line: end_line_of(outer),
                         report_line: line_of(def),
                         skip: false,
+                        start_byte: outer.start_byte(),
+                        end_byte: outer.end_byte(),
                     });
                 }
             }
