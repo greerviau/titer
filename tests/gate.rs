@@ -153,7 +153,7 @@ fn markdown_writes_a_job_summary() {
     let text = std::fs::read_to_string(&summary).unwrap();
     assert!(text.contains("### titer: passed\n"), "{text}");
     assert!(
-        text.contains("| fails (assertion) | test\\_high | test\\_new.py:4 | `assert 5 == 3 + where 5 = clamp(5, 3)` |"),
+        text.contains("| fails (assertion) | test\\_high | test\\_new.py:4 | `assert 5 == 3 +  where 5 = clamp(5, 3)` |"),
         "{text}"
     );
 }

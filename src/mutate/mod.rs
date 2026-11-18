@@ -20,7 +20,7 @@ use crate::runner::{CaseResult, RunRequest, Runner, Selection, Status, TestCase,
 use crate::session::Session;
 use crate::worktree::Worktree;
 
-use operators::{CallFilter, Candidate};
+use operators::{CallFilter, Candidate, CodeNode};
 
 /// What each runner's mutants run: the head-green changed tests, or the whole suite when the
 /// change has no changed tests for that runner.
@@ -154,7 +154,7 @@ pub fn generate(ctx: &Context) -> anyhow::Result<Vec<(Mutant, Job)>> {
             continue;
         }
         let text = detect::read_head(&ctx.session, &source.file)?;
-        let base = BaseHunks::load(&ctx.session, &source.file)?;
+        let base = BaseHunks::load(&ctx.session, &source.file, source.lang)?;
         for cand in operators::generate(
             source.lang,
             &text,
@@ -169,7 +169,7 @@ pub fn generate(ctx: &Context) -> anyhow::Result<Vec<(Mutant, Job)>> {
                 &cand,
                 MutantSource::Generated,
             );
-            mutant.unchanged_from_base = base.contains(cand.line, &text[cand.context.clone()]);
+            mutant.unchanged_from_base = base.contains(cand.line, &cand.context);
             all.push((
                 mutant,
                 Job {
@@ -208,75 +208,60 @@ pub fn mutant_from(runner: &Runner, file: &str, cand: &Candidate, source: Mutant
     }
 }
 
-/// The base text that each hunk of one source file replaces.
+/// The base side of one source file's hunks, for telling whether a mutant's code is new.
 pub struct BaseHunks {
     change: Option<FileChange>,
-    base: Vec<String>,
+    base: String,
+    tree: Option<tree_sitter::Tree>,
 }
 
 impl BaseHunks {
-    pub fn load(session: &Session, file: &str) -> anyhow::Result<BaseHunks> {
+    pub fn load(session: &Session, file: &str, lang: Lang) -> anyhow::Result<BaseHunks> {
         let change = session.changes.get(file).cloned();
         let base = match change.as_ref().and_then(|c| c.old_path.as_deref()) {
             Some(old) => session
                 .git
                 .read_blob(&session.base_sha, old)?
-                .map(|b| {
-                    String::from_utf8_lossy(&b)
-                        .lines()
-                        .map(str::to_string)
-                        .collect()
-                })
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
                 .unwrap_or_default(),
-            None => Vec::new(),
+            None => String::new(),
         };
-        Ok(BaseHunks { change, base })
+        Ok(BaseHunks::new(change, lang, base))
     }
 
-    /// Whether `code`, which starts on head `line`, also appears in the base lines that the
-    /// line's hunk replaces. That suggests the change moved or reformatted it.
-    pub fn contains(&self, line: u32, code: &str) -> bool {
-        let Some(change) = &self.change else {
+    pub fn new(change: Option<FileChange>, lang: Lang, base: String) -> BaseHunks {
+        let tree = lang.parse(&base);
+        BaseHunks { change, base, tree }
+    }
+
+    /// Whether a node in the base lines that the hunk of head `line` replaces has the same
+    /// kind, parent kind, and tokens as `context`. Then the change only moved or reformatted
+    /// that code.
+    pub fn contains(&self, line: u32, context: &CodeNode) -> bool {
+        let (Some(change), Some(tree)) = (&self.change, &self.tree) else {
             return false;
         };
-        let replaced: Vec<&str> = change
-            .replaced(line)
-            .iter()
-            .filter_map(|n| self.base.get(*n as usize - 1).map(String::as_str))
-            .collect();
-        contains_tokens(&replaced.join("\n"), code)
-    }
-}
-
-/// Whether `needle`'s tokens appear contiguously in `haystack`'s, ignoring whitespace. Tokens
-/// are runs of word characters and single other characters, so `if x` does not match
-/// `if x_old` and a line split across several matches the one-line original.
-pub fn contains_tokens(haystack: &str, needle: &str) -> bool {
-    let needle = tokens(needle);
-    !needle.is_empty() && tokens(haystack).windows(needle.len()).any(|w| w == needle)
-}
-
-fn tokens(text: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut word: Option<usize> = None;
-    for (i, c) in text.char_indices() {
-        let is_word = c.is_alphanumeric() || c == '_';
-        if let Some(start) = word
-            && !is_word
-        {
-            out.push(&text[start..i]);
-            word = None;
+        let replaced = change.replaced(line);
+        let (Some(&first), Some(&last)) = (replaced.first(), replaced.last()) else {
+            return false;
+        };
+        let mut found = false;
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            let start = node.start_position().row as u32 + 1;
+            let end = node.end_position().row as u32 + 1;
+            if end < first || start > last {
+                continue;
+            }
+            if start >= first && end <= last && CodeNode::of(node, &self.base) == *context {
+                found = true;
+                break;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
         }
-        if is_word {
-            word.get_or_insert(i);
-        } else if !c.is_whitespace() {
-            out.push(&text[i..i + c.len_utf8()]);
-        }
+        found
     }
-    if let Some(start) = word {
-        out.push(&text[start..]);
-    }
-    out
 }
 
 /// Mutation workers: the smaller of cores minus 1 and 70% of available memory over the
@@ -804,17 +789,87 @@ fn follow_up(
 mod tests {
     use super::*;
 
+    fn matches(base: &str, head: &str, lang: Lang) -> Vec<(u32, String, bool)> {
+        let patch = format!(
+            "diff --git a/f b/f\n--- a/f\n+++ b/f\n{}",
+            hunks(base, head)
+        );
+        let change = crate::diff::ChangeSet::parse(&patch).files.pop();
+        let changed = change.as_ref().unwrap().added.clone();
+        let hunks = BaseHunks::new(change, lang, base.to_string());
+        operators::generate(lang, head, &changed, &CallFilter::default(), &[])
+            .into_iter()
+            .map(|c| {
+                (
+                    c.line,
+                    c.original.clone(),
+                    hunks.contains(c.line, &c.context),
+                )
+            })
+            .collect()
+    }
+
+    /// One hunk that replaces every base line with every head line: enough for these tests.
+    fn hunks(base: &str, head: &str) -> String {
+        let (b, h) = (base.lines().count(), head.lines().count());
+        let mut out = format!("@@ -1,{b} +1,{h} @@\n");
+        for l in base.lines() {
+            out.push_str(&format!("-{l}\n"));
+        }
+        for l in head.lines() {
+            out.push_str(&format!("+{l}\n"));
+        }
+        out
+    }
+
     #[test]
-    fn code_matches_base_by_tokens_not_whitespace() {
-        let base = "  if (!aligned) return <p className={LARGE}>{card.target_language}</p>;";
-        assert!(contains_tokens(base, "className={LARGE}"));
-        assert!(contains_tokens(base, "if (!aligned)"));
-        assert!(contains_tokens("if x > hi: return hi", "x >\n  hi"));
-        assert!(!contains_tokens("if x_old:", "if x"));
-        assert!(!contains_tokens("a > b", "a > c"));
-        assert!(!contains_tokens("a >= b", "a > b"));
-        assert!(!contains_tokens("anything", "  "));
-        assert!(contains_tokens("s = \"caf\u{e9}\"", "\"caf\u{e9}\""));
+    fn code_the_change_only_reformats_matches_base() {
+        let base = "const a = <p className={LARGE}>{t}</p>;\n";
+        let head = "const a = (\n  <p lang={lang} className={LARGE}>\n    {t}\n  </p>\n);\n";
+        assert_eq!(
+            matches(base, head, Lang::Tsx),
+            vec![
+                (2, "lang={lang}".into(), false),
+                (2, "className={LARGE}".into(), true)
+            ]
+        );
+        let base = "def f(x, hi):\n    if x > hi: return hi\n";
+        let head = "def f(x, hi):\n    if x > hi:\n        return hi\n";
+        assert!(
+            matches(base, head, Lang::Python).iter().all(|m| m.2),
+            "{:?}",
+            matches(base, head, Lang::Python)
+        );
+    }
+
+    #[test]
+    fn comments_larger_expressions_and_literals_do_not_match() {
+        let cases = [
+            (
+                "def f(x):\n    # return x > 2\n    pass\n",
+                "def f(x):\n    return x > 2\n",
+            ),
+            (
+                "def f(x):\n    return x > 2 + 3\n",
+                "def f(x):\n    return x > 2\n",
+            ),
+            (
+                "def f(x):\n    return x > 'a b'\n",
+                "def f(x):\n    return x > 'a  b'\n",
+            ),
+            (
+                "def f(x, y):\n    if y and x:\n        pass\n",
+                "def f(x, y):\n    if x:\n        pass\n",
+            ),
+        ];
+        for (base, head) in cases {
+            let got = matches(base, head, Lang::Python);
+            assert!(!got.is_empty(), "{head}");
+            assert!(
+                got.iter().filter(|m| m.0 > 1).all(|m| !m.2),
+                "{head}: {got:?}"
+            );
+        }
     }
 
     #[test]

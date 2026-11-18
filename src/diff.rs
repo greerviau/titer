@@ -63,8 +63,12 @@ impl ChangeSet {
     pub fn parse(patch: &str) -> ChangeSet {
         let mut files = Vec::new();
         let mut current: Option<FileChange> = None;
+        // After a file's first hunk, every line but a hunk header is content, even one such
+        // as `--- n;` that removes the line `-- n;`.
+        let mut in_hunks = false;
         for line in patch.lines() {
             if let Some(rest) = line.strip_prefix("diff --git ") {
+                in_hunks = false;
                 files.extend(current.take());
                 let (old, new) = split_diff_header(rest);
                 current = Some(FileChange {
@@ -81,6 +85,9 @@ impl ChangeSet {
             let Some(change) = current.as_mut() else {
                 continue;
             };
+            if in_hunks && !line.starts_with("@@ ") {
+                continue;
+            }
             if line.starts_with("new file mode") {
                 change.status = FileStatus::Added;
                 change.old_path = None;
@@ -104,6 +111,7 @@ impl ChangeSet {
             } else if line.starts_with("Binary files ") {
                 change.binary = true;
             } else if let Some(hunk) = line.strip_prefix("@@ ") {
+                in_hunks = true;
                 if let Some((old, new)) = parse_hunk(hunk) {
                     change.removed.extend(old.iter().copied());
                     change.added.extend(new.iter().copied());
@@ -268,6 +276,22 @@ index 1111111..2222222 100644
         assert_eq!(file.replaced(4), &[3]);
         assert_eq!(file.replaced(12), &[] as &[u32]);
         assert_eq!(file.replaced(5), &[] as &[u32]);
+    }
+
+    #[test]
+    fn hunk_lines_that_look_like_file_headers_are_content() {
+        let patch = "\
+diff --git a/a.ts b/a.ts
+--- a/a.ts
++++ b/a.ts
+@@ -2 +2 @@
+--- n;
++++ n;
+";
+        let file = &ChangeSet::parse(patch).files[0];
+        assert_eq!(file.old_path.as_deref(), Some("a.ts"));
+        assert_eq!(file.new_path.as_deref(), Some("a.ts"));
+        assert_eq!(file.replaced(2), &[2]);
     }
 
     #[test]

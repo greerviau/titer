@@ -20,7 +20,42 @@ pub struct Candidate {
     pub replacement: String,
     /// The code the edit's meaning depends on, such as the whole comparison for an operator
     /// swap. A mutant whose context is unchanged from base may predate the change.
-    pub context: std::ops::Range<usize>,
+    pub context: CodeNode,
+}
+
+/// A syntax node, in a form that can be compared with nodes of the base file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeNode {
+    pub kind: String,
+    pub parent: Option<String>,
+    /// The texts of the node's leaf tokens. Whitespace between tokens is formatting and is
+    /// left out; whitespace inside a token, such as a string literal, is kept.
+    pub leaves: Vec<String>,
+}
+
+impl CodeNode {
+    pub fn of(node: Node, source: &str) -> CodeNode {
+        CodeNode {
+            kind: node.kind().to_string(),
+            parent: node.parent().map(|p| p.kind().to_string()),
+            leaves: leaves(node, source),
+        }
+    }
+}
+
+fn leaves(node: Node, source: &str) -> Vec<String> {
+    if node.child_count() == 0 {
+        let t = text(node, source);
+        return if t.is_empty() {
+            Vec::new()
+        } else {
+            vec![t.to_string()]
+        };
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .flat_map(|c| leaves(c, source))
+        .collect()
 }
 
 impl Candidate {
@@ -141,7 +176,7 @@ impl Gen<'_> {
             end_byte: node.end_byte(),
             original,
             replacement,
-            context: context(node, operator),
+            context: CodeNode::of(context(node, operator), self.source),
         });
     }
 
@@ -392,29 +427,24 @@ const WRAPPERS: &[&str] = &[
     "unary_expression",
 ];
 
-/// The byte range a mutant's meaning depends on. An operator token means nothing without its
-/// operands, a literal nothing without what uses it, and a negated condition nothing without
-/// its `if`, so each widens to that; other mutants replace a whole construct already.
-fn context(node: Node, operator: Operator) -> std::ops::Range<usize> {
-    fn parent(n: Node) -> Node {
-        n.parent().unwrap_or(n)
-    }
-    let range = |n: Node| n.start_byte()..n.end_byte();
+/// The node a mutant's meaning depends on. An operator token means nothing without its
+/// operands, and a literal nothing without what uses it, so each widens to that; other
+/// mutants replace a whole construct already. A context matches base only with the same
+/// parent kind, which ties a negated condition to its `if`.
+fn context(node: Node, operator: Operator) -> Node {
+    let parent = node.parent().unwrap_or(node);
     match operator {
-        Operator::SwapComparison | Operator::SwapBoolean | Operator::SwapArithmetic => {
-            range(parent(node))
-        }
+        Operator::SwapComparison | Operator::SwapBoolean | Operator::SwapArithmetic => parent,
         Operator::FlipBool | Operator::IncrementInt => {
-            let mut user = parent(node);
+            let mut user = parent;
             while WRAPPERS.contains(&user.kind())
                 && let Some(next) = user.parent()
             {
                 user = next;
             }
-            range(user)
+            user
         }
-        Operator::NegateIf => parent(node).start_byte()..node.end_byte(),
-        _ => range(node),
+        _ => node,
     }
 }
 
@@ -625,25 +655,33 @@ def g():
         );
         let contexts: Vec<String> = cands
             .iter()
-            .map(|c| format!("{:?} {}", c.operator, &source[c.context.clone()]))
+            .map(|c| {
+                format!(
+                    "{:?} {} in {}: {}",
+                    c.operator,
+                    c.context.kind,
+                    c.context.parent.as_deref().unwrap_or("-"),
+                    c.context.leaves.join(" ")
+                )
+            })
             .collect();
         assert_eq!(
             contexts,
             vec![
-                "RemoveNot not flag",
-                "NegateIf if not flag and len(xs) <= 3",
-                "SwapBoolean not flag and len(xs) <= 3",
-                "SwapComparison len(xs) <= 3",
-                "IncrementInt len(xs) <= 3",
-                "RemoveCall save(-1, True)",
-                "IncrementInt save(-1, True)",
-                "FlipBool save(-1, True)",
+                "RemoveNot not_operator in boolean_operator: not flag",
+                "NegateIf boolean_operator in if_statement: not flag and len ( xs ) <= 3",
+                "SwapBoolean boolean_operator in if_statement: not flag and len ( xs ) <= 3",
+                "SwapComparison comparison_operator in boolean_operator: len ( xs ) <= 3",
+                "IncrementInt comparison_operator in boolean_operator: len ( xs ) <= 3",
+                "RemoveCall expression_statement in block: save ( - 1 , True )",
+                "IncrementInt call in expression_statement: save ( - 1 , True )",
+                "FlipBool call in expression_statement: save ( - 1 , True )",
             ]
         );
 
         let tsx = "const a = <p lang={lang} className={LARGE}>{text}</p>;\n";
         let cands = generate(Lang::Tsx, tsx, &lines(1..=1), &CallFilter::default(), &[]);
-        assert_eq!(&tsx[cands[1].context.clone()], "className={LARGE}");
+        assert_eq!(cands[1].context.leaves.join(""), "className={LARGE}");
     }
 
     #[test]

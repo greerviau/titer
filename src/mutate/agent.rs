@@ -87,8 +87,6 @@ pub fn load(ctx: &Context, path: &Path) -> anyhow::Result<Loaded> {
             spec.replacement,
             lines[stop..].concat()
         );
-        let unchanged_from_base =
-            super::BaseHunks::load(&ctx.session, &spec.file)?.contains(spec.line, &replaced);
         let mutant = Mutant {
             id: spec
                 .id
@@ -104,7 +102,8 @@ pub fn load(ctx: &Context, path: &Path) -> anyhow::Result<Loaded> {
             outcome: MutantOutcome::NotRun,
             killed_by: None,
             duration_ms: None,
-            unchanged_from_base,
+            // An agent edit replaces whole lines, with no syntax node to compare with base.
+            unchanged_from_base: false,
         };
         out.push((
             mutant,

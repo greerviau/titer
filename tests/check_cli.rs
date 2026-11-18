@@ -26,7 +26,7 @@ fn check_json_emits_a_schema_valid_empty_report() {
     let report = stdout_json(&output);
     assert_schema_valid(&report);
     assert_eq!(report["gate"]["status"], "pass");
-    assert_eq!(report["schema_version"], "1");
+    assert_eq!(report["schema_version"], "2");
     assert_eq!(
         report["tiers"],
         serde_json::json!(["scan", "prove", "mutate", "crap"])

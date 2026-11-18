@@ -200,7 +200,7 @@
           "$ref": "#/$defs/MutantSource"
         },
         "unchanged_from_base": {
-          "description": "The mutated code also appears in the base lines that this hunk replaces, so the change\nmay only have moved or reformatted it. A survivor here may predate the change.",
+          "description": "The mutated code also appears in the base lines that this hunk replaces, as a syntax\nnode with the same kind, parent kind, and tokens. The change may only have moved or\nreformatted it, so a survivor here may predate the change. Always false for agent\nmutants.",
           "type": "boolean"
         }
       },
