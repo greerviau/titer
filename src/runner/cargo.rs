@@ -61,7 +61,7 @@ struct Group<'a> {
 
 fn groups<'a>(runner: &Runner, cwd: &Path, selection: &Selection<'a>) -> Vec<Group<'a>> {
     let rel = |f: &str| cwd_relative(f, &runner.config.cwd);
-    let index = targets::index(&runner.config.command, cwd);
+    let index = targets::index(cwd);
     let mut by_target: BTreeMap<Target, Vec<Wanted<'a>>> = BTreeMap::new();
     let mut defs: BTreeMap<String, Vec<TestDef>> = BTreeMap::new();
     let mut tests_in = |file: &str| -> Vec<TestDef> {
@@ -74,6 +74,13 @@ fn groups<'a>(runner: &Runner, cwd: &Path, selection: &Selection<'a>) -> Vec<Gro
     };
     let mut add = |file: &str, case: Option<&'a TestCase>, def: &TestDef| {
         for r in index.refs(file) {
+            // Cargo skips a target the command's features leave out, and a module path
+            // that two files can fill gives their tests one name.
+            if !index.builds(&r.target, &runner.config.command)
+                || index.ambiguous(&r.target, &r.module)
+            {
+                continue;
+            }
             let mut path = r.module.clone();
             path.extend(def.suite.iter().cloned());
             path.push(def.name.clone());
@@ -273,11 +280,6 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
             Some(s) => batches(s.keys().cloned().collect()),
             None => vec![Vec::new()],
         };
-        let case_of = |name: &str| {
-            selected
-                .as_ref()
-                .and_then(|s| s.get(name).copied().flatten())
-        };
         let mut failed = false;
         for batch in names {
             let remaining = req.timeout.map(|t| t.saturating_sub(run.duration));
@@ -297,7 +299,13 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
             let out = exec(runner, req, &args, remaining)?;
             run.duration += out.duration;
             run.max_rss_bytes = run.max_rss_bytes.max(out.max_rss_bytes);
-            failed |= read_output(&out, &group, &case_of, &runner.config.cwd, &mut run);
+            failed |= read_output(
+                &out,
+                &group,
+                selected.as_ref(),
+                &runner.config.cwd,
+                &mut run,
+            );
             if out.timed_out {
                 run.timed_out = true;
                 break 'groups;
@@ -311,22 +319,35 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
 }
 
 /// Adds one invocation's results to the run. Returns whether any test failed or crashed.
-fn read_output<'a>(
+/// `selected` maps the exact names a target run selected to their cases; None for the
+/// suite.
+fn read_output(
     out: &RunOutput,
     group: &Group,
-    case_of: &dyn Fn(&str) -> Option<&'a TestCase>,
+    selected: Option<&BTreeMap<String, Option<&TestCase>>>,
     cwd: &str,
     run: &mut TestRun,
 ) -> bool {
     let blocks = parse(&out.stdout);
     let files = binary_files(&out.stderr);
+    let case_of = |name: &str| selected.and_then(|s| s.get(name).copied().flatten());
     let mut failed = false;
     for (i, block) in blocks.iter().enumerate() {
         let file = match &group.target {
             Some(t) => format!("./{}", t.root),
             None => files.get(i).cloned().unwrap_or_default(),
         };
+        if !block.consistent() {
+            run.incomplete = true;
+            run.runner_error = Some(format!(
+                "the test output of {file} disagrees with its own summary, for example because a test printed to stdout; titer reads no result from it"
+            ));
+            continue;
+        }
         for (name, status) in &block.results {
+            if selected.is_some_and(|s| !s.contains_key(name)) {
+                continue;
+            }
             failed |= matches!(status, Status::Failed(_));
             run.outcomes
                 .push(outcome(case_of(name), &file, name, status.clone(), cwd));
@@ -378,6 +399,17 @@ fn exec(
             anyhow::bail!(
                 "refusing to build into {}: it is a symlink out of the worktree",
                 dir.display()
+            );
+        }
+    }
+    // Cargo writes the lockfile, and a symlinked one can point into the checkout.
+    let cwd = runner.cwd_in(req.worktree);
+    for dir in cwd.ancestors().take_while(|d| d.starts_with(req.worktree)) {
+        let lock = dir.join("Cargo.lock");
+        if lock.is_symlink() {
+            anyhow::bail!(
+                "refusing to run cargo: {} is a symlink, and cargo may rewrite it",
+                lock.display()
             );
         }
     }
@@ -445,6 +477,9 @@ static SECTION: LazyLock<Regex> =
 static PANIC: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^thread '[^']*'(?: \(\d+\))? panicked at (?:'(.*)', \S+|\S+:\d+:\d+:)$").unwrap()
 });
+static SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored;").unwrap()
+});
 static SIGNAL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\((signal: \d+[^)]*|exit status: \d+)\)").unwrap());
 
@@ -479,6 +514,23 @@ struct Block {
     running: Option<String>,
     /// The binary printed its `test result:` line.
     finished: bool,
+    /// The passed, failed, and ignored counts of that line.
+    summary: Option<(usize, usize, usize)>,
+}
+
+impl Block {
+    /// Whether the per-test lines agree with the binary's own counts. A test that prints
+    /// to stdout can garble or forge result lines, and then no line is trusted.
+    fn consistent(&self) -> bool {
+        let Some((passed, failed, ignored)) = self.summary else {
+            return !self.finished;
+        };
+        let count = |f: fn(&Status) -> bool| self.results.iter().filter(|(_, s)| f(s)).count();
+        count(|s| *s == Status::Passed) == passed
+            && count(|s| matches!(s, Status::Failed(_))) == failed
+            && count(|s| *s == Status::Skipped) == ignored
+            && self.results.iter().all(|(n, _)| !n.contains(" ... "))
+    }
 }
 
 fn parse(stdout: &str) -> Vec<Block> {
@@ -503,6 +555,10 @@ fn parse(stdout: &str) -> Vec<Block> {
             section = None;
             if line.starts_with("test result: ") {
                 block.finished = true;
+                block.summary = SUMMARY.captures(line).map(|c| {
+                    let n = |i: usize| c[i].parse().unwrap_or(usize::MAX);
+                    (n(1), n(2), n(3))
+                });
             }
             continue;
         }
@@ -629,6 +685,17 @@ mod tests {
         let second = &blocks[1];
         assert!(!second.finished);
         assert_eq!(second.running.as_deref(), Some("y"));
+    }
+
+    #[test]
+    fn output_that_disagrees_with_the_summary_is_not_trusted() {
+        // A test that prints a result line of its own while it runs.
+        let forged = "\nrunning 1 test\ntest works ... test works ... FAILED\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let blocks = parse(forged);
+        assert!(blocks[0].finished);
+        assert!(!blocks[0].consistent());
+        let honest = "\nrunning 2 tests\ntest a ... ok\ntest b ... ignored\n\ntest result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        assert!(parse(honest)[0].consistent());
     }
 
     #[test]

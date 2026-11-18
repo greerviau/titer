@@ -74,7 +74,7 @@ Each survivor gets two follow-up runs:
 
 Mutant outcomes are `killed`, `timed_out`, `survived`, `not_executed`, `caught_by_other`, `not_run` (the budget ran out first), and `no_result`.
 
-A mutant that leaves any selected target unbuildable or unlistable gets `no_result`, unless a test in a target that built fails. A compile or link error is never a kill, and a pass in one target is not a survivor while another target cannot run.
+A mutant survives only when every selected test ran and passed. A mutant that leaves any selected target unbuildable or unlistable, or a selected test missing, gets `no_result`, unless a selected test fails. A compile or link error is never a kill.
 
 Agents can add their own mutants with `--mutants`. See the [CLI reference](cli.md#agent-mutants).
 
@@ -94,11 +94,15 @@ Rust keeps unit tests in the source file they test. titer reads `#[cfg(test)]` i
 
 - A changed test inside a source file is a changed test. `#[cfg_attr(condition, test)]` also marks a test.
 - Test code is never mutated, and a change that edits only test code does not touch source. Code that shares a line with test code is still source.
-- `prove` keeps base's source code and replaces its test items with head's. Each head test item goes right after the nearest non-test item before it in head that base also has, so it sees the same `macro_rules!` definitions it sees in head. A test module inside a module that base lacks goes into an empty module of that name. A file that cargo compiles only as test code, such as one under `#[cfg(test)] mod unit;` or `#![cfg(test)]`, goes onto base whole.
+- `prove` keeps base's source code and replaces its test items with head's. It rebuilds each module in head's item order: items both sides have keep base's text, items only base has stay, test items come from head, and other items only head has are left out. So every test sees the `macro_rules!` definitions it sees in head. A test module inside a module that base lacks goes into an empty module of that name. A file that cargo compiles only as test code, such as one under `#[cfg(test)] mod unit;` or `#![cfg(test)]`, goes onto base whole.
 
 titer asks `cargo metadata` for packages and targets, and maps each file to the targets that compile it by following `mod` declarations, including `#[path]`, from each target's root. A module that several targets declare, such as `tests/common/mod.rs`, belongs to each of them. It lists each target's tests and selects exact names; a test that a macro such as `rstest` expands into cases selects every case.
 
-A test that uses a name only head has stops its whole target from compiling on base. `prove` gives such a test the `missing_symbol` verdict, removes it and the imports of that name (including an alias) from base, and builds again, so the other changed tests in that target still run.
+titer skips a target whose `required-features` the runner's command does not enable, as cargo does. Two files that can fill one module path, such as `#[cfg]` variants under `#[path]`, give their tests the same libtest name, so titer selects neither and they get `no_result`. titer reads a test binary's results only when they agree with its own `test result:` counts; a test that prints result lines of its own leaves the run without a result.
+
+A test that uses a name only head has stops its whole target from compiling on base. `prove` gives such a test the `missing_symbol` verdict, removes it and the import of that exact path from base, and builds again, so the other changed tests in that target still run.
+
+Worktrees hold the tree without `.git`, so a build script that runs git fails there, and the check exits 2.
 
 Doc tests run with the suite, but a changed doc test is not a changed test: libtest names a doc test by its line, which differs between base and head.
 

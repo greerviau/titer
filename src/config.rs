@@ -181,8 +181,6 @@ fn check_cargo_command(command: &[String]) -> Result<(), String> {
         "--target",
         "-j",
         "--jobs",
-        "--config",
-        "-Z",
         "--color",
     ];
     const SWITCHES: &[&str] = &[
@@ -460,7 +458,7 @@ mod tests {
     #[test]
     fn cargo_commands_accept_build_flags_with_their_values() {
         let config = Config::parse(
-            "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"+nightly\", \"test\", \"--features\", \"pg\", \"--release\", \"-j\", \"2\", \"--config=net.offline=true\"]\n",
+            "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"+nightly\", \"test\", \"--features\", \"pg\", \"--release\", \"-j\", \"2\", \"--locked\"]\n",
         );
         assert!(config.is_ok(), "{config:?}");
     }
@@ -516,6 +514,10 @@ mod tests {
             (
                 "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\", \"unrelated\"]",
                 "must not contain \"unrelated\"",
+            ),
+            (
+                "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\", \"--config\", \"build.build-dir='/x'\"]",
+                "must not contain \"--config\"",
             ),
             (
                 "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"build\"]",

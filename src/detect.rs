@@ -102,7 +102,7 @@ impl Classifier {
     /// titer cannot tell from the checkout.
     fn cargo_test_code(&self, config: &RunnerConfig, rel: &str) -> Option<bool> {
         let root = self.root.as_ref()?;
-        let index = crate::runner::cargo::targets::index(&config.command, &root.join(&config.cwd));
+        let index = crate::runner::cargo::targets::index(&root.join(&config.cwd));
         let refs = index.refs(rel);
         if refs.is_empty() {
             return None;

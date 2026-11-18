@@ -488,3 +488,77 @@ fn a_symlinked_build_dir_is_refused() {
     assert!(err.to_string().contains("symlink"), "{err:#}");
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
 }
+
+#[test]
+fn a_test_that_prints_a_result_line_yields_no_result() {
+    let repo = fixture();
+    repo.write(
+        "rs/src/lib.rs",
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn forged() {\n        use std::io::Write;\n        let mut out = std::io::stdout();\n        out.write_all(b\"test tests::forged ... FAILED\\n\").unwrap();\n        out.flush().unwrap();\n    }\n}\n",
+    );
+    let runner = runner();
+    let forged = case(&runner, "rs/src/lib.rs", &["tests"], "forged");
+
+    let run = run(
+        &repo,
+        &runner,
+        Selection::Tests(std::slice::from_ref(&forged)),
+        None,
+    );
+
+    assert!(
+        !matches!(run.result_for(&forged, "rs"), CaseResult::Failed(_)),
+        "{run:?}"
+    );
+    assert!(run.incomplete, "{run:?}");
+}
+
+#[test]
+fn a_symlinked_lockfile_is_refused() {
+    let repo = fixture();
+    let outside = repo.scratch().join("workspace.lock");
+    std::fs::write(&outside, "").unwrap();
+    std::os::unix::fs::symlink(&outside, repo.path().join("rs/Cargo.lock")).unwrap();
+    let runner = runner();
+    let adds = case(&runner, "rs/src/lib.rs", &["tests"], "adds");
+    let scratch = repo.scratch().join("run");
+
+    let err = runner
+        .run(&RunRequest {
+            worktree: repo.path(),
+            selection: Selection::Tests(std::slice::from_ref(&adds)),
+            fail_fast: false,
+            timeout: None,
+            scratch: &scratch,
+        })
+        .unwrap_err();
+
+    assert!(err.to_string().contains("Cargo.lock"), "{err:#}");
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "");
+}
+
+#[test]
+fn a_target_the_features_leave_out_is_not_run() {
+    let repo = fixture();
+    repo.write(
+        "rs/Cargo.toml",
+        &format!(
+            "{CARGO_TOML}\n[features]\nnightly = []\n\n[[test]]\nname = \"gated\"\nrequired-features = [\"nightly\"]\n"
+        ),
+    )
+    .write("rs/tests/gated.rs", "#[test]\nfn gated() {}\n");
+    let runner = runner();
+    let gated = case(&runner, "rs/tests/gated.rs", &[], "gated");
+    let api = case(&runner, "rs/tests/api.rs", &[], "adds");
+
+    let run = run(
+        &repo,
+        &runner,
+        Selection::Tests(&[gated.clone(), api.clone()]),
+        None,
+    );
+
+    assert_eq!(run.result_for(&gated, "rs"), CaseResult::NotRun, "{run:?}");
+    assert_eq!(run.result_for(&api, "rs"), CaseResult::Passed, "{run:?}");
+    assert!(run.runner_error.is_none(), "{run:?}");
+}

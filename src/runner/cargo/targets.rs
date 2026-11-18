@@ -6,7 +6,7 @@
 //! several declarations reach has a module path for each. A file reached only through
 //! `#[cfg(test)]` modules is test code throughout.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -31,6 +31,8 @@ pub struct Target {
     pub kind: Kind,
     /// The target's root file, relative to the runner's cwd.
     pub root: String,
+    /// Features the target needs; cargo skips it without them.
+    pub required_features: Vec<String>,
 }
 
 impl Target {
@@ -61,6 +63,10 @@ pub struct ModuleRef {
 pub struct Index {
     /// Cwd-relative file to its references.
     files: HashMap<String, Vec<ModuleRef>>,
+    /// How many files each module path of each target has.
+    sources: HashMap<(Target, Vec<String>), usize>,
+    /// Each package's `features` table.
+    features: HashMap<String, serde_json::Value>,
     /// Cwd-relative dirs of the workspace members' manifests.
     pub members: Vec<String>,
 }
@@ -69,16 +75,87 @@ impl Index {
     pub fn refs(&self, rel: &str) -> &[ModuleRef] {
         self.files.get(rel).map_or(&[], Vec::as_slice)
     }
+
+    /// Whether more than one file can be `module` of `target`, as with `#[cfg]` variants
+    /// of one module. libtest names cannot tell their tests apart.
+    pub fn ambiguous(&self, target: &Target, module: &[String]) -> bool {
+        self.sources
+            .get(&(target.clone(), module.to_vec()))
+            .is_some_and(|n| *n > 1)
+    }
+
+    /// Whether `command` enables every feature `target` requires.
+    pub fn builds(&self, target: &Target, command: &[String]) -> bool {
+        if target.required_features.is_empty() {
+            return true;
+        }
+        let empty = serde_json::Value::Null;
+        let features = self.features.get(&target.package).unwrap_or(&empty);
+        let enabled = enabled_features(command, features);
+        target.required_features.iter().all(|f| enabled.contains(f))
+    }
+}
+
+/// The features of a package that `command` enables: default ones unless it turns them
+/// off, the ones it names, and what those enable in turn.
+fn enabled_features(command: &[String], features: &serde_json::Value) -> HashSet<String> {
+    let args: Vec<&str> = match command.iter().position(|a| a == "test") {
+        Some(at) => command[at + 1..].iter().map(String::as_str).collect(),
+        None => Vec::new(),
+    };
+    let table = features.as_object();
+    if args.contains(&"--all-features") {
+        return table
+            .map(|t| t.keys().cloned().collect())
+            .unwrap_or_default();
+    }
+    let mut wanted: Vec<String> = Vec::new();
+    if !args.contains(&"--no-default-features") {
+        wanted.push("default".to_string());
+    }
+    let mut i = 0;
+    while i < args.len() {
+        let value = match args[i].split_once('=') {
+            Some(("--features" | "-F", v)) => Some(v),
+            None if matches!(args[i], "--features" | "-F") => {
+                i += 1;
+                args.get(i).copied()
+            }
+            _ => None,
+        };
+        if let Some(v) = value {
+            wanted.extend(
+                v.split([',', ' '])
+                    .filter(|f| !f.is_empty())
+                    .map(str::to_string),
+            );
+        }
+        i += 1;
+    }
+    let mut on: HashSet<String> = HashSet::new();
+    while let Some(f) = wanted.pop() {
+        if f.contains('/') || f.starts_with("dep:") || !on.insert(f.clone()) {
+            continue;
+        }
+        let implied = table
+            .and_then(|t| t.get(&f))
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_string));
+        wanted.extend(implied);
+    }
+    on
 }
 
 /// The index for `cwd`, built once per dir: worktrees do not change their module layout
-/// between runs. `command` is the runner's command; its prefix before `test` runs cargo.
-pub fn index(command: &[String], cwd: &Path) -> Arc<Index> {
+/// between runs.
+pub fn index(cwd: &Path) -> Arc<Index> {
     static CACHE: LazyLock<Mutex<HashMap<PathBuf, Arc<Index>>>> = LazyLock::new(Default::default);
     if let Some(index) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(cwd) {
         return index.clone();
     }
-    let index = Arc::new(build(command, cwd));
+    let index = Arc::new(build(cwd));
     CACHE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -86,9 +163,9 @@ pub fn index(command: &[String], cwd: &Path) -> Arc<Index> {
     index
 }
 
-fn build(command: &[String], cwd: &Path) -> Index {
+fn build(cwd: &Path) -> Index {
     let mut index = Index::default();
-    let Some(meta) = metadata(command, cwd) else {
+    let Some(meta) = metadata(cwd) else {
         return index;
     };
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
@@ -126,6 +203,9 @@ fn build(command: &[String], cwd: &Path) -> Index {
         {
             index.members.push(package_dir.clone());
         }
+        index
+            .features
+            .insert(name.to_string(), package["features"].clone());
         let no_harness = no_harness(&cwd.join(&manifest_rel));
         for target in package["targets"].as_array().unwrap_or(&empty) {
             if target["test"].as_bool() == Some(false) {
@@ -164,9 +244,29 @@ fn build(command: &[String], cwd: &Path) -> Index {
                 package: name.to_string(),
                 kind,
                 root: root.clone(),
+                required_features: target["required-features"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|f| f.as_str().map(str::to_string))
+                    .collect(),
             };
             let mut seen = Vec::new();
-            walk_module(&cwd, &root, Vec::new(), true, false, &mut seen);
+            walk_module(
+                &cwd,
+                &root,
+                Vec::new(),
+                true,
+                false,
+                &mut Vec::new(),
+                &mut seen,
+            );
+            for (_, module, _) in &seen {
+                *index
+                    .sources
+                    .entry((target.clone(), module.clone()))
+                    .or_default() += 1;
+            }
             for (file, module, test_only) in seen {
                 let refs = index.files.entry(file).or_default();
                 let r = ModuleRef {
@@ -183,20 +283,19 @@ fn build(command: &[String], cwd: &Path) -> Index {
     index
 }
 
-/// `cargo metadata` for the workspace in `cwd`, run with the command's prefix before
-/// `test`. It reads manifests only and writes nothing.
-fn metadata(command: &[String], cwd: &Path) -> Option<serde_json::Value> {
-    let at = command.iter().position(|a| a == "test")?;
-    let mut cmd = std::process::Command::new(&command[0]);
-    cmd.args(&command[1..at])
-        .args([
-            "metadata",
-            "--no-deps",
-            "--format-version",
-            "1",
-            "--offline",
-        ])
-        .current_dir(cwd);
+/// `cargo metadata` for the workspace in `cwd`. It reads manifests only and writes
+/// nothing. It runs cargo itself, never the runner's command: detection reads the user's
+/// checkout and must not run the repo's own scripts there.
+fn metadata(cwd: &Path) -> Option<serde_json::Value> {
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.args([
+        "metadata",
+        "--no-deps",
+        "--format-version",
+        "1",
+        "--offline",
+    ])
+    .current_dir(cwd);
     let out = crate::process::output(cmd).ok()?;
     if !out.status.success() {
         return None;
@@ -241,12 +340,19 @@ fn walk_module(
     module: Vec<String>,
     mod_rs: bool,
     test_only: bool,
+    ancestors: &mut Vec<String>,
     seen: &mut Vec<(String, Vec<String>, bool)>,
 ) {
-    if seen.iter().any(|(f, m, _)| f == file && *m == module) || seen.len() > 100_000 {
+    // A file that declares itself, directly or through others, compiles only behind a
+    // cfg that is off; its module path would grow without end.
+    if ancestors.iter().any(|a| a == file)
+        || seen.iter().any(|(f, m, _)| f == file && *m == module)
+        || seen.len() > 100_000
+    {
         return;
     }
     seen.push((file.to_string(), module.clone(), test_only));
+    ancestors.push(file.to_string());
     let Ok(source) = std::fs::read_to_string(cwd.join(file)) else {
         return;
     };
@@ -268,7 +374,8 @@ fn walk_module(
         module: &module,
         test_only,
     };
-    declarations(cwd, tree.root_node(), &source, &scope, seen);
+    declarations(cwd, tree.root_node(), &source, &scope, ancestors, seen);
+    ancestors.pop();
 }
 
 struct Scope<'a> {
@@ -285,6 +392,7 @@ fn declarations(
     node: Node,
     source: &str,
     scope: &Scope,
+    ancestors: &mut Vec<String>,
     seen: &mut Vec<(String, Vec<String>, bool)>,
 ) {
     for child in children(node) {
@@ -310,7 +418,7 @@ fn declarations(
                 module: &path,
                 test_only,
             };
-            declarations(cwd, body, source, &inner_scope, seen);
+            declarations(cwd, body, source, &inner_scope, ancestors, seen);
             continue;
         }
         let (file, mod_rs) = match path_attr {
@@ -328,7 +436,7 @@ fn declarations(
             }
         };
         if let Some(file) = file {
-            walk_module(cwd, &file, path, mod_rs, test_only, seen);
+            walk_module(cwd, &file, path, mod_rs, test_only, ancestors, seen);
         }
     }
 }
@@ -376,6 +484,29 @@ mod tests {
     }
 
     #[test]
+    fn required_features_count_defaults_and_the_command() {
+        let features: serde_json::Value = serde_json::json!({
+            "default": ["std"],
+            "std": [],
+            "nightly": ["fast"],
+            "fast": []
+        });
+        let command = |args: &[&str]| -> Vec<String> {
+            ["cargo", "test"]
+                .iter()
+                .chain(args)
+                .map(|a| a.to_string())
+                .collect()
+        };
+        let on = |cmd: &[&str]| enabled_features(&command(cmd), &features);
+        assert!(on(&[]).contains("std"));
+        assert!(!on(&["--no-default-features"]).contains("std"));
+        assert!(on(&["--features", "nightly"]).contains("fast"));
+        assert!(on(&["-F", "x,nightly"]).contains("nightly"));
+        assert!(on(&["--all-features"]).contains("nightly"));
+    }
+
+    #[test]
     fn maps_files_to_the_targets_and_modules_that_declare_them() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
@@ -411,9 +542,16 @@ mod tests {
         write(d, "app/tests/my.rs", "");
         write(d, "app/examples/ex.rs", "");
         write(d, "app/src/orphan.rs", "");
-        let command = vec!["cargo".to_string(), "test".to_string()];
+        // Two cfg variants of one module, and an inactive module that loops back.
+        write(
+            d,
+            "app/src/main.rs",
+            "mod cli;\n#[cfg(unix)]\n#[path = \"unix.rs\"]\nmod platform;\n#[cfg(not(unix))]\n#[path = \"other.rs\"]\nmod platform;\n#[cfg(not(unix))]\n#[path = \"main.rs\"]\nmod recursive;\n",
+        );
+        write(d, "app/src/unix.rs", "");
+        write(d, "app/src/other.rs", "");
 
-        let index = build(&command, d);
+        let index = build(d);
 
         assert_eq!(index.members, vec!["app"]);
         assert_eq!(
@@ -467,6 +605,14 @@ mod tests {
             vec!["Example(\"ex\") app/examples/ex.rs []"]
         );
         assert!(summary(&index, "app/tests/my.rs").is_empty());
+        let bin = &index.refs("app/src/unix.rs")[0];
+        assert!(index.ambiguous(&bin.target, &bin.module));
+        let cli = &index.refs("app/src/cli.rs")[0];
+        assert!(!index.ambiguous(&cli.target, &cli.module));
+        assert_eq!(
+            summary(&index, "app/src/main.rs"),
+            vec!["Bin(\"app\") app/src/main.rs []"]
+        );
         assert!(summary(&index, "app/src/orphan.rs").is_empty());
     }
 }

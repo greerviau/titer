@@ -4,8 +4,6 @@
 //! treats those items as test code: their lines are never mutated, and prove splices head's
 //! test items into base's source file.
 
-use std::collections::BTreeMap;
-
 use tree_sitter::Node;
 
 use super::{FunctionDef, Lang, TestDef, children, end_line_of, line_of, text};
@@ -383,147 +381,152 @@ pub fn test_lines(source: &str) -> Vec<(u32, u32)> {
         .collect()
 }
 
-/// Base's source file with its test items replaced by head's. Returns None when the test
-/// items are the same.
+/// Base's source file with its test items replaced by head's. Returns None when that
+/// leaves base's items as they were.
 ///
 /// Rust items can come in any order, except that a `macro_rules!` macro is visible only
-/// after its definition. So each head test item goes right after its anchor: the nearest
-/// non-test item before it in head that base also has, matched by kind, name (or text,
-/// for an unnamed item such as an item macro), and occurrence. A base test item with the
-/// same key and anchor is replaced where it stands. A module that base lacks becomes an
-/// empty shell around head's test items, which then compile on base only if they use
-/// nothing new. Base's test items that head lacks go away.
-///
-/// Returns None when splicing leaves base unchanged.
+/// after its definition. So each module is rebuilt in head's item order: an item both
+/// sides have keeps base's text (with its own modules merged the same way), an item only
+/// base has stays after the base item before it, a test item comes from head, and a
+/// non-test item only head has is left out. A module only head has keeps just its test
+/// items, so they compile on base only if they use nothing new. Items match by kind, name
+/// (or text, for an unnamed item such as an item macro), and occurrence. Comments between
+/// items are not kept.
 pub fn splice_tests(base: &str, head: &str) -> Option<String> {
     let base_tree = Lang::Rust.parse(base)?;
     let head_tree = Lang::Rust.parse(head)?;
-    let mut paths: Vec<Vec<Step>> = test_items(base_tree.root_node(), base)
+    let rebuild = |other: &str, other_tree: &tree_sitter::Tree| {
+        let root = base_tree.root_node();
+        let entries = entries(root, base);
+        let prefix = entries
+            .first()
+            .map_or(base, |e| &base[..indent_start(base, e.start)]);
+        let body = merge(Some((root, base)), (other_tree.root_node(), other));
+        format!("{prefix}{body}")
+    };
+    let spliced = rebuild(head, &head_tree);
+    (spliced != rebuild(base, &base_tree)).then_some(spliced)
+}
+
+/// The items of one module, merged as `splice_tests` describes, one per paragraph.
+fn merge(base: Option<(Node, &str)>, head: (Node, &str)) -> String {
+    let (head_node, head_src) = head;
+    let head_entries = entries(head_node, head_src);
+    let base_entries = base.map(|(n, src)| entries(n, src)).unwrap_or_default();
+    let base_src = base.map_or("", |(_, src)| src);
+    let in_head = |e: &Entry| head_entries.iter().any(|h| !h.test && h.key == e.key);
+    let mut out: Vec<String> = Vec::new();
+    let mut emitted = vec![false; base_entries.len()];
+    let mut next = 0;
+    let base_only = |k: usize| !base_entries[k].test && !in_head(&base_entries[k]);
+    for h in &head_entries {
+        if h.test {
+            out.push(head_src[indent_start(head_src, h.start)..h.end].to_string());
+            continue;
+        }
+        let common = base_entries.iter().position(|b| !b.test && b.key == h.key);
+        match common {
+            Some(j) => {
+                for k in next..j {
+                    if base_only(k) && !emitted[k] {
+                        out.push(entry_text(&base_entries[k], base_src));
+                        emitted[k] = true;
+                    }
+                }
+                let (base_node, _) = base.expect("a common item has a base");
+                out.push(merged_item(
+                    &base_entries[j],
+                    base_node,
+                    base_src,
+                    h,
+                    head_node,
+                    head_src,
+                ));
+                emitted[j] = true;
+                next = next.max(j + 1);
+            }
+            None => {
+                if let Some(shell) = shell(h, head_node, head_src) {
+                    out.push(shell);
+                }
+            }
+        }
+    }
+    for (k, e) in base_entries.iter().enumerate() {
+        if base_only(k) && !emitted[k] {
+            out.push(entry_text(e, base_src));
+        }
+    }
+    let mut text = out.join("\n\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
+fn entry_text(e: &Entry, source: &str) -> String {
+    source[indent_start(source, e.start)..e.end].to_string()
+}
+
+/// The inline module `entry` of `container`, when it has a body.
+fn module_body<'t>(container: Node<'t>, source: &str, entry: &Entry) -> Option<Node<'t>> {
+    children(container)
         .into_iter()
-        .chain(test_items(head_tree.root_node(), head))
-        .filter_map(|i| i.container)
-        .collect();
-    paths.sort();
-    paths.dedup();
-    let mut edits: Vec<Edit> = Vec::new();
-    // Head's test items in modules base lacks, by the deepest module base has and the
-    // first missing step.
-    let mut shells: BTreeMap<(Vec<Step>, String), Vec<ShellItem>> = BTreeMap::new();
-    for path in &paths {
-        let Some(head_node) = container(head_tree.root_node(), head, path) else {
-            // Only base has the module: its test items go.
-            if let Some(base_node) = container(base_tree.root_node(), base, path) {
-                for e in entries(base_node, base).iter().filter(|e| e.test) {
-                    edits.push(Edit::remove(
-                        indent_start(base, e.start),
-                        line_end(base, e.end),
-                    ));
-                }
-            }
-            continue;
-        };
-        let head_entries = entries(head_node, head);
-        let Some(base_node) = container(base_tree.root_node(), base, path) else {
-            let have = (0..path.len())
-                .rev()
-                .find(|n| container(base_tree.root_node(), base, &path[..*n]).is_some())
-                .unwrap_or(0);
-            let rest: Vec<String> = path[have + 1..].iter().map(|(n, _)| n.clone()).collect();
-            let key = (path[..have].to_vec(), path[have].0.clone());
-            for e in head_entries.iter().filter(|e| e.test) {
-                shells.entry(key.clone()).or_default().push((
-                    rest.clone(),
-                    head[indent_start(head, e.start)..e.end].to_string(),
-                ));
-            }
-            continue;
-        };
-        let base_entries = entries(base_node, base);
-        // The base index of the nearest non-test head item before head entry `i` that
-        // base also has.
-        let anchor = |i: usize| -> Option<usize> {
-            head_entries[..i]
-                .iter()
-                .rev()
-                .filter(|e| !e.test)
-                .find_map(|e| base_entries.iter().position(|t| !t.test && t.key == e.key))
-        };
-        let mut kept: Vec<usize> = Vec::new();
-        // Where the last head test item went, by anchor, so the next one with that anchor
-        // follows it.
-        let mut cursor: Option<(Option<usize>, usize)> = None;
-        for (i, h) in head_entries.iter().enumerate().filter(|(_, h)| h.test) {
-            let text = &head[h.start..h.end];
-            let at = anchor(i);
-            let same = base_entries.iter().enumerate().position(|(b, e)| {
-                e.test
-                    && e.key.is_some()
-                    && e.key == h.key
-                    && !kept.contains(&b)
-                    && base_anchor(&base_entries, &head_entries, b) == at
-            });
-            if let Some(b) = same {
-                kept.push(b);
-                edits.push(Edit::replace(
-                    base_entries[b].start,
-                    base_entries[b].end,
-                    text,
-                ));
-                cursor = Some((at, base_entries[b].end));
-                continue;
-            }
-            let indent = &head[indent_start(head, h.start)..h.start];
-            let after = match cursor {
-                Some((a, end)) if a == at => Some(end),
-                _ => at.map(|a| base_entries[a].end),
-            };
-            match after {
-                Some(end) => {
-                    edits.push(Edit::insert(end, format!("\n{indent}{text}")));
-                    cursor = Some((at, end));
-                }
-                None => {
-                    // Before every item base has; past the indentation of the first one, or
-                    // inside an empty container.
-                    let (start, lead) = match base_entries.first() {
-                        Some(first) => (indent_start(base, first.start), String::new()),
-                        None => {
-                            let end = container_end(base_node, base);
-                            let nl = if base[..end].ends_with('\n') {
-                                ""
-                            } else {
-                                "\n"
-                            };
-                            (end, nl.to_string())
-                        }
-                    };
-                    edits.push(Edit::insert(start, format!("{lead}{indent}{text}\n")));
-                }
-            }
-        }
-        for (b, e) in base_entries.iter().enumerate() {
-            if e.test && !kept.contains(&b) {
-                edits.push(Edit::remove(
-                    indent_start(base, e.start),
-                    line_end(base, e.end),
-                ));
-            }
-        }
+        .find(|c| c.end_byte() == entry.end && c.kind() == "mod_item")
+        .and_then(|m| m.child_by_field_name("body"))
+        .filter(|_| source.len() >= entry.end)
+}
+
+/// An item both sides have: base's text, with an inline module's items merged.
+fn merged_item(
+    b: &Entry,
+    base_container: Node,
+    base_src: &str,
+    h: &Entry,
+    head_container: Node,
+    head_src: &str,
+) -> String {
+    let base_body = module_body(base_container, base_src, b);
+    let head_body = module_body(head_container, head_src, h);
+    let (Some(base_body), Some(head_body)) = (base_body, head_body) else {
+        return entry_text(b, base_src);
+    };
+    let open = base_body.start_byte() + 1;
+    let inner_entries = entries(base_body, base_src);
+    // Inner attributes and comments before the module's first item stay.
+    let lead_end = inner_entries
+        .first()
+        .map_or(open, |e| indent_start(base_src, e.start));
+    let merged = merge(Some((base_body, base_src)), (head_body, head_src));
+    let close = base_body.end_byte() - 1;
+    let indent = &base_src[indent_start(base_src, close)..close];
+    format!(
+        "{}{}{merged}{indent}}}",
+        &base_src[indent_start(base_src, b.start)..open],
+        if base_src[open..lead_end].contains('\n') {
+            base_src[open..lead_end].to_string()
+        } else {
+            format!("{}\n", &base_src[open..lead_end])
+        },
+    )
+}
+
+/// A non-test inline module only head has, reduced to its test items and the modules
+/// that hold more of them; None when it holds none.
+fn shell(h: &Entry, head_container: Node, head_src: &str) -> Option<String> {
+    let body = module_body(head_container, head_src, h)?;
+    let merged = merge(None, (body, head_src));
+    if merged.is_empty() {
+        return None;
     }
-    for ((have, first), items) in shells {
-        let Some(node) = container(base_tree.root_node(), base, &have) else {
-            continue;
-        };
-        let at = container_end(node, base);
-        let lead = if base[..at].ends_with('\n') { "" } else { "\n" };
-        edits.push(Edit::insert(at, format!("{lead}{}", shell(&first, &items))));
-    }
-    edits.sort_by_key(|e| (e.start, e.end > e.start));
-    let mut out = base.to_string();
-    for e in edits.into_iter().rev() {
-        out.replace_range(e.start..e.end, &e.text);
-    }
-    (out != base).then_some(out)
+    let module = children(head_container)
+        .into_iter()
+        .find(|c| c.end_byte() == h.end)?;
+    let name = name_of(module, head_src);
+    let close = body.end_byte() - 1;
+    let indent = &head_src[indent_start(head_src, close)..close];
+    let lead = &head_src[indent_start(head_src, h.start)..h.start];
+    Some(format!("{lead}mod {name} {{\n{merged}{indent}}}"))
 }
 
 /// Just past the newline that ends the line `at` is on, when only whitespace follows `at`
@@ -536,96 +539,44 @@ fn line_end(source: &str, at: usize) -> usize {
     }
 }
 
-/// The anchor of base entry `b`, as an index into base's entries: the nearest non-test
-/// entry before it that head also has.
-fn base_anchor(base: &[Entry], head: &[Entry], b: usize) -> Option<usize> {
-    base[..b].iter().enumerate().rev().find_map(|(i, e)| {
-        (!e.test && e.key.is_some() && head.iter().any(|h| !h.test && h.key == e.key)).then_some(i)
-    })
+/// `prefix::path`, without whitespace or a leading `::`.
+fn join_path(prefix: &str, path: &str) -> String {
+    let path: String = path.chars().filter(|c| !c.is_whitespace()).collect();
+    let full = if prefix.is_empty() {
+        path
+    } else {
+        format!("{prefix}::{path}")
+    };
+    full.trim_start_matches("::").to_string()
 }
 
-/// A test item for a shell module: the module names below the shell, and its text.
-type ShellItem = (Vec<String>, String);
-
-/// `mod name { ... }` around test items, with nested shells for deeper modules.
-fn shell(name: &str, items: &[ShellItem]) -> String {
-    let mut body = String::new();
-    let mut nested: BTreeMap<String, Vec<ShellItem>> = BTreeMap::new();
-    for (rest, text) in items {
-        match rest.split_first() {
-            None => {
-                body.push_str(text);
-                body.push('\n');
-            }
-            Some((first, deeper)) => nested
-                .entry(first.clone())
-                .or_default()
-                .push((deeper.to_vec(), text.clone())),
-        }
-    }
-    for (inner, items) in nested {
-        body.push_str(&shell(&inner, &items));
-    }
-    format!("mod {name} {{\n{body}}}\n")
-}
-
-/// One edit of base's bytes.
-struct Edit {
-    start: usize,
-    end: usize,
-    text: String,
-}
-
-impl Edit {
-    fn insert(at: usize, text: String) -> Edit {
-        Edit {
-            start: at,
-            end: at,
-            text,
-        }
-    }
-
-    fn remove(start: usize, end: usize) -> Edit {
-        Edit {
-            start,
-            end,
-            text: String::new(),
-        }
-    }
-
-    fn replace(start: usize, end: usize, text: &str) -> Edit {
-        Edit {
-            start,
-            end,
-            text: text.to_string(),
-        }
-    }
-}
-
-/// The last path segment a use tree imports: `n` for `demo::api::n` and for
-/// `demo::n as m`.
-fn imported(node: Node, source: &str) -> String {
+/// The full path a leaf of a use tree imports, without its alias: `demo::api::n` for
+/// `n` inside `use demo::api::{n}`, and `demo::n` for `demo::n as m`.
+fn imported_path(node: Node, source: &str, prefix: &str) -> String {
     let path = match node.kind() {
         "use_as_clause" => node.child_by_field_name("path").unwrap_or(node),
         _ => node,
     };
-    let t = text(path, source);
-    t.rsplit("::").next().unwrap_or(t).to_string()
+    join_path(prefix, text(path, source))
 }
 
-/// A use tree without the imports of `names`, or None when nothing is left of it.
-fn kept_tree(node: Node, source: &str, names: &[&str]) -> Option<String> {
+/// A use tree without the imports of `paths`, or None when nothing is left of it.
+/// `prefix` is the path the enclosing lists add.
+fn kept_tree(node: Node, source: &str, prefix: &str, paths: &[&str]) -> Option<String> {
     match node.kind() {
         "scoped_use_list" | "use_list" => {
-            let list = if node.kind() == "use_list" {
-                node
+            let (list, inner_prefix) = if node.kind() == "use_list" {
+                (node, prefix.to_string())
             } else {
-                node.child_by_field_name("list")?
+                let path = node
+                    .child_by_field_name("path")
+                    .map_or(String::new(), |p| join_path(prefix, text(p, source)));
+                (node.child_by_field_name("list")?, path)
             };
             let items = children(list);
             let kept: Vec<String> = items
                 .iter()
-                .filter_map(|i| kept_tree(*i, source, names))
+                .filter_map(|i| kept_tree(*i, source, &inner_prefix, paths))
                 .collect();
             if kept.is_empty() {
                 return None;
@@ -642,7 +593,7 @@ fn kept_tree(node: Node, source: &str, names: &[&str]) -> Option<String> {
             })
         }
         "use_wildcard" => Some(text(node, source).to_string()),
-        _ => (!names.contains(&imported(node, source).as_str()))
+        _ => (!paths.contains(&imported_path(node, source, prefix).as_str()))
             .then(|| text(node, source).to_string()),
     }
 }
@@ -660,10 +611,11 @@ fn use_declarations<'t>(root: Node<'t>) -> Vec<Node<'t>> {
     out
 }
 
-/// `source` without the imports of `names`: a `use` left with nothing goes away, and a
-/// `use` list keeps the rest.
-pub fn remove_imports(source: &str, names: &[&str]) -> String {
-    if names.is_empty() {
+/// `source` without the imports of `paths`, such as `demo::new_api`: a `use` left with
+/// nothing goes away, and a `use` list keeps the rest. An import of another path that
+/// ends in the same name stays.
+pub fn remove_imports(source: &str, paths: &[&str]) -> String {
+    if paths.is_empty() {
         return source.to_string();
     }
     let Some(tree) = Lang::Rust.parse(source) else {
@@ -674,7 +626,7 @@ pub fn remove_imports(source: &str, names: &[&str]) -> String {
         let Some(arg) = decl.child_by_field_name("argument") else {
             continue;
         };
-        match kept_tree(arg, source, names) {
+        match kept_tree(arg, source, "", paths) {
             None => edits.push((
                 indent_start(source, decl.start_byte()),
                 line_end(source, decl.end_byte()),
@@ -694,25 +646,42 @@ pub fn remove_imports(source: &str, names: &[&str]) -> String {
     out
 }
 
-/// The names a file's code can use for the imported `name`: the name itself, and each
-/// alias a `use ... as` gives it.
-pub fn local_names(source: &str, name: &str) -> Vec<String> {
-    let mut out = vec![name.to_string()];
+/// The names a file's code uses for an import of `path`: each alias a `use ... as` gives
+/// it, and its last segment where it is imported without one.
+pub fn local_names(source: &str, path: &str) -> Vec<String> {
+    let mut out = Vec::new();
     let Some(tree) = Lang::Rust.parse(source) else {
         return out;
     };
-    let mut stack = use_declarations(tree.root_node());
-    while let Some(node) = stack.pop() {
-        if node.kind() == "use_as_clause"
-            && imported(node, source) == name
-            && let Some(alias) = node.child_by_field_name("alias")
-        {
-            let alias = text(alias, source).to_string();
-            if !out.contains(&alias) {
-                out.push(alias);
+    let mut stack: Vec<(Node, String)> = use_declarations(tree.root_node())
+        .into_iter()
+        .filter_map(|d| {
+            d.child_by_field_name("argument")
+                .map(|a| (a, String::new()))
+        })
+        .collect();
+    while let Some((node, prefix)) = stack.pop() {
+        match node.kind() {
+            "scoped_use_list" => {
+                let inner = node
+                    .child_by_field_name("path")
+                    .map_or(prefix.clone(), |p| join_path(&prefix, text(p, source)));
+                if let Some(list) = node.child_by_field_name("list") {
+                    stack.extend(children(list).into_iter().map(|c| (c, inner.clone())));
+                }
             }
+            "use_list" => stack.extend(children(node).into_iter().map(|c| (c, prefix.clone()))),
+            _ if imported_path(node, source, &prefix) == path => {
+                let local = match node.child_by_field_name("alias") {
+                    Some(alias) => text(alias, source).to_string(),
+                    None => path.rsplit("::").next().unwrap_or(path).to_string(),
+                };
+                if !out.contains(&local) {
+                    out.push(local);
+                }
+            }
+            _ => {}
         }
-        stack.extend(children(node));
     }
     out
 }
@@ -768,34 +737,6 @@ fn indent_start(source: &str, at: usize) -> usize {
         line_start
     } else {
         at
-    }
-}
-
-/// The body of the inline module at `path`: the file itself for the root.
-fn container<'t>(root: Node<'t>, source: &str, path: &[Step]) -> Option<Node<'t>> {
-    let mut node = root;
-    for (name, occurrence) in path {
-        let module = children(node)
-            .into_iter()
-            .filter(|c| {
-                c.kind() == "mod_item"
-                    && name_of(*c, source) == name
-                    && !is_test_item(*c, source)
-                    && c.child_by_field_name("body").is_some()
-            })
-            .nth(*occurrence)?;
-        node = module.child_by_field_name("body")?;
-    }
-    Some(node)
-}
-
-/// The byte offset just inside the end of a container: the end of the file, or a module
-/// body's closing brace.
-fn container_end(node: Node, source: &str) -> usize {
-    if node.kind() == "source_file" {
-        source.len()
-    } else {
-        node.end_byte() - 1
     }
 }
 
@@ -940,34 +881,43 @@ fn top_level() {}
     }
 
     #[test]
-    fn removes_imports_of_names_base_lacks() {
-        let source = "use demo::{clamp, double, other as o};\nuse demo::double;\nuse demo::{double};\nuse std::fmt;\n";
+    fn removes_only_the_imports_of_the_paths_base_lacks() {
+        let source = "use demo::{clamp, double, other as o};\nuse demo::double;\nuse demo::{double};\nuse std::fmt;\nuse demo::fixed::double as call;\n";
         assert_eq!(
-            remove_imports(source, &["double"]),
-            "use demo::{clamp, other as o};\nuse std::fmt;\n"
+            remove_imports(source, &["demo::double"]),
+            "use demo::{clamp, other as o};\nuse std::fmt;\nuse demo::fixed::double as call;\n"
         );
         assert_eq!(
-            remove_imports("use demo::{clamp, double};\n", &["double", "clamp"]),
+            remove_imports(
+                "use demo::{clamp, double};\n",
+                &["demo::double", "demo::clamp"]
+            ),
             ""
         );
         assert_eq!(
-            remove_imports("use demo::{n, x, y};\n", &["x", "y"]),
+            remove_imports("use demo::{n, x, y};\n", &["demo::x", "demo::y"]),
             "use demo::{n};\n"
         );
         assert_eq!(
-            remove_imports("use demo::{api::{new_api, n}, m};\n", &["new_api"]),
+            remove_imports(
+                "use demo::{api::{new_api, n}, m};\n",
+                &["demo::api::new_api"]
+            ),
             "use demo::{api::{n}, m};\n"
         );
         assert_eq!(
-            remove_imports("use demo::new_api as renamed;\nfn f() {}\n", &["new_api"]),
+            remove_imports(
+                "use demo::new_api as renamed;\nfn f() {}\n",
+                &["demo::new_api"]
+            ),
             "fn f() {}\n"
         );
         assert_eq!(
             local_names(
-                "use demo::new_api as renamed;\nuse demo::{x::new_api};\n",
-                "new_api"
+                "use demo::new_api as renamed;\nuse demo::{x::new_api};\nuse demo::{new_api};\n",
+                "demo::new_api"
             ),
-            vec!["new_api", "renamed"]
+            vec!["renamed", "new_api"]
         );
     }
 
@@ -1045,6 +995,7 @@ mod gone {
             r#"pub fn add(a: i32, b: i32) -> i32 {
     a - b
 }
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1072,54 +1023,53 @@ mod gone {
 
     #[test]
     fn splices_handle_renames_moves_shells_and_twin_modules() {
-        // A renamed first test: the removal and the insertion share an offset.
-        let base = "#[test]\nfn old() {}\n\npub fn f() {}\n";
-        let head = "#[test]\nfn new() {}\n\npub fn f() {}\n";
-        assert_eq!(
-            splice_tests(base, head).unwrap(),
-            "#[test]\nfn new() {}\n\npub fn f() {}\n"
-        );
-
-        // A test that moved past a second macro definition moves on base too.
-        let base = "macro_rules! v { () => { 1 }; }\n#[test]\nfn t() { assert_eq!(v!(), 2); }\nmacro_rules! v { () => { 2 }; }\n";
-        let head = "macro_rules! v { () => { 1 }; }\nmacro_rules! v { () => { 2 }; }\n#[test]\nfn t() { assert_eq!(v!(), 2); }\n";
-        assert_eq!(
-            splice_tests(base, head).unwrap(),
-            "macro_rules! v { () => { 1 }; }\nmacro_rules! v { () => { 2 }; }\n#[test]\nfn t() { assert_eq!(v!(), 2); }\n"
-        );
-
-        // A new test after an item macro follows it on base.
-        let base = "make_want!();\npub fn f() {}\n";
-        let head = "make_want!();\n#[test]\nfn uses_want() {}\npub fn f() {}\n";
-        assert_eq!(
-            splice_tests(base, head).unwrap(),
-            "make_want!();\n#[test]\nfn uses_want() {}\npub fn f() {}\n"
-        );
-
-        // The same test moved between modules is a change.
-        let base = "mod a {\n    #[test]\n    fn t() {}\n}\nmod b {}\n";
-        let head = "mod a {}\nmod b {\n    #[test]\n    fn t() {}\n}\n";
-        assert_eq!(
-            splice_tests(base, head).unwrap(),
-            "mod a {\n}\nmod b {\n    #[test]\n    fn t() {}\n}\n"
-        );
-
-        // A test in the second of two same-named modules goes into the second.
-        let base = "#[cfg(unix)]\nmod os {}\n#[cfg(windows)]\nmod os {}\n";
-        let head =
-            "#[cfg(unix)]\nmod os {}\n#[cfg(windows)]\nmod os {\n    #[test]\n    fn t() {}\n}\n";
-        assert_eq!(
-            splice_tests(base, head).unwrap(),
-            "#[cfg(unix)]\nmod os {}\n#[cfg(windows)]\nmod os {\n    #[test]\n    fn t() {}\n}\n"
-        );
-
-        // A module base lacks becomes an empty shell around head's tests.
-        let base = "pub fn n() -> i32 {\n    1\n}\n";
-        let head = "pub fn n() -> i32 {\n    1\n}\n\nmod fresh {\n    pub fn new() {}\n\n    #[cfg(test)]\n    mod tests {\n        #[test]\n        fn calls_n() {\n            assert_eq!(crate::n(), 1);\n        }\n    }\n}\n";
-        assert_eq!(
-            splice_tests(base, head).unwrap(),
-            "pub fn n() -> i32 {\n    1\n}\nmod fresh {\n    #[cfg(test)]\n    mod tests {\n        #[test]\n        fn calls_n() {\n            assert_eq!(crate::n(), 1);\n        }\n    }\n}\n"
-        );
+        let cases = [
+            // A renamed test.
+            (
+                "#[test]\nfn old() {}\n\npub fn f() {}\n",
+                "#[test]\nfn new() {}\n\npub fn f() {}\n",
+                "#[test]\nfn new() {}\n\npub fn f() {}\n",
+            ),
+            // A test that moved past a second macro definition moves on base too.
+            (
+                "macro_rules! v { () => { 1 }; }\n#[test]\nfn t() { assert_eq!(v!(), 2); }\nmacro_rules! v { () => { 2 }; }\n",
+                "macro_rules! v { () => { 1 }; }\nmacro_rules! v { () => { 2 }; }\n#[test]\nfn t() { assert_eq!(v!(), 2); }\n",
+                "macro_rules! v { () => { 1 }; }\n\nmacro_rules! v { () => { 2 }; }\n\n#[test]\nfn t() { assert_eq!(v!(), 2); }\n",
+            ),
+            // Test-only macros come from head, in head's order.
+            (
+                "#[cfg(test)]\nmacro_rules! v { () => { 0 }; }\n#[test]\nfn t() { assert_eq!(v!(), 1); }\n#[cfg(test)]\nmacro_rules! v { () => { 1 }; }\n",
+                "#[cfg(test)]\nmacro_rules! v { () => { 0 }; }\n#[cfg(test)]\nmacro_rules! v { () => { 1 }; }\n#[test]\nfn t() { assert_eq!(v!(), 1); }\n",
+                "#[cfg(test)]\nmacro_rules! v { () => { 0 }; }\n\n#[cfg(test)]\nmacro_rules! v { () => { 1 }; }\n\n#[test]\nfn t() { assert_eq!(v!(), 1); }\n",
+            ),
+            // A new test after an item macro follows it.
+            (
+                "make_want!();\npub fn f() {}\n",
+                "make_want!();\n#[test]\nfn uses_want() {}\npub fn f() {}\n",
+                "make_want!();\n\n#[test]\nfn uses_want() {}\n\npub fn f() {}\n",
+            ),
+            // The same test moved between modules.
+            (
+                "mod a {\n    #[test]\n    fn t() {}\n}\nmod b {}\n",
+                "mod a {}\nmod b {\n    #[test]\n    fn t() {}\n}\n",
+                "mod a {\n}\n\nmod b {\n    #[test]\n    fn t() {}\n}\n",
+            ),
+            // A test in the second of two same-named modules.
+            (
+                "#[cfg(unix)]\nmod os {}\n#[cfg(windows)]\nmod os {}\n",
+                "#[cfg(unix)]\nmod os {}\n#[cfg(windows)]\nmod os {\n    #[test]\n    fn t() {}\n}\n",
+                "#[cfg(unix)]\nmod os {\n}\n\n#[cfg(windows)]\nmod os {\n    #[test]\n    fn t() {}\n}\n",
+            ),
+            // A module base lacks keeps only its tests.
+            (
+                "pub fn n() -> i32 {\n    1\n}\n",
+                "pub fn n() -> i32 {\n    1\n}\n\nmod fresh {\n    pub fn new() {}\n\n    #[cfg(test)]\n    mod tests {\n        #[test]\n        fn calls_n() {\n            assert_eq!(crate::n(), 1);\n        }\n    }\n}\n",
+                "pub fn n() -> i32 {\n    1\n}\n\nmod fresh {\n    #[cfg(test)]\n    mod tests {\n        #[test]\n        fn calls_n() {\n            assert_eq!(crate::n(), 1);\n        }\n    }\n}\n",
+            ),
+        ];
+        for (base, head, expected) in cases {
+            assert_eq!(splice_tests(base, head).unwrap(), expected, "{head}");
+        }
     }
 
     #[test]
@@ -1169,6 +1119,7 @@ pub fn f() {}
             r#"#![allow(unused)]
 #[test]
 fn leading() {}
+
 macro_rules! value {
     () => { 1 };
 }
@@ -1177,6 +1128,7 @@ macro_rules! value {
 fn uses_first() {
     assert_eq!(value!(), 1, "the first definition");
 }
+
 #[test]
 fn also_first() {
     assert_eq!(value!(), 1);

@@ -307,8 +307,7 @@ fn workspace_member(workspace_dir: &Path, workspace_rel: &str, rel: &str) -> boo
     let Some(inner) = inner else {
         return false;
     };
-    let command = ["cargo".to_string(), "test".to_string()];
-    crate::runner::cargo::targets::index(&command, workspace_dir)
+    crate::runner::cargo::targets::index(workspace_dir)
         .members
         .iter()
         .any(|m| m == inner)

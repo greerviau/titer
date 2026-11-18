@@ -265,8 +265,8 @@ fn run_base(
 
 /// The selected tests that compile errors fall in, each with its first error. An error
 /// inside a test blames that test. An error outside every test, such as in a `use`, blames
-/// the tests in its file that name what it reports missing; such names also come back by
-/// file, so the import can go with the tests.
+/// the tests in its file that name what it reports missing; the paths of unresolved
+/// imports also come back by file, so the import can go with the tests.
 #[allow(clippy::type_complexity)]
 fn blame(
     errors: &[CompileError],
@@ -302,22 +302,28 @@ fn blame(
                     .iter()
                     .find(|d| d.report_line == case.line)
                     .map_or("", |d| &head_text[d.start_byte..d.end_byte]);
-                errors.iter().find(|e| {
+                errors.iter().find_map(|e| {
                     let outside = !defs.iter().any(|d| (d.line..=d.end_line).contains(&e.line));
-                    // The test may call the name through an alias its file imports it as.
-                    outside
-                        && missing_name(&e.message).is_some_and(|n| {
-                            lang::rust::local_names(&head_text, &n)
-                                .iter()
-                                .any(|local| mentions(text, local))
-                        })
+                    if !outside {
+                        return None;
+                    }
+                    // An unresolved import names a path; the test uses it by the name or
+                    // alias the file imports it as.
+                    let (locals, import) = match unresolved_import(&e.message) {
+                        Some(path) => (lang::rust::local_names(&head_text, &path), Some(path)),
+                        None => (missing_name(&e.message).into_iter().collect(), None),
+                    };
+                    locals
+                        .iter()
+                        .any(|local| mentions(text, local))
+                        .then_some((e, import))
                 })
             };
             if let Some(error) = inside {
                 out.push((case.clone(), error.message.clone()));
-            } else if let Some(error) = named() {
+            } else if let Some((error, import)) = named() {
                 out.push((case.clone(), error.message.clone()));
-                names.extend(missing_name(&error.message).map(|n| (file.to_string(), n)));
+                names.extend(import.map(|path| (file.to_string(), path)));
             }
         }
     }
@@ -336,6 +342,15 @@ fn missing_name(message: &str) -> Option<String> {
         .take_while(|c| c.is_alphanumeric() || *c == '_')
         .collect();
     (!name.is_empty()).then_some(name)
+}
+
+/// The path an `unresolved import` error names, such as `demo::new_api`.
+fn unresolved_import(message: &str) -> Option<String> {
+    if !message.contains("unresolved import") {
+        return None;
+    }
+    let quoted = BACKTICKED.captures(message)?.get(1)?.as_str();
+    Some(quoted.trim_start_matches("::").to_string())
 }
 
 fn mentions(text: &str, name: &str) -> bool {

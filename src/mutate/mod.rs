@@ -469,7 +469,7 @@ fn error_result(e: anyhow::Error) -> JobResult {
 }
 
 /// Killed when a selected test fails or the mutant breaks a selected file's import; survived
-/// when a selected test passed, none failed, and every selected target built; no result
+/// when every selected test ran and passed and every selected target built; no result
 /// otherwise. A target that does not build ran none of its tests, so a pass elsewhere is
 /// not a survivor.
 pub fn classify(run: &TestRun, plan: &Plan, cwd: &str) -> (MutantOutcome, Option<String>) {
@@ -499,7 +499,9 @@ pub fn classify(run: &TestRun, plan: &Plan, cwd: &str) -> (MutantOutcome, Option
                     Some(e.file.trim_start_matches("./").to_string()),
                 );
             }
-            if results.iter().any(|(_, r)| *r == CaseResult::Passed) && !run.incomplete {
+            // Every selected test must run and pass: a mutant that hides a test, for
+            // example by turning off its cfg, has not shown that the tests miss it.
+            if results.iter().all(|(_, r)| *r == CaseResult::Passed) && !run.incomplete {
                 return (MutantOutcome::Survived, None);
             }
         }

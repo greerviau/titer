@@ -267,7 +267,7 @@ static TS_MODIFIER: LazyLock<Regex> =
 fn markers(lang: Lang, test: &Test) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     if lang == Lang::Rust {
-        if test.def.skip {
+        if test.def.skip || RS_CONDITIONAL_IGNORE.is_match(test.text) {
             out.insert("#[ignore]".to_string());
         }
         return out;
@@ -312,6 +312,9 @@ static TS_ASSERT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\bexpect(\.soft)?\(|\bassert(\.\w+)?\(|\bexpectTypeOf\(").unwrap()
 });
 
+/// `#[cfg_attr(condition, ignore)]`, which ignores the test where the condition holds.
+static RS_CONDITIONAL_IGNORE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"#\s*\[\s*cfg_attr\s*\([^\]]*\bignore\b").unwrap());
 static RS_ASSERT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(?:debug_|prop_)?assert(?:_\w+)?!|#\[should_panic").unwrap());
 
@@ -679,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flaky"]
+    #[cfg_attr(unix, ignore = "flaky")]
     fn ignore_me() {
         assert_eq!(f(1), 1);
     }
