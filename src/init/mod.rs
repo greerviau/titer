@@ -121,28 +121,39 @@ fn refuse_symlinks(root: &Path, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The skill's run instructions: one line per manifest that pins titer.
+/// The skill's run instructions: one command for one check of the whole repo, from the
+/// first manifest that pins titer. Every pin runs the same check, so listing each one only
+/// invites an agent to run it several times.
 fn run_commands(root: &Path, plan: &Plan) -> String {
-    let mut lines = Vec::new();
-    for (path, _) in &plan.writes {
-        let (Some(name), Some(dir)) = (path.file_name(), path.parent()) else {
-            continue;
-        };
-        let command = match name.to_str() {
-            Some("package.json") => "npx titer check --json",
-            Some("pyproject.toml") => "uv run titer check --json",
-            _ => continue,
-        };
-        let place = match rel_dir(root, dir).as_str() {
-            "." => "from the repo root".to_string(),
-            d => format!("from `{d}/`, where titer is pinned (it still checks the whole repo)"),
-        };
-        lines.push(format!("- `{command}` {place}"));
+    let pins: Vec<(&str, String)> = plan
+        .writes
+        .iter()
+        .filter_map(|(path, _)| {
+            let command = match path.file_name()?.to_str()? {
+                "package.json" => "npx titer check --json",
+                "pyproject.toml" => "uv run titer check --json",
+                _ => return None,
+            };
+            Some((command, rel_dir(root, path.parent()?)))
+        })
+        .collect();
+    let Some((command, dir)) = pins.first() else {
+        return "- `titer check --json` from the repo root".to_string();
+    };
+    let mut text = match dir.as_str() {
+        "." => format!("- `{command}` from the repo root"),
+        d => format!("- `{command}` from `{d}/`, where titer is pinned"),
+    };
+    if pins.len() > 1 {
+        let others: Vec<String> = pins[1..].iter().map(|(_, d)| format!("`{d}/`")).collect();
+        text.push_str(&format!(
+            "\n\ntiter is also pinned in {}. Each pin runs the same check of the whole repo, so run it once, from any one of them.",
+            others.join(", ")
+        ));
+    } else if dir != "." {
+        text.push_str(" (it still checks the whole repo)");
     }
-    if lines.is_empty() {
-        lines.push("- `titer check --json` from the repo root".to_string());
-    }
-    lines.join("\n")
+    text
 }
 
 /// The titer version stamped in each copy of the repo skill; None for a missing copy.

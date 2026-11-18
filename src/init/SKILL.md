@@ -15,7 +15,9 @@ Run the version the repo pins:
 
 {run}
 
-titer compares the working tree, including untracked files, with the merge-base of `--base` (default: the remote default branch). It never modifies the checkout. A typical run takes under 2 minutes; `--budget 60s` makes it shorter.
+titer compares the working tree, including untracked files, with the merge-base of `--base` (default: the remote default branch). It never modifies the checkout.
+
+`--budget 60s` caps the time spent on mutation only. The head and base test runs keep their own timeouts, so a slow test suite stays slow. To skip mutation, pass `--only scan,prove`.
 
 ## Exit codes
 
@@ -42,7 +44,7 @@ titer compares the working tree, including untracked files, with the merge-base 
 
 `findings` lists weakened tests: `test_deleted`, `assertion_removed`, `skip_added`, `matcher_loosened`, and `snapshot_changed`. Each one needs a reason in the PR, or a revert.
 
-`crap` scores each changed function by complexity and coverage. It is informational.
+`crap` scores each changed function by complexity and coverage. A score needs a coverage source, `--coverage FILE` or `[crap] coverage_command` in `titer.toml`; without one, `crap` reports complexity only, and `coverage` and `score` are null. It is informational.
 
 ## Triage survivors
 

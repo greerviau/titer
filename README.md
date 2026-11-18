@@ -89,7 +89,7 @@ Common options:
 
 - `--base REF` sets the base ref.
 - `--only scan,prove` runs only some tiers.
-- `--budget 60s` limits how long the whole check runs.
+- `--budget 60s` limits the time spent on mutation. The head and base test runs keep their own timeouts.
 
 ## Run in CI
 

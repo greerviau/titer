@@ -259,7 +259,7 @@ pub struct GateConfig {
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MutateConfig {
-    /// The time budget for a whole check, for example "120s".
+    /// The time budget for mutation, for example "120s".
     #[serde(default = "default_budget", with = "humantime_serde_compat")]
     pub budget: Duration,
     #[serde(default)]

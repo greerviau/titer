@@ -159,6 +159,7 @@ fn a_second_init_refuses_and_update_restamps_the_skill() {
             text.contains(&format!("<!-- titer-version: {VERSION} -->")),
             "{path}"
         );
+        assert!(text.contains("`--only scan,prove`"), "{path}");
     }
 }
 
@@ -210,14 +211,40 @@ fn runner_names_stay_unique_and_the_skill_runs_from_the_pinned_dir() {
         "{config}"
     );
     let skill = std::fs::read_to_string(repo.path().join(".claude/skills/titer/SKILL.md")).unwrap();
+    let run = skill_section(&skill, "## Run");
+    assert_eq!(run.matches("titer check --json").count(), 1, "{run}");
     assert!(
-        skill.contains("- `npx titer check --json` from `web/app/`"),
-        "{skill}"
+        run.contains("`uv run titer check --json` from `api/app/`"),
+        "{run}"
     );
-    assert!(
-        skill.contains("- `uv run titer check --json` from `api/app/`"),
-        "{skill}"
-    );
+    assert!(run.contains("`web/app/`"), "{run}");
+    assert!(run.contains("same check"), "{run}");
+}
+
+/// The text of one `## ` section of the skill, without the next section.
+fn skill_section<'a>(skill: &'a str, heading: &str) -> &'a str {
+    let start = skill
+        .find(heading)
+        .unwrap_or_else(|| panic!("no {heading}: {skill}"));
+    let rest = &skill[start + heading.len()..];
+    &rest[..rest.find("\n## ").unwrap_or(rest.len())]
+}
+
+#[test]
+fn the_skill_says_what_budget_limits_and_when_crap_has_scores() {
+    let repo = monorepo();
+
+    assert_eq!(repo.titer(&["init"]).status.code(), Some(0));
+
+    let skill = std::fs::read_to_string(repo.path().join(".claude/skills/titer/SKILL.md")).unwrap();
+    let run = skill_section(&skill, "## Run");
+    assert!(run.contains("`--budget"), "{run}");
+    assert!(run.contains("mutation"), "{run}");
+    assert!(run.contains("`--only scan,prove`"), "{run}");
+    assert!(!run.contains("makes it shorter"), "{run}");
+    let report = skill_section(&skill, "## Read the report");
+    assert!(report.contains("`--coverage"), "{report}");
+    assert!(report.contains("complexity only"), "{report}");
 }
 
 #[test]
