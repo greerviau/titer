@@ -1,6 +1,6 @@
 # Coding standards
 
-These rules apply to every change in this repo, in addition to `docs/UBIQUITOUS-LANGUAGE.md`.
+These rules apply to every change in this repo, in addition to `GLOSSARY.md`.
 
 ## Safety
 

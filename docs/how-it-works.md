@@ -2,7 +2,7 @@
 
 `titer check` answers one question about a diff: do the tests in this change test the change? It cannot show that the change is correct. A test that fails on base detects a difference from base, and a reviewer still checks that the difference is the intended one.
 
-[Ubiquitous language](UBIQUITOUS-LANGUAGE.md) defines the terms on this page.
+The [glossary](../GLOSSARY.md) defines the terms on this page.
 
 ## Head, base, and worktrees
 

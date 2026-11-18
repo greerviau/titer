@@ -1,4 +1,4 @@
-# Ubiquitous language
+# Glossary
 
 Code, docs, the report, and the repo skill use these terms with these meanings.
 
