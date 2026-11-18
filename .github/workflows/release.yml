@@ -7,12 +7,28 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
 
 permissions:
   contents: read
 
 jobs:
+  version:
+    # The tag must name the version in Cargo.toml, which every registry publishes.
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: check
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   tokens:
     runs-on: ubuntu-latest
     outputs:
@@ -31,6 +47,7 @@ jobs:
           echo "crates=${CARGO_REGISTRY_TOKEN:+true}" >> "$GITHUB_OUTPUT"
 
   binaries:
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -60,6 +77,7 @@ jobs:
           path: out/
 
   wheels:
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -114,7 +132,7 @@ jobs:
             --generate-notes *.tar.gz *.whl SHA256SUMS
 
   npm:
-    needs: [tokens, binaries, github]
+    needs: [version, tokens, binaries, github]
     if: needs.tokens.outputs.npm == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -132,10 +150,10 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          scripts/npm-packages.py "$version" bins npm-out
-          for pkg in npm-out/titer-*; do npm publish --access public "$pkg"; done
-          npm publish --access public npm-out/titer
+          scripts/npm-packages.py "${{ needs.version.outputs.version }}" bins npm-out
+          # A ./ prefix keeps npm from reading owner/name paths as GitHub specs.
+          for pkg in ./npm-out/titer-*; do npm publish --access public "$pkg"; done
+          npm publish --access public ./npm-out/titer
 
   pypi:
     needs: [tokens, wheels, sdist, github]
@@ -161,8 +179,8 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  verify:
-    needs: [npm, pypi]
+  verify-npm:
+    needs: [version, npm]
     strategy:
       fail-fast: false
       matrix:
@@ -172,12 +190,29 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-      - uses: astral-sh/setup-uv@v7
-      - name: npx and uvx run the published version
+      - name: npx runs the published version
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${{ needs.version.outputs.version }}"
           for attempt in 1 2 3 4 5 6; do
-            if npx -y "titer@$version" --version && uvx --no-cache "titer@$version" --version; then exit 0; fi
+            if npx -y "titer@$version" --version | grep -qx "titer $version"; then exit 0; fi
+            sleep 30
+          done
+          exit 1
+
+  verify-pypi:
+    needs: [version, pypi]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: astral-sh/setup-uv@v7
+      - name: uvx runs the published version
+        run: |
+          version="${{ needs.version.outputs.version }}"
+          for attempt in 1 2 3 4 5 6; do
+            if uvx --no-cache "titer@$version" --version | grep -qx "titer $version"; then exit 0; fi
             sleep 30
           done
           exit 1
