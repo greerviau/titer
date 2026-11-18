@@ -124,7 +124,7 @@ The Action runs the titer version your repo pins, writes a job summary, annotate
 - [Configuration](docs/configuration.md): every `titer.toml` setting.
 - [CLI reference](docs/cli.md): commands, options, exit codes, agent mutants, and the JSON report.
 - [GitHub Action](docs/github-action.md): inputs, outputs, job summary, annotations, and PR comments.
-- [Ubiquitous language](docs/UBIQUITOUS-LANGUAGE.md): the terms titer uses and what they mean.
+- [Glossary](GLOSSARY.md): the terms titer uses and what they mean.
 
 ## License
 
