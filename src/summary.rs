@@ -14,13 +14,27 @@ pub const COMMENT_MARKER: &str = "<!-- titer-report -->";
 const SHOWN: usize = 10;
 
 /// A Markdown summary. With `link_base`, such as
-/// `https://github.com/owner/repo/blob/<sha>`, file locations link to that commit.
-pub fn markdown(report: &Report, link_base: Option<&str>) -> String {
+/// `https://github.com/owner/repo/blob/<sha>`, file locations link to that commit. With
+/// `commit`, the heading names the commit checked, and a hidden marker records it so the
+/// Action can tell one commit's comment from another's.
+pub fn markdown(report: &Report, link_base: Option<&str>, commit: Option<&str>) -> String {
     let link = |file: &str, line: u32| location(file, line, link_base);
     let mut out = String::new();
     let _ = writeln!(out, "{COMMENT_MARKER}");
+    let commit = commit.filter(|c| c.chars().all(|ch| ch.is_ascii_hexdigit()) && !c.is_empty());
+    if let Some(sha) = commit {
+        let _ = writeln!(out, "<!-- titer-commit: {sha} -->");
+    }
     let (title, sentence) = headline(report);
-    let _ = writeln!(out, "### titer: {title}\n\n{sentence}\n");
+    match commit {
+        Some(sha) => {
+            let short = &sha[..sha.len().min(7)];
+            let _ = writeln!(out, "### titer: {title} for `{short}`\n\n{sentence}\n");
+        }
+        None => {
+            let _ = writeln!(out, "### titer: {title}\n\n{sentence}\n");
+        }
+    }
 
     if report.gate.status == GateStatus::Error {
         for reason in &report.gate.reasons {
@@ -608,7 +622,7 @@ mod tests {
 
     #[test]
     fn markdown_leads_with_the_verdict_and_links_locations() {
-        let text = markdown(&report(), Some("https://github.com/o/r/blob/abc"));
+        let text = markdown(&report(), Some("https://github.com/o/r/blob/abc"), None);
         assert!(text.starts_with(COMMENT_MARKER), "{text}");
         assert!(text.contains("### titer: proven\n\n1 changed test fails on the base code, so it would have caught the bug."), "{text}");
         assert!(
@@ -656,7 +670,7 @@ mod tests {
         let mut r = report();
         r.tests[0].verdict = Some(Verdict::PassesOnBase);
         r.gate = crate::report::Gate::fail(vec!["unproven change: ...".into()]);
-        let text = markdown(&r, None);
+        let text = markdown(&r, None, None);
         assert!(
             text.contains("### titer: unproven\n\nNo changed test fails on the base code"),
             "{text}"
@@ -665,11 +679,22 @@ mod tests {
     }
 
     #[test]
+    fn the_heading_and_a_hidden_marker_name_the_commit() {
+        let text = markdown(&report(), None, Some("4b986aa0123456789"));
+        assert!(text.starts_with("<!-- titer-report -->\n<!-- titer-commit: 4b986aa0123456789 -->\n### titer: proven for `4b986aa`\n"), "{text}");
+        let unsafe_commit = markdown(&report(), None, Some("--> <b>"));
+        assert!(
+            !unsafe_commit.contains("titer-commit") && !unsafe_commit.contains("<b>"),
+            "{unsafe_commit}"
+        );
+    }
+
+    #[test]
     fn odd_paths_and_source_render_exactly() {
         let mut r = report();
         r.mutants[2].file = "sub dir/a|b`.ts".into();
         r.mutants[2].original = "a || `x`".into();
-        let text = markdown(&r, Some("https://h/blob/s"));
+        let text = markdown(&r, Some("https://h/blob/s"), None);
         assert!(
             text.contains("- [sub dir/a\\|b\\`.ts:2](https://h/blob/s/sub%20dir/a%7Cb%60.ts#L2): `` a || `x` `` to `>=`"),
             "{text}"
@@ -681,7 +706,7 @@ mod tests {
     fn deleted_tests_point_at_base_and_get_no_annotation() {
         let mut r = report();
         r.findings[0].kind = FindingKind::TestDeleted;
-        let text = markdown(&r, Some("https://h/blob/s"));
+        let text = markdown(&r, Some("https://h/blob/s"), None);
         assert!(
             text.contains("- tests/test\\_app.py:10 (in base) test deleted"),
             "{text}"
@@ -697,13 +722,13 @@ mod tests {
             "1 scan finding(s) (gate.fail_on_scan)".into(),
         ]);
         assert!(
-            markdown(&r, None)
+            markdown(&r, None, None)
                 .contains("The gate also failed on: 1 scan finding(s) (gate.fail\\_on\\_scan).")
         );
         let mut scan_only = Report::new();
         scan_only.tiers = vec![Tier::Scan];
         assert!(
-            markdown(&scan_only, None).contains(
+            markdown(&scan_only, None, None).contains(
                 "Only scan ran, so nothing here says whether the tests prove the change."
             )
         );

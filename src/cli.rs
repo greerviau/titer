@@ -78,6 +78,9 @@ struct CheckArgs {
     /// https://github.com/owner/repo/blob/<sha>.
     #[arg(long, requires = "markdown")]
     link_base: Option<String>,
+    /// The commit the Markdown summary describes, named in its heading.
+    #[arg(long, requires = "markdown")]
+    commit: Option<String>,
     /// Also write GitHub workflow commands that annotate the diff to this file.
     #[arg(long)]
     annotations: Option<PathBuf>,
@@ -176,7 +179,7 @@ fn run_check(args: CheckArgs) -> u8 {
     let outputs = [
         (
             &args.markdown,
-            crate::summary::markdown(&report, args.link_base.as_deref()),
+            crate::summary::markdown(&report, args.link_base.as_deref(), args.commit.as_deref()),
         ),
         (&args.annotations, crate::summary::annotations(&report)),
     ];
