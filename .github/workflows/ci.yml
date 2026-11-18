@@ -49,3 +49,38 @@ jobs:
       - name: Fixture runners
         run: scripts/setup-fixture-deps.sh
       - run: cargo test --all-targets
+
+  package:
+    # Builds the npm packages and the wheel for this platform and runs them through npx
+    # and uvx, the way users install titer.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, npm: linux-x64 }
+          - { os: macos-latest, npm: darwin-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: cargo build --release --locked
+      - name: npx titer --version
+        run: |
+          work="$RUNNER_TEMP/npm"
+          mkdir -p "$work/bins" "$work/consumer"
+          cp target/release/titer "$work/bins/titer-${{ matrix.npm }}"
+          scripts/npm-packages.py 0.0.0-ci "$work/bins" "$work/pkgs"
+          (cd "$work/pkgs/titer-${{ matrix.npm }}" && npm pack --pack-destination "$work")
+          (cd "$work/pkgs/titer" && npm pack --pack-destination "$work")
+          cd "$work/consumer" && npm init -y >/dev/null
+          npm install --no-audit --no-fund "$work"/titer-${{ matrix.npm }}-0.0.0-ci.tgz "$work"/titer-0.0.0-ci.tgz
+          npx titer --version
+      - name: uvx titer --version
+        run: |
+          uvx --from 'maturin>=1.9,<2' maturin build --release --locked --out "$RUNNER_TEMP/wheels"
+          uvx --no-cache --from "$(ls "$RUNNER_TEMP"/wheels/*.whl)" titer --version
