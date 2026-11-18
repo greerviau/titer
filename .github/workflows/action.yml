@@ -28,6 +28,7 @@ jobs:
             scripts/action-fixture.sh "$RUNNER_TEMP/$mode" "$PWD/target/release/titer" "$mode" "$RUNNER_TEMP/venv/bin/python"
           done
       - name: A proven change passes
+        id: proven
         uses: ./
         with:
           working-directory: ${{ runner.temp }}/proven
@@ -41,9 +42,13 @@ jobs:
           working-directory: ${{ runner.temp }}/unproven
           base: main
           command: ${{ github.workspace }}/target/release/titer
-      - name: The unproven run failed with exit 1
+      - name: The unproven run failed with exit 1, and both summaries say why
         env:
           OUTCOME: ${{ steps.unproven.outcome }}
           CODE: ${{ steps.unproven.outputs.exit-code }}
+          PROVEN_SUMMARY: ${{ steps.proven.outputs.summary }}
+          UNPROVEN_SUMMARY: ${{ steps.unproven.outputs.summary }}
         run: |
           test "$OUTCOME" = failure && test "$CODE" = 1
+          grep -q '^### titer: proven$' "$PROVEN_SUMMARY"
+          grep -q '^### titer: unproven$' "$UNPROVEN_SUMMARY"

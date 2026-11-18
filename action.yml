@@ -17,6 +17,20 @@ inputs:
     description: The repo root, where titer.toml lives.
     required: false
     default: "."
+  annotations:
+    description: Annotate survivors, weakened tests, and lines no test runs in the pull request's diff.
+    required: false
+    default: "true"
+  comment:
+    description: >-
+      Post the summary as a pull request comment and update that one comment on later runs.
+      Needs `pull-requests: write`.
+    required: false
+    default: "false"
+  github-token:
+    description: The token that posts the comment.
+    required: false
+    default: ${{ github.token }}
   command:
     description: >-
       The command that runs titer. Defaults to the pinned version: `npx --no-install titer`
@@ -31,6 +45,9 @@ outputs:
   report:
     description: The path of the JSON report.
     value: ${{ steps.check.outputs.report }}
+  summary:
+    description: The path of the Markdown summary.
+    value: ${{ steps.check.outputs.summary }}
 
 runs:
   using: composite
@@ -42,6 +59,8 @@ runs:
         TITER_BASE: ${{ inputs.base || (github.base_ref && format('origin/{0}', github.base_ref)) || '' }}
         TITER_ARGS: ${{ inputs.args }}
         TITER_COMMAND: ${{ inputs.command }}
+        TITER_ANNOTATIONS: ${{ inputs.annotations }}
+        TITER_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       run: |
         set -u
         # Finds the dir whose manifest pins titer: the repo root, then each runner cwd.
@@ -75,8 +94,9 @@ runs:
         fi
         report=$(mktemp "$RUNNER_TEMP/titer-report.XXXXXX")
         summary=$(mktemp "$RUNNER_TEMP/titer-summary.XXXXXX")
-        args=()
-        [ -n "$TITER_BASE" ] && args=(--base "$TITER_BASE")
+        annotations=$(mktemp "$RUNNER_TEMP/titer-annotations.XXXXXX")
+        args=(--link-base "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$TITER_HEAD_SHA" --annotations "$annotations")
+        [ -n "$TITER_BASE" ] && args+=(--base "$TITER_BASE")
         # Quotes in the args input group words, as in a shell.
         eval "extra=($TITER_ARGS)"
         args+=("${extra[@]}")
@@ -85,10 +105,37 @@ runs:
         code=$?
         set -e
         [ -s "$summary" ] && cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+        # Workflow commands on stdout become annotations on the diff.
+        [ "$TITER_ANNOTATIONS" = true ] && [ -s "$annotations" ] && cat "$annotations"
         echo "exit-code=$code" >> "$GITHUB_OUTPUT"
         echo "report=$report" >> "$GITHUB_OUTPUT"
+        echo "summary=$summary" >> "$GITHUB_OUTPUT"
+        if [ "$code" != 0 ] && [ "$code" != 1 ] && [ ! -s "$summary" ]; then
+          printf '<!-- titer-report -->\n### titer: could not run\n\ntiter exited %s before writing a summary. See the job log.\n' "$code" > "$summary"
+        fi
         case "$code" in
           0) ;;
           1) echo "::error::titer: the change's tests do not prove the change"; exit 1 ;;
           *) echo "::error::titer could not run the check (exit $code)"; exit "$code" ;;
         esac
+    - name: Comment
+      if: always() && inputs.comment == 'true' && github.event_name == 'pull_request' && steps.check.outputs.summary != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        SUMMARY: ${{ steps.check.outputs.summary }}
+      run: |
+        set -u
+        # One comment per pull request, found by its marker and updated in place.
+        body=$(mktemp "$RUNNER_TEMP/titer-comment.XXXXXX")
+        head -c 65000 "$SUMMARY" > "$body"
+        existing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+          --jq '.[] | select(.body | startswith("<!-- titer-report -->")) | .id' | head -1) || existing=""
+        if [ -n "$existing" ]; then
+          gh api --silent -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" -F "body=@$body" \
+            || echo "::warning::titer could not update its comment; the workflow needs pull-requests: write"
+        else
+          gh api --silent "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F "body=@$body" \
+            || echo "::warning::titer could not post its comment; the workflow needs pull-requests: write"
+        fi

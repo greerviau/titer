@@ -19,6 +19,7 @@ pub mod report;
 pub mod runner;
 pub mod scan;
 pub mod session;
+pub mod summary;
 pub mod tmp;
 pub mod worktree;
 pub mod xml;
