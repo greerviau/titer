@@ -14,7 +14,7 @@ use crate::runner::Runner;
 use crate::session::Session;
 
 pub fn scan(session: &Session, runners: &[Runner]) -> anyhow::Result<Vec<Finding>> {
-    let classifier = Classifier::new(runners)?;
+    let classifier = Classifier::in_checkout(runners, session.git.root())?;
     let mut findings = Vec::new();
     for change in &session.changes.files {
         let path = change.path();
@@ -49,12 +49,27 @@ pub fn scan(session: &Session, runners: &[Runner]) -> anyhow::Result<Vec<Finding
         }
         let old_path = change.old_path.as_deref();
         let new_path = change.new_path.as_deref();
-        // A test file renamed to a name the runner does not collect loses its tests.
-        let is_test = |p: &str| matches!(classifier.role(p), Role::Test { .. });
+        // A test file renamed to a name the runner does not collect loses its tests. A Rust
+        // source file holds its own unit tests.
+        let is_test = |p: &str| {
+            matches!(
+                classifier.role(p),
+                Role::Test { .. }
+                    | Role::Source {
+                        lang: Lang::Rust,
+                        ..
+                    }
+            )
+        };
         let new_is_test = new_path.is_some_and(is_test);
         let role_path = if new_is_test { new_path } else { old_path }.unwrap_or_default();
-        let Role::Test { runner } = classifier.role(role_path) else {
-            continue;
+        let runner = match classifier.role(role_path) {
+            Role::Test { runner }
+            | Role::Source {
+                runner,
+                lang: Lang::Rust,
+            } => runner,
+            _ => continue,
         };
         let new_path = new_path.filter(|_| new_is_test);
         let Some(lang) = Lang::of(role_path) else {
@@ -193,7 +208,7 @@ pub fn compare(
                 format!("replaces {} with {}", lost.join(", "), gained.join(", ")),
             ));
         }
-        if inline_snapshots(old.text) != inline_snapshots(new.text) {
+        if inline_snapshots(lang, old.text) != inline_snapshots(lang, new.text) {
             findings.push(at(
                 FindingKind::SnapshotChanged,
                 "an inline snapshot changed; check that the new output is intended".to_string(),
@@ -230,13 +245,13 @@ static TS_SUITE_ONLY: LazyLock<Regex> =
 
 /// Markers that act on a whole file or suite rather than on one test.
 fn file_markers(lang: Lang) -> Vec<(&'static Regex, &'static str)> {
-    if lang.is_python() {
-        vec![(&PY_PYTESTMARK, "a module-level pytestmark skip or xfail")]
-    } else {
-        vec![(
+    match lang {
+        Lang::Python => vec![(&PY_PYTESTMARK, "a module-level pytestmark skip or xfail")],
+        Lang::TypeScript | Lang::Tsx => vec![(
             &TS_SUITE_ONLY,
             "describe.only, which skips every other suite in the file",
-        )]
+        )],
+        Lang::Rust => Vec::new(),
     }
 }
 
@@ -248,9 +263,15 @@ static PY_SKIP_CALL: LazyLock<Regex> =
 static TS_MODIFIER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*[\w$]+((?:\s*\.\s*[\w$]+)*)").unwrap());
 
-/// Skip, xfail, only, and todo markers on a test.
+/// Skip, xfail, only, todo, and ignore markers on a test.
 fn markers(lang: Lang, test: &Test) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
+    if lang == Lang::Rust {
+        if test.def.skip || RS_CONDITIONAL_IGNORE.is_match(test.text) {
+            out.insert("#[ignore]".to_string());
+        }
+        return out;
+    }
     if lang.is_python() {
         for caps in PY_SKIP_DECORATOR.captures_iter(test.text) {
             out.insert(caps[1].to_lowercase().replace("expectedfailure", "xfail"));
@@ -291,13 +312,20 @@ static TS_ASSERT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\bexpect(\.soft)?\(|\bassert(\.\w+)?\(|\bexpectTypeOf\(").unwrap()
 });
 
+/// `#[cfg_attr(condition, ignore)]`, which ignores the test where the condition holds.
+static RS_CONDITIONAL_IGNORE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"#\s*\[\s*cfg_attr\s*\([^\]]*\bignore\b").unwrap());
+static RS_ASSERT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:debug_|prop_)?assert(?:_\w+)?!|#\[should_panic").unwrap());
+
 fn assertions(lang: Lang, text: &str) -> usize {
-    let text = strip_comments(lang, text);
-    if lang.is_python() {
-        PY_ASSERT.find_iter(&text).count()
-    } else {
-        TS_ASSERT.find_iter(&text).count()
-    }
+    let text = code_of(lang, text);
+    let re = match lang {
+        Lang::Python => &PY_ASSERT,
+        Lang::TypeScript | Lang::Tsx => &TS_ASSERT,
+        Lang::Rust => &RS_ASSERT,
+    };
+    re.find_iter(&text).count()
 }
 
 static PY_ASSERT_METHOD: LazyLock<Regex> =
@@ -306,12 +334,17 @@ static PY_PLAIN_ASSERT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^\s*assert\s+(.*)$").unwrap());
 static PY_COMPARISON: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"==|!=|<=|>=|<|>|\bin\b|\bis\b").unwrap());
+static RS_ASSERT_MACRO: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)\b(?:debug_|prop_)?(assert(?:_\w+)?)!\s*[(\[{](.*)$").unwrap()
+});
+static RS_COMPARISON: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"==|!=|<=|>=|\s<\s|\s>\s").unwrap());
 static TS_MATCHER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\.(?:not\.|resolves\.|rejects\.)*(to[A-Z]\w*)\(").unwrap());
 
 /// Matcher names and how often each occurs.
 fn matchers(lang: Lang, text: &str) -> BTreeMap<String, usize> {
-    let text = strip_comments(lang, text);
+    let text = code_of(lang, text);
     let mut out: BTreeMap<String, usize> = BTreeMap::new();
     if lang.is_python() {
         for caps in PY_ASSERT_METHOD.captures_iter(&text) {
@@ -322,6 +355,15 @@ fn matchers(lang: Lang, text: &str) -> BTreeMap<String, usize> {
                 "assert_compare"
             } else {
                 "assert_bare"
+            };
+            *out.entry(kind.to_string()).or_default() += 1;
+        }
+    } else if lang == Lang::Rust {
+        for caps in RS_ASSERT_MACRO.captures_iter(&text) {
+            let kind = match &caps[1] {
+                "assert" if RS_COMPARISON.is_match(&caps[2]) => "assert_compare",
+                "assert" => "assert_bare",
+                other => other,
             };
             *out.entry(kind.to_string()).or_default() += 1;
         }
@@ -382,6 +424,14 @@ fn is_strong(matcher: &str) -> bool {
             | "assert_any_call"
             | "assert_has_calls"
             | "assert_compare"
+            | "assert_eq"
+            | "assert_ne"
+            | "assert_matches"
+            | "assert_snapshot"
+            | "assert_debug_snapshot"
+            | "assert_display_snapshot"
+            | "assert_json_snapshot"
+            | "assert_yaml_snapshot"
     )
 }
 
@@ -413,14 +463,69 @@ static INLINE_SNAPSHOT: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// insta's inline snapshots: `@"..."`, or a raw string such as `@r#"..."#`.
+static RS_INLINE_SNAPSHOT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r##"(?s)@(r#*".*?"#*|"(?:[^"\\]|\\.)*")"##).unwrap());
+
 /// The inline snapshot arguments, read as whole string or template literals, outside
 /// comments.
-fn inline_snapshots(text: &str) -> Vec<String> {
-    let text = strip_comments(Lang::TypeScript, text);
-    INLINE_SNAPSHOT
-        .captures_iter(&text)
+fn inline_snapshots(lang: Lang, text: &str) -> Vec<String> {
+    let text = strip_comments(lang, text);
+    let re = if lang == Lang::Rust {
+        &RS_INLINE_SNAPSHOT
+    } else {
+        &INLINE_SNAPSHOT
+    };
+    re.captures_iter(&text)
         .map(|c| c.get(1).map(|m| m.as_str().to_string()).unwrap_or_default())
         .collect()
+}
+
+/// The text that assertions and matchers are counted in: comments dropped, and for Rust
+/// the contents of string literals too, so a quoted `assert!` does not count.
+fn code_of(lang: Lang, text: &str) -> String {
+    if lang == Lang::Rust {
+        strip_rust_nodes(
+            text,
+            &["line_comment", "block_comment"],
+            &["string_literal", "raw_string_literal"],
+        )
+    } else {
+        strip_comments(lang, text)
+    }
+}
+
+/// Drops Rust comments as the parser finds them, so `//` inside a string stays.
+fn strip_rust_comments(text: &str) -> String {
+    strip_rust_nodes(text, &["line_comment", "block_comment"], &[])
+}
+
+/// `text` without the nodes of the `dropped` kinds, and with the nodes of the `emptied`
+/// kinds replaced by an empty string literal.
+fn strip_rust_nodes(text: &str, dropped: &[&str], emptied: &[&str]) -> String {
+    let Some(tree) = Lang::Rust.parse(text) else {
+        return TS_COMMENT.replace_all(text, "").into_owned();
+    };
+    let mut cuts: Vec<(std::ops::Range<usize>, &str)> = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if dropped.contains(&node.kind()) {
+            cuts.push((node.byte_range(), ""));
+            continue;
+        }
+        if emptied.contains(&node.kind()) {
+            cuts.push((node.byte_range(), "\"\""));
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    cuts.sort_by_key(|(r, _)| r.start);
+    let mut out = text.to_string();
+    for (range, with) in cuts.into_iter().rev() {
+        out.replace_range(range, with);
+    }
+    out
 }
 
 static PY_COMMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)#.*$").unwrap());
@@ -430,6 +535,9 @@ static TS_COMMENT: LazyLock<Regex> =
 /// Drops comments, so a commented-out assertion does not count. Approximate: a `#` or `//`
 /// inside a string also starts a comment here.
 fn strip_comments(lang: Lang, text: &str) -> String {
+    if lang == Lang::Rust {
+        return strip_rust_comments(text);
+    }
     let re = if lang.is_python() {
         &PY_COMMENT
     } else {
@@ -507,6 +615,119 @@ def test_unchanged_but_moved():
 def test_new_and_marked():
     assert f(9) == 9
 "#;
+
+    const RS_BASE: &str = r#"pub fn f(x: i32) -> i32 {
+    x
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kept() {
+        assert_eq!(f(1), 1);
+    }
+
+    #[test]
+    fn removed() {
+        assert!(true);
+    }
+
+    #[test]
+    fn assertions() {
+        assert_eq!(f(1), 1);
+        assert_eq!(f(2), 2);
+    }
+
+    #[test]
+    fn loosened() {
+        assert_eq!(f(1), 1);
+    }
+
+    #[test]
+    fn ignore_me() {
+        assert_eq!(f(1), 1);
+    }
+
+    #[test]
+    fn snap() {
+        insta::assert_snapshot!(f(1), @"1");
+    }
+}
+"#;
+
+    const RS_HEAD: &str = r#"pub fn f(x: i32) -> i32 {
+    x + 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kept() {
+        assert_eq!(f(1), 1);
+    }
+
+    #[test]
+    fn assertions() {
+        assert_eq!(f(1), 1);
+        // assert_eq!(f(2), 2);
+    }
+
+    #[test]
+    fn loosened() {
+        assert!(f(1).is_positive());
+    }
+
+    #[test]
+    #[cfg_attr(unix, ignore = "flaky")]
+    fn ignore_me() {
+        assert_eq!(f(1), 1);
+    }
+
+    #[test]
+    fn snap() {
+        insta::assert_snapshot!(f(1), @"2");
+    }
+}
+"#;
+
+    #[test]
+    fn rust_findings_read_tests_inside_source_files() {
+        let findings = compare(
+            Lang::Rust,
+            PythonStyle::Pytest,
+            "src/lib.rs",
+            RS_BASE,
+            RS_HEAD,
+        );
+        let mut got = kinds(&findings);
+        got.sort_by_key(|(k, t)| (*k as u8, t.clone()));
+        let mut expected = vec![
+            (FindingKind::TestDeleted, "tests > removed".to_string()),
+            (
+                FindingKind::AssertionRemoved,
+                "tests > assertions".to_string(),
+            ),
+            (FindingKind::MatcherLoosened, "tests > loosened".to_string()),
+            (FindingKind::SkipAdded, "tests > ignore_me".to_string()),
+            (FindingKind::SnapshotChanged, "tests > snap".to_string()),
+        ];
+        expected.sort_by_key(|(k, t)| (*k as u8, t.clone()));
+        assert_eq!(got, expected, "{findings:#?}");
+    }
+
+    #[test]
+    fn rust_comments_come_from_the_parser_so_urls_in_strings_stay() {
+        let base = "#[test]\nfn t() {\n    assert_eq!(f(1), 1); assert_eq!(f(2), 2);\n}\n";
+        let head = "#[test]\nfn t() {\n    let s = \"http://example\"; assert_eq!(f(1), 1); assert_eq!(f(2), 2);\n    // assert_eq!(f(3), 3);\n}\n";
+        assert_eq!(assertions(Lang::Rust, head), 2);
+        assert!(compare(Lang::Rust, PythonStyle::Pytest, "tests/a.rs", base, head).is_empty());
+        let quoted = "#[test]\nfn t() {\n    let _ = \"assert!(true)\"; assert_eq!(f(2), 2);\n}\n";
+        assert_eq!(assertions(Lang::Rust, quoted), 1);
+    }
 
     #[test]
     fn python_findings_cover_each_kind_and_skip_unchanged_tests() {

@@ -1,7 +1,8 @@
-//! Source parsing with tree-sitter: Python, TypeScript, and TSX (which also covers
+//! Source parsing with tree-sitter: Python, Rust, TypeScript, and TSX (which also covers
 //! JavaScript and JSX).
 
 pub mod python;
+pub mod rust;
 pub mod ts;
 
 use tree_sitter::{Node, Parser, Tree};
@@ -12,6 +13,7 @@ pub enum Lang {
     TypeScript,
     /// TSX, also used for JavaScript and JSX files.
     Tsx,
+    Rust,
 }
 
 impl Lang {
@@ -22,6 +24,7 @@ impl Lang {
             "py" => Some(Lang::Python),
             "ts" | "mts" | "cts" => Some(Lang::TypeScript),
             "tsx" | "js" | "jsx" | "mjs" | "cjs" => Some(Lang::Tsx),
+            "rs" => Some(Lang::Rust),
             _ => None,
         }
     }
@@ -30,12 +33,18 @@ impl Lang {
         self == Lang::Python
     }
 
+    /// TypeScript, TSX, or JavaScript.
+    pub fn is_ts(self) -> bool {
+        matches!(self, Lang::TypeScript | Lang::Tsx)
+    }
+
     pub fn parse(self, source: &str) -> Option<Tree> {
         let mut parser = Parser::new();
         let language: tree_sitter::Language = match self {
             Lang::Python => tree_sitter_python::LANGUAGE.into(),
             Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
         };
         parser.set_language(&language).ok()?;
         parser.parse(source, None)
@@ -52,10 +61,13 @@ pub struct TestDef {
     pub line: u32,
     pub end_line: u32,
     /// The line the runner reports for the test: the `def` line in Python, the call's first
-    /// line in TypeScript.
+    /// line in TypeScript, the `fn` line in Rust.
     pub report_line: u32,
-    /// Statically skipped: `it.skip`, `it.todo`, `xit`, or inside `describe.skip`.
+    /// Statically skipped: `it.skip`, `it.todo`, `xit`, inside `describe.skip`, or Rust's
+    /// `#[ignore]`.
     pub skip: bool,
+    /// Rust only: a macro such as `rstest` expands the test into a module of cases.
+    pub parametrized: bool,
     /// The byte span of the test, including decorators.
     pub start_byte: usize,
     pub end_byte: usize,
@@ -92,6 +104,7 @@ pub fn find_tests(lang: Lang, source: &str, style: PythonStyle) -> Vec<TestDef> 
     match lang {
         Lang::Python => python::find_tests(tree.root_node(), source, style),
         Lang::TypeScript | Lang::Tsx => ts::find_tests(tree.root_node(), source),
+        Lang::Rust => rust::find_tests(tree.root_node(), source),
     }
 }
 
@@ -105,6 +118,7 @@ pub fn find_functions(lang: Lang, source: &str) -> Vec<FunctionDef> {
         Lang::TypeScript | Lang::Tsx => {
             ts::find_functions(tree.root_node(), source, &mut Vec::new(), &mut out)
         }
+        Lang::Rust => rust::find_functions(tree.root_node(), source, &mut Vec::new(), &mut out),
     }
     out
 }
@@ -152,7 +166,7 @@ mod tests {
         assert_eq!(Lang::of("a.ts"), Some(Lang::TypeScript));
         assert_eq!(Lang::of("a.tsx"), Some(Lang::Tsx));
         assert_eq!(Lang::of("a.js"), Some(Lang::Tsx));
-        assert_eq!(Lang::of("a.rs"), None);
+        assert_eq!(Lang::of("src/lib.rs"), Some(Lang::Rust));
         assert_eq!(Lang::of("Makefile"), None);
     }
 }

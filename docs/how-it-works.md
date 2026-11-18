@@ -17,6 +17,7 @@ titer runs tests through the repo's own command and the runner's native selectio
 | pytest | node ids |
 | unittest | dotted ids |
 | vitest | `file:line` |
+| cargo | the package and target (`-p`, `--lib`, `--bin`, or `--test`) and exact libtest names |
 
 The checkout's status, index, stash, and worktree list never change. titer kills its own process groups on exit, on timeout, and on SIGINT.
 
@@ -39,7 +40,7 @@ All tiers run by default. `--only` selects a subset, for example `--only scan,pr
 |---|---|
 | `assertion` | The test fails on base with an assertion. The gate counts this as proof. |
 | `exception` | The test fails on base with an exception from the code under test. The gate counts this as proof. |
-| `missing_symbol` | The test fails on base only because a name exists only in head. It is not proof. |
+| `missing_symbol` | The test fails on base only because a name exists only in head, or, in Rust, because it does not compile against base. It is not proof. |
 | `passes_on_base` | The test passes on base. It can still be a useful regression guard. |
 | `skipped` | The test skipped. |
 | `no_result` | Zero tests executed. |
@@ -56,22 +57,24 @@ Read the failure message of each proven test and check that it is the behavior t
 - removed `not` and `!`
 - `return None` and `return undefined`
 - removed calls (never logging calls)
-- removed raise and throw
+- removed raise and throw, and in Rust removed `panic!` and `return Err(...)`
 - negated `if`
 - JSX attributes set to undefined
 
 The head-green changed tests run against each mutant in parallel workers. If the change has no changed tests, the whole suite runs instead.
 
-Before any mutant, a canary raises at the top of a changed module. The canary must be killed. If it survives, the worktree is not loading the code titer mutates, for example because of an editable install, and the check exits 2.
+Before any mutant, a canary raises at the top of a changed module. The canary must be killed. If it survives, the worktree is not loading the code titer mutates, for example because of an editable install, and the check exits 2. A Rust module runs no code when it loads, so its canary is a `compile_error!` instead, and a build that fails counts as killed.
 
 A mutant whose code also appears in the base lines its hunk replaces gets `unchanged_from_base: true`. The change may only have moved or reformatted that code.
 
 Each survivor gets two follow-up runs:
 
-1. titer inserts a sentinel raise before the line's statement. If no test fails, the outcome is `not_executed`: nothing runs the line.
+1. titer inserts a sentinel raise before the line's statement. In Rust the sentinel is `std::process::abort()`, which `#[should_panic]` and `catch_unwind` cannot catch. If no test fails, the outcome is `not_executed`: nothing runs the line.
 2. titer reruns the whole changed test files. If another test kills the mutant, the outcome is `caught_by_other`.
 
 Mutant outcomes are `killed`, `timed_out`, `survived`, `not_executed`, `caught_by_other`, `not_run` (the budget ran out first), and `no_result`.
+
+A mutant survives only when every selected test ran and passed. A mutant that leaves any selected target unbuildable or unlistable, or a selected test missing, gets `no_result`, unless a selected test fails. A compile or link error is never a kill.
 
 Agents can add their own mutants with `--mutants`. See the [CLI reference](cli.md#agent-mutants).
 
@@ -84,6 +87,26 @@ CRAP = complexity^2 * (1 - coverage)^3 + complexity
 ```
 
 Coverage comes from `--coverage` (lcov, Cobertura XML, or coverage.py JSON) or from `[crap] coverage_command` in `titer.toml`. Functions that score above `[crap] threshold` (default 30) are flagged.
+
+## Rust
+
+Rust keeps unit tests in the source file they test. titer reads `#[cfg(test)]` items and test functions (`#[test]`, `#[tokio::test]`, `#[rstest]`, and the like) as test code:
+
+- A changed test inside a source file is a changed test. `#[cfg_attr(condition, test)]` also marks a test.
+- Test code is never mutated, and a change that edits only test code does not touch source. Code that shares a line with test code is still source.
+- `prove` keeps base's source code and replaces its test items with head's. It rebuilds each module in head's item order: items both sides have keep base's text, items only base has stay, test items come from head, and other items only head has are left out. So every test sees the `macro_rules!` definitions it sees in head. A test module inside a module that base lacks goes into an empty module of that name. A file that cargo compiles only as test code, such as one under `#[cfg(test)] mod unit;` or `#![cfg(test)]`, goes onto base whole.
+
+titer asks `cargo metadata` for packages and targets, and maps each file to the targets that compile it by following `mod` declarations, including `#[path]`, from each target's root. A module that several targets declare, such as `tests/common/mod.rs`, belongs to each of them. It lists each target's tests and selects exact names; a test that a macro such as `rstest` expands into cases selects every case.
+
+titer skips a target whose `required-features` the runner's command does not enable, as cargo does. Two files that can fill one module path, such as `#[cfg]` variants under `#[path]`, give their tests the same libtest name, so titer selects neither and they get `no_result`. titer reads a test binary's results only when they agree with its own `test result:` counts; a test that prints result lines of its own leaves the run without a result.
+
+A test that uses a name only head has stops its whole target from compiling on base. `prove` gives such a test the `missing_symbol` verdict, removes it and the import of that exact path from base, and builds again, so the other changed tests in that target still run.
+
+Worktrees hold the tree without `.git`, so a build script that runs git fails there, and the check exits 2.
+
+Doc tests run with the suite, but a changed doc test is not a changed test: libtest names a doc test by its line, which differs between base and head.
+
+Each worktree builds its own target dir, and the first build in each one is cold. The runner's timeouts and durations count only the test binaries, so a slow cold build does not stretch mutant timeouts. Builds are also outside the budget: on a large workspace, the head, base, and canary builds can take minutes each, and a check can run that long past `--budget`. `--workers` limits how many cold builds run at once.
 
 ## The gate
 

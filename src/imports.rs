@@ -48,6 +48,8 @@ pub fn missing_imports(
     match lang {
         Lang::Python => python(runner, file, tree.root_node(), source, trees),
         Lang::TypeScript | Lang::Tsx => typescript(file, tree.root_node(), source, trees),
+        // The compiler reports a name that only head has; prove reads its errors instead.
+        Lang::Rust => Vec::new(),
     }
 }
 

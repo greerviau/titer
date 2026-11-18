@@ -63,6 +63,9 @@ pub struct JobResult {
     pub outcome: MutantOutcome,
     pub killed_by: Option<String>,
     pub duration: Option<Duration>,
+    /// The mutated code did not compile. Such a mutant has no result, but a compile-error
+    /// canary that fails the build shows that the build compiles its file.
+    pub compile_failed: bool,
 }
 
 pub struct Mutation {
@@ -155,6 +158,12 @@ pub fn generate(ctx: &Context) -> anyhow::Result<Vec<(Mutant, Job)>> {
         }
         let text = detect::read_head(&ctx.session, &source.file)?;
         let base = BaseHunks::load(&ctx.session, &source.file, source.lang)?;
+        // Test code that shares a changed line with source code is not a target.
+        let tests = if source.lang == Lang::Rust {
+            crate::lang::rust::test_ranges(&text)
+        } else {
+            Vec::new()
+        };
         for cand in operators::generate(
             source.lang,
             &text,
@@ -162,6 +171,12 @@ pub fn generate(ctx: &Context) -> anyhow::Result<Vec<(Mutant, Job)>> {
             &calls,
             &config.exclude_operators,
         ) {
+            if tests
+                .iter()
+                .any(|(s, e)| cand.start_byte < *e && *s < cand.end_byte)
+            {
+                continue;
+            }
             let mutated = cand.apply(&text);
             let mut mutant = mutant_from(
                 &ctx.runners[source.runner],
@@ -341,6 +356,7 @@ pub fn run_jobs(
                             outcome: MutantOutcome::NotRun,
                             killed_by: None,
                             duration: None,
+                            compile_failed: false,
                         };
                         (skipped, true)
                     };
@@ -368,6 +384,7 @@ pub fn run_jobs(
                 outcome: MutantOutcome::NotRun,
                 killed_by: None,
                 duration: None,
+                compile_failed: false,
             })
         })
         .collect()
@@ -394,6 +411,7 @@ fn run_job(ctx: &Context, worktree: &Worktree, plan: &RunnerPlan, job: &Job) -> 
                 outcome: MutantOutcome::NoResult,
                 killed_by: None,
                 duration: None,
+                compile_failed: false,
             };
             return (nothing, true);
         }
@@ -427,6 +445,7 @@ fn run_job(ctx: &Context, worktree: &Worktree, plan: &RunnerPlan, job: &Job) -> 
         outcome,
         killed_by,
         duration: Some(run.duration),
+        compile_failed: !run.compile_errors.is_empty(),
     };
     (result, true)
 }
@@ -445,11 +464,14 @@ fn error_result(e: anyhow::Error) -> JobResult {
         outcome: MutantOutcome::NoResult,
         killed_by: None,
         duration: None,
+        compile_failed: false,
     }
 }
 
 /// Killed when a selected test fails or the mutant breaks a selected file's import; survived
-/// when a selected test passed and none failed; no result when nothing executed.
+/// when every selected test ran and passed and every selected target built; no result
+/// otherwise. A target that does not build ran none of its tests, so a pass elsewhere is
+/// not a survivor.
 pub fn classify(run: &TestRun, plan: &Plan, cwd: &str) -> (MutantOutcome, Option<String>) {
     if run.timed_out {
         return (MutantOutcome::TimedOut, None);
@@ -477,7 +499,9 @@ pub fn classify(run: &TestRun, plan: &Plan, cwd: &str) -> (MutantOutcome, Option
                     Some(e.file.trim_start_matches("./").to_string()),
                 );
             }
-            if results.iter().any(|(_, r)| *r == CaseResult::Passed) {
+            // Every selected test must run and pass: a mutant that hides a test, for
+            // example by turning off its cfg, has not shown that the tests miss it.
+            if results.iter().all(|(_, r)| *r == CaseResult::Passed) && !run.incomplete {
                 return (MutantOutcome::Survived, None);
             }
         }
@@ -499,7 +523,7 @@ pub fn classify(run: &TestRun, plan: &Plan, cwd: &str) -> (MutantOutcome, Option
             if let Some(e) = run.file_errors.first() {
                 return (MutantOutcome::Killed, Some(e.file.clone()));
             }
-            if run.executed() > 0 {
+            if run.executed() > 0 && !run.incomplete {
                 return (MutantOutcome::Survived, None);
             }
         }
@@ -509,7 +533,8 @@ pub fn classify(run: &TestRun, plan: &Plan, cwd: &str) -> (MutantOutcome, Option
 }
 
 /// Runs a canary in every mutated module. Returns the modules whose canary survived, or an
-/// error when every canary survived, which means the worktrees do not load the code.
+/// error when every canary survived, which means the worktrees do not load the code. A
+/// Rust canary is a compile error, so a build that fails counts as killed.
 pub fn canaries(
     ctx: &Context,
     workers: &[Worktree],
@@ -532,7 +557,10 @@ pub fn canaries(
     if jobs.is_empty() {
         return Ok(Vec::new());
     }
-    let results = run_jobs(ctx, workers, plans, &jobs, None);
+    let mut results = run_jobs(ctx, workers, plans, &jobs, None);
+    for r in results.iter_mut().filter(|r| r.compile_failed) {
+        r.outcome = MutantOutcome::Killed;
+    }
     let unconfirmed: Vec<&str> = jobs
         .iter()
         .zip(&results)
@@ -554,7 +582,7 @@ pub fn canaries(
     if survived.len() == jobs.len() {
         bail!(
             "the canary survived in every mutated module ({}): the worktree is not loading the code titer mutates. \
-             An editable install or a PYTHONPATH that points at the checkout can cause this.",
+             An editable install, a PYTHONPATH that points at the checkout, or a Cargo path dependency outside the repo can cause this.",
             survived.join(", ")
         );
     }

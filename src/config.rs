@@ -31,6 +31,7 @@ pub enum RunnerKind {
     Pytest,
     Unittest,
     Vitest,
+    Cargo,
 }
 
 impl RunnerKind {
@@ -39,6 +40,7 @@ impl RunnerKind {
             RunnerKind::Pytest => "pytest",
             RunnerKind::Unittest => "unittest",
             RunnerKind::Vitest => "vitest",
+            RunnerKind::Cargo => "cargo",
         }
     }
 
@@ -47,6 +49,9 @@ impl RunnerKind {
             RunnerKind::Pytest => &["**/test_*.py", "**/*_test.py"],
             RunnerKind::Unittest => &["**/test*.py"],
             RunnerKind::Vitest => &["**/*.{test,spec}.{ts,tsx,mts,cts,js,jsx,mjs,cjs}"],
+            // Integration tests. Unit tests live in source files, where titer finds them by
+            // their attributes; the classifier never takes a file under `src/` as a test file.
+            RunnerKind::Cargo => &["**/tests/**/*.rs"],
         };
         globs.iter().map(|g| g.to_string()).collect()
     }
@@ -66,6 +71,7 @@ impl RunnerKind {
                 "test/**",
                 "tests/**",
             ],
+            RunnerKind::Cargo => &["**/tests/**", "**/testdata/**", "**/snapshots/**"],
         };
         globs.iter().map(|g| g.to_string()).collect()
     }
@@ -74,6 +80,9 @@ impl RunnerKind {
         let deps: &[&str] = match self {
             RunnerKind::Pytest | RunnerKind::Unittest => &[".venv", "venv"],
             RunnerKind::Vitest => &["node_modules"],
+            // A shared target dir would let one worktree's build overwrite another's
+            // binaries, so each worktree builds its own.
+            RunnerKind::Cargo => &[],
         };
         deps.iter().map(|d| d.to_string()).collect()
     }
@@ -108,7 +117,8 @@ pub struct RunnerConfig {
     pub kind: RunnerKind,
     /// Repo-relative directory the command runs in. Globs and paths below are relative to it.
     pub cwd: String,
-    /// The repo's own command prefix, for example `["uv", "run", "--no-sync", "python", "-m", "pytest"]`.
+    /// The repo's own command prefix, for example `["uv", "run", "--no-sync", "python", "-m", "pytest"]`
+    /// or `["cargo", "test"]`.
     pub command: Vec<String>,
     /// Files that contain tests.
     pub test_globs: Vec<String>,
@@ -138,6 +148,9 @@ impl TryFrom<RawRunner> for RunnerConfig {
                     .to_string(),
             );
         }
+        if raw.kind == RunnerKind::Cargo {
+            check_cargo_command(&raw.command)?;
+        }
         let cwd = normalize_rel(&raw.cwd)?;
         Ok(RunnerConfig {
             name: raw.name.unwrap_or_else(|| raw.kind.name().to_string()),
@@ -155,6 +168,59 @@ impl TryFrom<RawRunner> for RunnerConfig {
             start_dir: normalize_rel(raw.start_dir.as_deref().unwrap_or("."))?,
         })
     }
+}
+
+/// A cargo command is a prefix that ends in `test`, such as `["cargo", "+nightly", "test"]`,
+/// then only flags that leave titer's choice of packages, targets, tests, output format,
+/// and target dir alone.
+fn check_cargo_command(command: &[String]) -> Result<(), String> {
+    const WITH_VALUE: &[&str] = &[
+        "--features",
+        "-F",
+        "--profile",
+        "--target",
+        "-j",
+        "--jobs",
+        "--color",
+    ];
+    const SWITCHES: &[&str] = &[
+        "--all-features",
+        "--no-default-features",
+        "--release",
+        "--locked",
+        "--offline",
+        "--frozen",
+        "--ignore-rust-version",
+        "--no-fail-fast",
+        "-v",
+        "-vv",
+        "--verbose",
+    ];
+    let Some(at) = command.iter().position(|a| a == "test") else {
+        return Err(
+            "a cargo command must run `cargo test`, such as [\"cargo\", \"test\"]".to_string(),
+        );
+    };
+    let mut args = command[at + 1..].iter();
+    while let Some(arg) = args.next() {
+        let flag = arg.split_once('=').map_or(arg.as_str(), |(f, _)| f);
+        if WITH_VALUE.contains(&flag) {
+            if !arg.contains('=') && args.next().is_none() {
+                return Err(format!("{arg:?} in the cargo command needs a value"));
+            }
+            continue;
+        }
+        if SWITCHES.contains(&arg.as_str()) {
+            continue;
+        }
+        return Err(format!(
+            "a cargo command must not contain {arg:?}: titer chooses the packages, targets, \
+             tests, output format, and target dir. After `test` it accepts {} and {}",
+            WITH_VALUE.join(", "),
+            SWITCHES.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 /// Normalizes a repo-relative path: no leading `./`, no trailing slash, `.` for the root.
@@ -374,6 +440,30 @@ mod tests {
     }
 
     #[test]
+    fn cargo_runners_default_to_rust_test_paths_and_no_deps() {
+        let config =
+            Config::parse("[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\"]\n")
+                .unwrap();
+        let cargo = &config.runners[0];
+        assert_eq!(cargo.name, "cargo");
+        assert_eq!(cargo.kind, RunnerKind::Cargo);
+        assert_eq!(cargo.test_globs, vec!["**/tests/**/*.rs"]);
+        assert_eq!(
+            cargo.support_globs,
+            vec!["**/tests/**", "**/testdata/**", "**/snapshots/**"]
+        );
+        assert!(cargo.deps.is_empty());
+    }
+
+    #[test]
+    fn cargo_commands_accept_build_flags_with_their_values() {
+        let config = Config::parse(
+            "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"+nightly\", \"test\", \"--features\", \"pg\", \"--release\", \"-j\", \"2\", \"--locked\"]\n",
+        );
+        assert!(config.is_ok(), "{config:?}");
+    }
+
+    #[test]
     fn rejects_configs_that_cannot_run() {
         let cases = [
             ("", "at least one [[runner]]"),
@@ -400,6 +490,38 @@ mod tests {
             (
                 "[[runner]]\nkind = \"unittest\"\ncommand = [\"python\", \"-m\", \"unittest\", \"discover\"]",
                 "drop `discover`",
+            ),
+            (
+                "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\", \"--workspace\"]",
+                "must not contain \"--workspace\"",
+            ),
+            (
+                "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\", \"--\", \"--show-output\"]",
+                "must not contain \"--\"",
+            ),
+            (
+                "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\", \"--target-dir=/tmp/t\"]",
+                "must not contain \"--target-dir=/tmp/t\"",
+            ),
+            (
+                "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\", \"-p\", \"beta\"]",
+                "must not contain \"-p\"",
+            ),
+            (
+                "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\", \"-qj1\"]",
+                "must not contain \"-qj1\"",
+            ),
+            (
+                "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\", \"unrelated\"]",
+                "must not contain \"unrelated\"",
+            ),
+            (
+                "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\", \"--config\", \"build.build-dir='/x'\"]",
+                "must not contain \"--config\"",
+            ),
+            (
+                "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"build\"]",
+                "must run `cargo test`",
             ),
             (
                 "[[runner]]\nkind = \"pytest\"\ncommand = [\"x\"]\n[mutate]\nbudget = \"soon\"",

@@ -185,10 +185,16 @@ impl Gen<'_> {
     }
 
     fn walk(&mut self, node: Node) {
-        if self.lang.is_python() {
-            self.python(node);
-        } else {
-            self.typescript(node);
+        match self.lang {
+            Lang::Python => self.python(node),
+            Lang::TypeScript | Lang::Tsx => self.typescript(node),
+            Lang::Rust => {
+                // Attributes are configuration, not behavior.
+                if node.kind() == "attribute_item" || node.kind() == "inner_attribute_item" {
+                    return;
+                }
+                self.rust(node);
+            }
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
@@ -409,6 +415,107 @@ impl Gen<'_> {
         }
     }
 
+    fn rust(&mut self, node: Node) {
+        match node.kind() {
+            "binary_expression" => {
+                let Some(op) = node.child_by_field_name("operator") else {
+                    return;
+                };
+                if !self.on_changed_line(op) {
+                    return;
+                }
+                let (operator, swapped) = match text(op, self.source) {
+                    "<" => (Operator::SwapComparison, "<="),
+                    "<=" => (Operator::SwapComparison, "<"),
+                    ">" => (Operator::SwapComparison, ">="),
+                    ">=" => (Operator::SwapComparison, ">"),
+                    "==" => (Operator::SwapComparison, "!="),
+                    "!=" => (Operator::SwapComparison, "=="),
+                    "&&" => (Operator::SwapBoolean, "||"),
+                    "||" => (Operator::SwapBoolean, "&&"),
+                    other => match swap_arithmetic(other) {
+                        Some(s) => (Operator::SwapArithmetic, s),
+                        None => return,
+                    },
+                };
+                self.push(op, operator, swapped);
+            }
+            "boolean_literal" if self.on_changed_line(node) => {
+                let flipped = if text(node, self.source) == "true" {
+                    "false"
+                } else {
+                    "true"
+                };
+                self.push(node, Operator::FlipBool, flipped);
+            }
+            "integer_literal" if self.on_changed_line(node) => {
+                // A tuple index or an array length changes a type, which rarely compiles.
+                let sized = node.parent().is_some_and(|p| match p.kind() {
+                    "field_expression" | "array_type" => true,
+                    "array_expression" => p
+                        .child_by_field_name("length")
+                        .is_some_and(|l| l.id() == node.id()),
+                    _ => false,
+                });
+                if !sized {
+                    self.increment(node);
+                }
+            }
+            "unary_expression" if self.on_changed_line(node) => {
+                let parts: Vec<Node> = {
+                    let mut cursor = node.walk();
+                    node.children(&mut cursor).collect()
+                };
+                if let [op, arg] = parts.as_slice()
+                    && text(*op, self.source) == "!"
+                {
+                    self.push(
+                        node,
+                        Operator::RemoveNot,
+                        text(*arg, self.source).to_string(),
+                    );
+                }
+            }
+            "expression_statement" if self.on_changed_line(node) => {
+                // Only a statement that ends in `;` can go without changing a block's value.
+                if !text(node, self.source).ends_with(';') {
+                    return;
+                }
+                let Some(expr) = children(node).into_iter().next() else {
+                    return;
+                };
+                let call = match expr.kind() {
+                    "call_expression" => Some(expr),
+                    "try_expression" | "await_expression" => children(expr)
+                        .into_iter()
+                        .next()
+                        .filter(|c| c.kind() == "call_expression"),
+                    _ => None,
+                };
+                if let Some(call) = call
+                    && let Some(func) = call.child_by_field_name("function")
+                    && !self.calls.skips(text(func, self.source))
+                {
+                    self.push(node, Operator::RemoveCall, ";");
+                    return;
+                }
+                if is_rust_raise(expr, self.source) {
+                    self.push(node, Operator::RemoveRaise, ";");
+                }
+            }
+            "if_expression" => {
+                if let Some(cond) = node.child_by_field_name("condition")
+                    && self.on_changed_line(cond)
+                    && !has_let(cond)
+                {
+                    let negated = format!("!({})", text(cond, self.source));
+                    self.push(cond, Operator::NegateIf, negated);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn increment(&mut self, node: Node) {
         let raw = text(node, self.source);
         let digits = raw.replace('_', "");
@@ -416,6 +523,30 @@ impl Gen<'_> {
             self.push(node, Operator::IncrementInt, n.to_string());
         }
     }
+}
+
+/// Rust's raise: `panic!`-like macros, and `return Err(...)`.
+fn is_rust_raise(expr: Node, source: &str) -> bool {
+    match expr.kind() {
+        "macro_invocation" => expr.child_by_field_name("macro").is_some_and(|m| {
+            matches!(
+                text(m, source),
+                "panic" | "unreachable" | "todo" | "unimplemented"
+            )
+        }),
+        "return_expression" => children(expr).into_iter().next().is_some_and(|value| {
+            value.kind() == "call_expression"
+                && value
+                    .child_by_field_name("function")
+                    .is_some_and(|f| text(f, source) == "Err")
+        }),
+        _ => false,
+    }
+}
+
+/// A condition with a `let` pattern, which cannot be negated.
+fn has_let(cond: Node) -> bool {
+    matches!(cond.kind(), "let_condition" | "let_chain") || children(cond).into_iter().any(has_let)
 }
 
 /// Parents that only wrap a literal, such as the `-` of `-1` or a call's argument list.
@@ -484,11 +615,15 @@ pub fn budget_order<T>(items: Vec<T>, key: impl Fn(&T) -> (String, u32)) -> Vec<
     }
 }
 
-/// The canary: a raise or throw at the top of a module.
+/// The canary: a raise or throw at the top of a module. Rust runs no code when a module
+/// loads, so its canary is a compile error at the end of the file instead: it fails the
+/// build only when the build compiles that file. The end of the file keeps it after any
+/// inner attributes.
 pub fn canary(lang: Lang, source: &str) -> String {
     match lang {
         Lang::Python => format!("raise RuntimeError(\"titer canary\")\n{source}"),
         Lang::TypeScript | Lang::Tsx => format!("throw new Error(\"titer canary\");\n{source}"),
+        Lang::Rust => format!("{source}\ncompile_error!(\"titer canary\");\n"),
     }
 }
 
@@ -502,15 +637,15 @@ pub fn sentinel(lang: Lang, source: &str, line: u32) -> Option<String> {
     let column = text_line.len() - text_line.trim_start().len();
     let point = tree_sitter::Point { row, column };
     let mut node = tree.root_node().descendant_for_point_range(point, point)?;
-    let containers: &[&str] = if lang.is_python() {
-        &["block", "module"]
-    } else {
-        &[
+    let containers: &[&str] = match lang {
+        Lang::Python => &["block", "module"],
+        Lang::TypeScript | Lang::Tsx => &[
             "statement_block",
             "program",
             "switch_case",
             "switch_default",
-        ]
+        ],
+        Lang::Rust => &["block"],
     };
     loop {
         let parent = node.parent()?;
@@ -530,6 +665,9 @@ pub fn sentinel(lang: Lang, source: &str, line: u32) -> Option<String> {
         // cannot swallow the sentinel; pytest and unittest both report it as a failure.
         Lang::Python => "raise SystemExit(\"titer sentinel\")",
         Lang::TypeScript | Lang::Tsx => "throw new Error(\"titer sentinel\");",
+        // A panic can be caught or expected by `#[should_panic]`, and an abort cannot. The
+        // `if true` keeps the code after it reachable, so no unreachable-code lint fires.
+        Lang::Rust => "if true { std::process::abort(); }",
     };
     let out = format!("{}{raise}\n{indent}{}", &source[..start], &source[start..]);
     let had_errors = tree.root_node().has_error();
@@ -639,6 +777,72 @@ def g():
                 "7 RemoveNot !busy -> busy",
                 "7 JsxAttributeUndefined aria-label=\"go\" -> aria-label={undefined}",
             ]
+        );
+    }
+
+    #[test]
+    fn rust_operators_leave_macros_attributes_and_let_conditions_alone() {
+        let source = r#"pub fn f(xs: &[i32], ok: bool) -> Result<i32, E> {
+    if !ok && xs.len() <= 3 {
+        return Err(E::Short);
+    }
+    if let Some(x) = xs.first() {
+        log::info!("first {}", x);
+    }
+    save(xs);
+    self.store.put(xs)?;
+    panic!("unreachable");
+    let total = xs.iter().sum::<i32>() + 1 - xs.0;
+    let flag = true;
+    #[cfg(feature = "x")]
+    let y = [0u8; 4];
+    Ok(total * 2)
+}
+"#;
+        let cands = generate(
+            Lang::Rust,
+            source,
+            &lines(2..=15),
+            &CallFilter::default(),
+            &[],
+        );
+        assert_eq!(
+            summary(&cands),
+            vec![
+                "2 RemoveNot !ok -> ok",
+                "2 NegateIf !ok && xs.len() <= 3 -> !(!ok && xs.len() <= 3)",
+                "2 SwapBoolean && -> ||",
+                "2 SwapComparison <= -> <",
+                "2 IncrementInt 3 -> 4",
+                "3 RemoveRaise return Err(E::Short); -> ;",
+                "8 RemoveCall save(xs); -> ;",
+                "9 RemoveCall self.store.put(xs)?; -> ;",
+                "10 RemoveRaise panic!(\"unreachable\"); -> ;",
+                "11 SwapArithmetic + -> -",
+                "11 IncrementInt 1 -> 2",
+                "11 SwapArithmetic - -> +",
+                "12 FlipBool true -> false",
+                "15 SwapArithmetic * -> /",
+                "15 IncrementInt 2 -> 3",
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_canary_and_sentinel() {
+        assert_eq!(
+            canary(Lang::Rust, "#![allow(dead_code)]\nfn f() {}\n"),
+            "#![allow(dead_code)]\nfn f() {}\n\ncompile_error!(\"titer canary\");\n"
+        );
+        let source = "fn f(x: i32) -> i32 {\n    let y = match x {\n        0 => 1,\n        _ => x + 1,\n    };\n    y\n}\n";
+        assert_eq!(
+            sentinel(Lang::Rust, source, 4).unwrap(),
+            "fn f(x: i32) -> i32 {\n    if true { std::process::abort(); }\n    let y = match x {\n        0 => 1,\n        _ => x + 1,\n    };\n    y\n}\n"
+        );
+        assert!(
+            sentinel(Lang::Rust, source, 6)
+                .unwrap()
+                .contains("    if true { std::process::abort(); }\n    y\n")
         );
     }
 

@@ -102,6 +102,7 @@ pub fn run(cwd: &Path, options: &CheckOptions) -> anyhow::Result<Report> {
                 .map(|(_, p)| p.as_str())
                 .collect();
             base.overlay(&ctx.session.git, &ctx.session.head_tree, &paths)?;
+            prove::splice_rust_sources(&ctx.session, &ctx.detection, &base)?;
             report.tests = prove::prove(&ctx.session, &ctx.runners, &ctx.detection, &heads, &base)?;
             report.timing.prove_ms = Some(elapsed_ms(tier_started));
         }

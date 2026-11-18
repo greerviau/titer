@@ -2,6 +2,7 @@
 //! touches.
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use globset::{GlobSet, GlobSetBuilder};
@@ -27,6 +28,9 @@ pub enum Role {
 /// Assigns repo-relative paths to runners and roles.
 pub struct Classifier {
     runners: Vec<(RunnerConfig, GlobSet, GlobSet)>,
+    /// The checkout, when the classifier may read it to learn which files cargo compiles
+    /// as tests.
+    root: Option<PathBuf>,
 }
 
 pub fn glob_set(globs: &[String]) -> anyhow::Result<GlobSet> {
@@ -45,7 +49,8 @@ pub fn glob_set(globs: &[String]) -> anyhow::Result<GlobSet> {
 fn runs_lang(kind: RunnerKind, lang: Lang) -> bool {
     match kind {
         RunnerKind::Pytest | RunnerKind::Unittest => lang.is_python(),
-        RunnerKind::Vitest => !lang.is_python(),
+        RunnerKind::Vitest => lang.is_ts(),
+        RunnerKind::Cargo => lang == Lang::Rust,
     }
 }
 
@@ -54,6 +59,7 @@ fn under(path: &str, cwd: &str) -> bool {
 }
 
 impl Classifier {
+    /// A classifier from paths and globs alone.
     pub fn new(runners: &[Runner]) -> anyhow::Result<Classifier> {
         let runners = runners
             .iter()
@@ -65,22 +71,76 @@ impl Classifier {
                 ))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(Classifier { runners })
+        Ok(Classifier {
+            runners,
+            root: None,
+        })
+    }
+
+    /// A classifier that also reads the checkout at `root`, which holds head, for cargo's
+    /// module layout. It never writes there.
+    pub fn in_checkout(runners: &[Runner], root: &Path) -> anyhow::Result<Classifier> {
+        let mut classifier = Classifier::new(runners)?;
+        classifier.root = Some(root.to_path_buf());
+        Ok(classifier)
+    }
+
+    /// The runners whose cwd contains `path`, deepest first.
+    fn containing(&self, path: &str) -> Vec<usize> {
+        let mut out: Vec<usize> = (0..self.runners.len())
+            .filter(|i| under(path, &self.runners[*i].0.cwd))
+            .collect();
+        let depth = |i: &usize| {
+            let cwd = &self.runners[*i].0.cwd;
+            if cwd == "." { 0 } else { cwd.len() }
+        };
+        out.sort_by_key(|i| std::cmp::Reverse(depth(i)));
+        out
+    }
+
+    /// For a cargo runner: whether cargo compiles the file only as test code, or None when
+    /// titer cannot tell from the checkout.
+    fn cargo_test_code(&self, config: &RunnerConfig, rel: &str) -> Option<bool> {
+        let root = self.root.as_ref()?;
+        let index = crate::runner::cargo::targets::index(&root.join(&config.cwd));
+        let refs = index.refs(rel);
+        if refs.is_empty() {
+            return None;
+        }
+        Some(refs.iter().all(|r| {
+            r.test_only || matches!(r.target.kind, crate::runner::cargo::targets::Kind::Test(_))
+        }))
     }
 
     pub fn role(&self, path: &str) -> Role {
         let lang = Lang::of(path);
-        for (i, (config, tests, _)) in self.runners.iter().enumerate() {
+        let runners = self.containing(path);
+        for &i in &runners {
+            let (config, tests, _) = &self.runners[i];
+            if !lang.is_some_and(|l| runs_lang(config.kind, l)) {
+                continue;
+            }
             let rel = cwd_relative(path, &config.cwd);
-            if under(path, &config.cwd)
-                && lang.is_some_and(|l| runs_lang(config.kind, l))
-                && tests.is_match(&rel)
-            {
+            if config.kind == RunnerKind::Cargo {
+                // What cargo compiles decides; without that, a file under `src/` is source,
+                // even in a `tests` module dir, since it can hold code that base must keep.
+                let test = self
+                    .cargo_test_code(config, &rel)
+                    .unwrap_or_else(|| tests.is_match(&rel) && !rel.split('/').any(|p| p == "src"));
+                if test {
+                    return Role::Test { runner: i };
+                }
+                continue;
+            }
+            if tests.is_match(&rel) {
                 return Role::Test { runner: i };
             }
         }
-        for (i, (config, _, support)) in self.runners.iter().enumerate() {
-            if under(path, &config.cwd) && support.is_match(cwd_relative(path, &config.cwd)) {
+        for &i in &runners {
+            let (config, _, support) = &self.runners[i];
+            let rel = cwd_relative(path, &config.cwd);
+            let cargo_rust = config.kind == RunnerKind::Cargo && lang == Some(Lang::Rust);
+            if support.is_match(&rel) && !cargo_rust {
                 return Role::Support { runner: i };
             }
         }
@@ -88,21 +148,10 @@ impl Classifier {
             return Role::NotAnalyzed;
         };
         // The runner with the deepest cwd that contains the file and runs its language.
-        self.runners
-            .iter()
-            .enumerate()
-            .filter(|(_, (config, _, _))| under(path, &config.cwd) && runs_lang(config.kind, lang))
-            .max_by_key(|(_, (config, _, _))| {
-                if config.cwd == "." {
-                    0
-                } else {
-                    config.cwd.len()
-                }
-            })
-            .map_or(Role::NotAnalyzed, |(runner, _)| Role::Source {
-                runner,
-                lang,
-            })
+        runners
+            .into_iter()
+            .find(|i| runs_lang(self.runners[*i].0.kind, lang))
+            .map_or(Role::NotAnalyzed, |runner| Role::Source { runner, lang })
     }
 
     /// True for test and support files of any runner.
@@ -133,8 +182,12 @@ pub struct Detection {
     pub tests: Vec<TestCase>,
     /// Test and support files that changed and exist in head, with their runner.
     pub test_paths: Vec<(usize, String)>,
-    /// Test files (not support files) that changed and exist in head.
+    /// Test files (not support files) that changed and exist in head, and Rust source files
+    /// whose changed tests they hold.
     pub test_files: Vec<(usize, String)>,
+    /// Rust source files that changed and exist in head. They hold their own unit tests,
+    /// so prove splices head's test items into base's copy of each.
+    pub rust_sources: Vec<String>,
     pub sources: Vec<SourceFile>,
     pub functions: Vec<ChangedFunction>,
     /// Changed files titer does not analyze.
@@ -159,7 +212,7 @@ pub fn python_style(kind: RunnerKind) -> PythonStyle {
 }
 
 pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection> {
-    let classifier = Classifier::new(runners)?;
+    let classifier = Classifier::in_checkout(runners, session.git.root())?;
     let mut detection = Detection::default();
     for change in &session.changes.files {
         if change.status == FileStatus::Deleted {
@@ -176,26 +229,8 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
                 detection.test_files.push((runner, path.clone()));
                 let source = read_head(session, &path)?;
                 let lang = Lang::of(&path).expect("test files have a language");
-                let r = &runners[runner];
-                for def in lang::find_tests(lang, &source, python_style(r.config.kind)) {
-                    if !change
-                        .added
-                        .iter()
-                        .any(|l| (def.line..=def.end_line).contains(l))
-                    {
-                        continue;
-                    }
-                    detection.tests.push(TestCase {
-                        runner: r.name().to_string(),
-                        file: path.clone(),
-                        line: def.report_line,
-                        end_line: def.end_line,
-                        id: r.test_id(&path, &def.suite, &def.name, def.report_line),
-                        suite: def.suite,
-                        name: def.name,
-                        skip: def.skip,
-                    });
-                }
+                let found = changed_tests(&runners[runner], &path, lang, &source, &change.added);
+                detection.tests.extend(found);
             }
             Role::Support { runner } => detection.test_paths.push((runner, path)),
             Role::Source { runner, lang } => {
@@ -203,9 +238,33 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
                     continue;
                 }
                 let source = read_head(session, &path)?;
-                let functions = lang::find_functions(lang, &source);
+                let mut changed = change.added.clone();
+                let mut test_ranges = Vec::new();
+                if lang == Lang::Rust {
+                    detection.rust_sources.push(path.clone());
+                    let found =
+                        changed_tests(&runners[runner], &path, lang, &source, &change.added);
+                    if !found.is_empty() {
+                        detection.test_files.push((runner, path.clone()));
+                    }
+                    detection.tests.extend(found);
+                    // Test code is never a mutant's target and never makes a change touch
+                    // source. A line it shares with other code still counts.
+                    let test_lines = lang::rust::test_lines(&source);
+                    test_ranges = lang::rust::test_ranges(&source);
+                    changed.retain(|l| !test_lines.iter().any(|(s, e)| (*s..=*e).contains(l)));
+                }
+                if changed.is_empty() {
+                    continue;
+                }
+                let mut functions = lang::find_functions(lang, &source);
+                functions.retain(|f| {
+                    !test_ranges
+                        .iter()
+                        .any(|(s, e)| (*s..*e).contains(&f.start_byte))
+                });
                 let mut owners: BTreeSet<usize> = BTreeSet::new();
-                for line in &change.added {
+                for line in &changed {
                     owners.extend(lang::innermost_function(&functions, *line));
                 }
                 for i in owners {
@@ -219,13 +278,37 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
                     runner,
                     file: path,
                     lang,
-                    changed: change.added.clone(),
+                    changed,
                 });
             }
             Role::NotAnalyzed => detection.not_analyzed.push(path),
         }
     }
     Ok(detection)
+}
+
+/// The tests in `source` whose spans intersect a changed line.
+fn changed_tests(
+    runner: &Runner,
+    path: &str,
+    lang: Lang,
+    source: &str,
+    added: &BTreeSet<u32>,
+) -> Vec<TestCase> {
+    lang::find_tests(lang, source, python_style(runner.config.kind))
+        .into_iter()
+        .filter(|def| added.iter().any(|l| (def.line..=def.end_line).contains(l)))
+        .map(|def| TestCase {
+            runner: runner.name().to_string(),
+            file: path.to_string(),
+            line: def.report_line,
+            end_line: def.end_line,
+            id: runner.test_id(path, &def.suite, &def.name, def.report_line),
+            suite: def.suite,
+            name: def.name,
+            skip: def.skip,
+        })
+        .collect()
 }
 
 pub fn read_head(session: &Session, path: &str) -> anyhow::Result<String> {
@@ -293,6 +376,34 @@ mod tests {
         assert_eq!(c.role("web/scripts/build.py"), Role::NotAnalyzed);
         assert_eq!(c.role("scripts/deploy.py"), Role::NotAnalyzed);
         assert_eq!(c.role("api/README.md"), Role::NotAnalyzed);
+    }
+
+    #[test]
+    fn cargo_test_files_are_integration_tests_outside_src() {
+        let c = classifier("[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\"]\n");
+        assert_eq!(c.role("tests/api.rs"), Role::Test { runner: 0 });
+        assert_eq!(
+            c.role("crates/a/tests/common/mod.rs"),
+            Role::Test { runner: 0 }
+        );
+        assert_eq!(
+            c.role("tests/fixtures/data.json"),
+            Role::Support { runner: 0 }
+        );
+        for source in [
+            "src/tests.rs",
+            "src/tests/mod.rs",
+            "crates/a/src/x/tests/y.rs",
+        ] {
+            assert_eq!(
+                c.role(source),
+                Role::Source {
+                    runner: 0,
+                    lang: Lang::Rust
+                },
+                "{source}"
+            );
+        }
     }
 
     #[test]

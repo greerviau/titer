@@ -103,6 +103,7 @@ fn walk_tests(
                     end_line: end_line_of(node),
                     report_line: reported_line(func),
                     skip,
+                    parametrized: false,
                     start_byte: node.start_byte(),
                     end_byte: node.end_byte(),
                 });

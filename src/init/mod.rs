@@ -73,7 +73,7 @@ pub fn run(cwd: &Path, dry_run: bool, update: bool) -> anyhow::Result<Plan> {
         let runners = detect_runners(&root)?;
         if runners.is_empty() {
             bail!(
-                "found no pytest, unittest, or vitest project; write titer.toml by hand (see docs/configuration.md)"
+                "found no pytest, unittest, vitest, or cargo project; write titer.toml by hand (see docs/configuration.md)"
             );
         }
         let text = render_config(&runners);
@@ -185,10 +185,19 @@ pub fn stamp_warning(root: &Path) -> Option<String> {
 pub fn detect_runners(root: &Path) -> anyhow::Result<Vec<DetectedRunner>> {
     let mut dirs = Vec::new();
     collect_dirs(root, root, 0, &mut dirs);
-    let mut runners = Vec::new();
+    let mut runners: Vec<DetectedRunner> = Vec::new();
     for dir in dirs {
         let rel = rel_dir(root, &dir);
         if let Some(r) = detect_vitest(&dir, &rel) {
+            runners.push(r);
+        }
+        // One cargo runner covers a workspace and its members; dirs come parents first. A
+        // package that no workspace above it lists gets its own runner.
+        let member = runners
+            .iter()
+            .filter(|r| r.kind == "cargo")
+            .any(|r| workspace_member(&root.join(&r.cwd), &r.cwd, &rel));
+        if !member && let Some(r) = detect_cargo(&dir, &rel) {
             runners.push(r);
         }
         if let Some(r) = detect_python(&dir, &rel) {
@@ -282,6 +291,39 @@ fn detect_vitest(dir: &Path, rel: &str) -> Option<DetectedRunner> {
             "vitest".into(),
             "run".into(),
         ],
+        start_dir: None,
+    })
+}
+
+/// Whether cargo counts the package at repo-relative `rel` as a member of the workspace
+/// rooted at `workspace_dir` (repo-relative `workspace_rel`), listed or joined as a path
+/// dependency. `cargo metadata` decides; it reads the manifests and writes nothing.
+fn workspace_member(workspace_dir: &Path, workspace_rel: &str, rel: &str) -> bool {
+    let inner = if workspace_rel == "." {
+        Some(rel)
+    } else {
+        rel.strip_prefix(&format!("{workspace_rel}/"))
+    };
+    let Some(inner) = inner else {
+        return false;
+    };
+    crate::runner::cargo::targets::index(workspace_dir)
+        .members
+        .iter()
+        .any(|m| m == inner)
+}
+
+fn detect_cargo(dir: &Path, rel: &str) -> Option<DetectedRunner> {
+    let text = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+    let manifest: toml::Table = text.parse().ok()?;
+    if !manifest.contains_key("package") && !manifest.contains_key("workspace") {
+        return None;
+    }
+    Some(DetectedRunner {
+        name: "cargo".to_string(),
+        kind: "cargo",
+        cwd: rel.to_string(),
+        command: vec!["cargo".into(), "test".into()],
         start_dir: None,
     })
 }

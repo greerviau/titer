@@ -39,7 +39,7 @@ pub struct Loaded {
 pub fn load(ctx: &Context, path: &Path) -> anyhow::Result<Loaded> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read --mutants {}", path.display()))?;
-    let classifier = Classifier::new(&ctx.runners)?;
+    let classifier = Classifier::in_checkout(&ctx.runners, ctx.session.git.root())?;
     let mut out = Vec::new();
     let mut warnings = Vec::new();
     for (n, raw) in text.lines().enumerate() {
@@ -68,6 +68,19 @@ pub fn load(ctx: &Context, path: &Path) -> anyhow::Result<Loaded> {
             }
         };
         let end = spec.end_line.unwrap_or(spec.line);
+        let in_tests = crate::lang::Lang::of(&spec.file) == Some(crate::lang::Lang::Rust)
+            && crate::lang::rust::test_spans(&original)
+                .iter()
+                .any(|(s, e)| spec.line <= *e && *s <= end);
+        if in_tests {
+            warnings.push(format!(
+                "agent mutant on line {} skipped: lines {}-{end} of {} hold test code",
+                n + 1,
+                spec.line,
+                spec.file
+            ));
+            continue;
+        }
         let lines: Vec<&str> = original.split_inclusive('\n').collect();
         if spec.line == 0 || end < spec.line || end as usize > lines.len() {
             warnings.push(format!(
