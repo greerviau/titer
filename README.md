@@ -34,7 +34,7 @@ npx @greerviau/titer init   # or: uvx titer init
 `init` detects the repo's runners and writes four things for you to review and commit:
 
 - `titer.toml`, with one `[[runner]]` per project (a monorepo gets several)
-- a pinned `titer` dev dependency in `package.json` or `pyproject.toml`
+- a pinned dev dependency: `@greerviau/titer` in `package.json`, or `titer` in `pyproject.toml`
 - the repo skill in `.agents/skills/titer/SKILL.md` (Codex, Cursor, OpenCode) and `.claude/skills/titer/SKILL.md` (Claude Code)
 
 The skill tells agents when to run `check`, how to read the report, how to triage survivors, and never to weaken a test to pass. `init --dry-run` prints the plan without writing. `init --update` rewrites the skill and the pin after an upgrade; `check` warns when they are out of date.

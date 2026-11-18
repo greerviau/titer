@@ -93,6 +93,15 @@ runs:
         }
 
         # Finds the dir whose manifest pins titer: the repo root, then each runner cwd.
+        # package.json is parsed because a grep would also match the name under overrides
+        # or with an escaped slash. npx needs node, so a repo without node has no npm pin.
+        npm_pins_titer() {
+          command -v node >/dev/null 2>&1 && node -e '
+            const pkg = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+            const fields = ["dependencies", "devDependencies", "optionalDependencies"];
+            process.exit(fields.some((f) => pkg[f] && pkg[f]["@greerviau/titer"]) ? 0 : 1);
+          ' "$1" 2>/dev/null
+        }
         pinned_dir=""
         command="$TITER_COMMAND"
         if [ -z "$command" ]; then
@@ -101,7 +110,7 @@ runs:
             dirs="$dirs $(sed -n 's/^cwd *= *"\(.*\)"/\1/p' titer.toml)"
           fi
           for dir in $dirs; do
-            if [ -f "$dir/package.json" ] && grep -Eq '"@greerviau/titer"[[:space:]]*:' "$dir/package.json"; then
+            if [ -f "$dir/package.json" ] && npm_pins_titer "$dir/package.json"; then
               command="npx --no-install titer"; pinned_dir="$dir"; break
             fi
             if [ -f "$dir/pyproject.toml" ] && grep -Eq "[\"']titer[[:space:]]*([=<>~!;[]|[\"'])" "$dir/pyproject.toml"; then
