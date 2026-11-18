@@ -88,9 +88,45 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
         }
         let runner_error =
             (json.trim().is_empty() && !out.timed_out && !out.success()).then(|| output_tail(&out));
+        let mut file_errors = parsed.file_errors;
+        // vitest also fails a run for errors outside any test, such as an unhandled
+        // rejection, and then reports every test as passed. The run still failed, so the
+        // selected files share the failure.
+        let failed_test = parsed
+            .outcomes
+            .iter()
+            .any(|o| matches!(o.status, Status::Failed(_)));
+        if !json.trim().is_empty()
+            && !out.timed_out
+            && out.exit_code == Some(1)
+            && !failed_test
+            && file_errors.is_empty()
+        {
+            let failure = Failure {
+                kind: FailureKind::Exception,
+                exception_type: None,
+                message: "vitest failed the run after its tests passed, for example on an unhandled error".to_string(),
+            };
+            let files: Vec<String> = match req.selection {
+                Selection::Tests(_) => selected_lines
+                    .iter()
+                    .flatten()
+                    .map(|(f, _)| f.clone())
+                    .collect(),
+                Selection::Files(_) => selectors.clone(),
+                Selection::Suite => vec![String::new()],
+            };
+            for file in files {
+                file_errors.push(FileError {
+                    file: format!("./{file}"),
+                    failure: failure.clone(),
+                });
+            }
+            file_errors.dedup();
+        }
         return Ok(TestRun {
             outcomes: parsed.outcomes,
-            file_errors: parsed.file_errors,
+            file_errors,
             timed_out: out.timed_out,
             duration: out.duration,
             max_rss_bytes: out.max_rss_bytes,

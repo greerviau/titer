@@ -276,3 +276,23 @@ fn a_throwing_after_all_hook_is_a_file_error() {
     assert_eq!(run.result_for(&test, "web"), CaseResult::Passed, "{run:?}");
     assert_eq!(run.file_errors.len(), 1, "{run:?}");
 }
+
+#[test]
+fn an_unhandled_error_outside_tests_fails_the_selected_file() {
+    let repo = fixture();
+    repo.write(
+        "web/src/unhandled.test.ts",
+        "import { it, expect } from \"vitest\";\n\nit(\"passes\", () => {\n  setTimeout(() => { throw new Error(\"late\"); }, 0);\n  expect(1).toBe(1);\n});\n\nit(\"waits\", async () => {\n  await new Promise((r) => setTimeout(r, 50));\n});\n",
+    );
+    let runner = runner();
+    let test = case(&runner, "web/src/unhandled.test.ts", &[], "passes", 3);
+    let wait = case(&runner, "web/src/unhandled.test.ts", &[], "waits", 8);
+
+    let run = run(&repo, &runner, Selection::Tests(&[test, wait]), false);
+
+    assert_eq!(run.file_errors.len(), 1, "{run:?}");
+    assert!(
+        run.file_errors[0].failure.message.contains("unhandled"),
+        "{run:?}"
+    );
+}
