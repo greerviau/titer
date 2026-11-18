@@ -124,7 +124,7 @@ steps:
       # The pull request head, so annotations land on the right diff lines.
       ref: ${{ github.event.pull_request.head.sha }}
   # Install the repo's dependencies here.
-  - uses: greerviau/titer@v1
+  - uses: greerviau/titer@v0.1
     with:
       comment: true
 ```
