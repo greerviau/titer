@@ -254,7 +254,7 @@ fn a_changed_test_in_a_mixin_runs_in_each_test_case_that_inherits_it() {
     repo.git(&["checkout", "-q", "-b", "fix"]);
     repo.write("app.py", "def double(x):\n    return x * 2\n").write(
         "tests/test_app.py",
-        "import unittest\n\nfrom app import double\n\n\nclass Checks:\n    def test_double(self):\n        self.assertEqual(double(2), 4)\n\n\nclass FastTest(Checks, unittest.TestCase):\n    pass\n\n\nclass Slow(Checks, unittest.TestCase):\n    pass\n\n\nclass Other(unittest.TestCase):\n    def test_other(self):\n        pass\n",
+        "import unittest\n\nfrom app import double\n\n\nclass Checks:\n    def test_double(self):\n        self.assertEqual(double(self.n), 2 * self.n)\n\n\nclass FastTest(Checks, unittest.TestCase):\n    n = 2\n\n\nclass Slow(Checks, unittest.TestCase):\n    n = 0\n\n\nclass Other(unittest.TestCase):\n    def test_other(self):\n        pass\n",
     );
 
     let output = repo.titer(&["check", "--json", "--only", "prove"]);
@@ -276,8 +276,9 @@ fn a_changed_test_in_a_mixin_runs_in_each_test_case_that_inherits_it() {
     assert_eq!(
         tests,
         vec![
+            // Each class's own result: double(0) is 0 on base too.
             ("test_app.FastTest.test_double".into(), "assertion".into()),
-            ("test_app.Slow.test_double".into(), "assertion".into()),
+            ("test_app.Slow.test_double".into(), "passes_on_base".into()),
         ],
         "{report:#}"
     );
