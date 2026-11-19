@@ -1,7 +1,7 @@
 //! Changed-test and source-function detection: which files, tests, and functions a change
 //! touches.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -317,21 +317,40 @@ fn changed_tests(
             })
             .collect();
     let changed = |def: &lang::TestDef| added.iter().any(|l| (def.line..=def.end_line).contains(l));
-    let mut by_id: BTreeMap<&str, Vec<&lang::TestDef>> = BTreeMap::new();
+    // Groups in the order their first test appears, so warnings follow the source.
+    let mut by_id: Vec<(&str, Vec<&lang::TestDef>)> = Vec::new();
     for (id, def) in &all {
-        by_id.entry(id.as_str()).or_default().push(def);
+        match by_id.iter_mut().find(|(i, _)| *i == id.as_str()) {
+            Some((_, defs)) => defs.push(def),
+            None => by_id.push((id.as_str(), vec![def])),
+        }
     }
-    let warnings = by_id
-        .into_iter()
-        .filter(|(_, defs)| defs.len() > 1 && defs.iter().any(|d| changed(d)))
-        .map(|(id, defs)| {
-            let names: Vec<String> = defs.iter().map(|d| format!("{:?}", full_name(d))).collect();
-            format!(
-                "tests {} share the selector {id}, so titer runs them together and reports their combined result for each",
-                names.join(" and ")
-            )
-        })
-        .collect();
+    let mut warnings = Vec::new();
+    for (id, defs) in by_id {
+        if defs.len() < 2 || !defs.iter().any(|d| changed(d)) {
+            continue;
+        }
+        let same_name = defs
+            .iter()
+            .all(|d| (&d.suite, &d.name) == (&defs[0].suite, &defs[0].name));
+        if same_name {
+            // Python rebinds the name, so only the last definition runs. Rust twins differ
+            // by #[cfg], so at most one compiles, and neither case shares a run.
+            if lang.is_python() {
+                warnings.push(format!(
+                    "test {:?} is defined {} times in {path}; only the last definition runs",
+                    full_name(defs[0]),
+                    defs.len()
+                ));
+            }
+            continue;
+        }
+        let names: Vec<String> = defs.iter().map(|d| format!("{:?}", full_name(d))).collect();
+        warnings.push(format!(
+            "tests {} share the selector {id}, so titer runs them together and reports their combined result for each",
+            names.join(" and ")
+        ));
+    }
     let tests = all
         .into_iter()
         .filter(|(_, def)| changed(def))

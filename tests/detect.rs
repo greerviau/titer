@@ -147,3 +147,48 @@ fn maps_changed_lines_to_tests_and_functions() {
     );
     assert_eq!(detection.not_analyzed, vec!["README.md".to_string()]);
 }
+
+#[test]
+fn warns_only_about_changed_tests_that_share_a_selector() {
+    let repo = Fixture::new();
+    let same_line = "import { it, expect } from \"vitest\";\n\nit(\"a\", () => { expect(1).toBe(1); }); it(\"b\", () => { expect(2).toBe(2); });\nit(\"c\", () => {\n  expect(3).toBe(3);\n});\nit(\"d\", () => { expect(4).toBe(4); }); it(\"e\", () => { expect(5).toBe(5); });\n";
+    repo.write("titer.toml", CONFIG)
+        .write("web/src/a.test.ts", same_line)
+        .write(
+            "api/tests/test_dup.py",
+            "def test_x():\n    assert True\n\n\ndef test_x():\n    assert 1\n",
+        );
+    repo.commit_all("base");
+    repo.git(&["checkout", "-q", "-b", "feat"]);
+    // Only "c" changes on its own lines, and "b" changes on the line it shares with "a".
+    repo.write(
+        "web/src/a.test.ts",
+        &same_line
+            .replace("expect(2).toBe(2)", "expect(2).toBe(2.0)")
+            .replace("expect(3).toBe(3)", "expect(3).toBe(3.0)"),
+    )
+    .write(
+        "api/tests/test_dup.py",
+        "def test_x():\n    assert True\n\n\ndef test_x():\n    assert 2\n",
+    );
+
+    let session = Session::open(repo.path(), None).unwrap();
+    let runners: Vec<Runner> = session
+        .config
+        .runners
+        .iter()
+        .cloned()
+        .map(Runner::new)
+        .collect();
+    let detection = detect(&session, &runners).unwrap();
+
+    assert_eq!(
+        detection.warnings,
+        vec![
+            "test \"test_x\" is defined 2 times in api/tests/test_dup.py; only the last definition runs"
+                .to_string(),
+            "tests \"a\" and \"b\" share the selector src/a.test.ts:3, so titer runs them together and reports their combined result for each"
+                .to_string(),
+        ]
+    );
+}
