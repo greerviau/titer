@@ -79,6 +79,11 @@ pub fn run(cwd: &Path, dry_run: bool, update: bool) -> anyhow::Result<Plan> {
         let text = render_config(&runners);
         Config::parse(&text).context("the generated titer.toml does not parse")?;
         plan.writes.push((config_path, text));
+        for dir in script_dirs(&root, &runners) {
+            plan.notes.push(format!(
+                "if `{dir}/` holds only build or tooling scripts, add \"{dir}/**\" to [mutate] exclude_globs in titer.toml, so titer does not mutate them"
+            ));
+        }
         let dirs: Vec<String> = runners.iter().map(|r| r.cwd.clone()).collect();
         pin_dependencies(&root, &dirs, &mut plan)?;
     }
@@ -88,9 +93,7 @@ pub fn run(cwd: &Path, dry_run: bool, update: bool) -> anyhow::Result<Plan> {
     for path in SKILL_PATHS {
         plan.writes.push((root.join(path), skill.clone()));
     }
-    for (path, _) in &plan.writes {
-        refuse_symlinks(&root, path)?;
-    }
+    plan.writes = resolve_writes(&root, std::mem::take(&mut plan.writes))?;
     if !dry_run {
         for (path, contents) in &plan.writes {
             if let Some(parent) = path.parent() {
@@ -103,20 +106,91 @@ pub fn run(cwd: &Path, dry_run: bool, update: bool) -> anyhow::Result<Plan> {
     Ok(plan)
 }
 
-/// Fails when any dir on the way to `path` inside the repo is a symlink, so `init` never
-/// writes into a directory shared with other repos or the user's own config.
-fn refuse_symlinks(root: &Path, path: &Path) -> anyhow::Result<()> {
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    let mut current = root.to_path_buf();
-    for part in rel.components() {
-        current.push(part);
-        if current.is_symlink() {
-            bail!(
-                "refusing to write {}: {} is a symlink, and titer writes only inside the repo",
-                path.display(),
-                current.display()
-            );
+/// Checks every planned write before any is made. A path with no symlink on the way is
+/// written as it is. A path with one is allowed only when it leads to another planned
+/// write that has none, such as `.agents/skills -> ../.claude/skills`, and that write
+/// covers both. Any other symlink is refused, so `init` never writes into a directory
+/// shared with other repos, the user's own config, or git's files. An existing
+/// destination must be a regular file with no other hard links.
+fn resolve_writes(
+    root: &Path,
+    writes: Vec<(PathBuf, String)>,
+) -> anyhow::Result<Vec<(PathBuf, String)>> {
+    let real_root = root
+        .canonicalize()
+        .with_context(|| format!("cannot resolve {}", root.display()))?;
+    let mut direct: Vec<(PathBuf, String)> = Vec::new();
+    let mut linked: Vec<(PathBuf, String)> = Vec::new();
+    for (path, contents) in writes {
+        let rel = path.strip_prefix(root).with_context(|| {
+            format!(
+                "refusing to write {}: it is outside the repo",
+                path.display()
+            )
+        })?;
+        let mut current = root.to_path_buf();
+        let mut through_link = false;
+        for part in rel.components() {
+            current.push(part);
+            through_link |= current.is_symlink();
         }
+        if through_link {
+            linked.push((path, contents));
+        } else {
+            check_destination(&path)?;
+            direct.push((real_root.join(rel), contents));
+        }
+    }
+    for (path, contents) in linked {
+        // titer writes only the direct path, so a wrong answer here can at worst leave
+        // the linked copy unwritten, never redirect a write.
+        let real = real_path(&path);
+        let target = direct.iter().find(|(p, _)| real.as_ref() == Some(p));
+        match target {
+            Some((_, existing)) if *existing == contents => {}
+            _ => bail!(
+                "refusing to write {}: a symlink is on its path, and titer follows one only when it leads to another file titer writes",
+                path.display()
+            ),
+        }
+    }
+    Ok(direct)
+}
+
+/// Where `path` leads: its deepest existing part resolved by the OS, plus the parts that do
+/// not exist yet. None when one of those parts is a dangling symlink.
+fn real_path(path: &Path) -> Option<PathBuf> {
+    let mut existing = path.to_path_buf();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        if existing.symlink_metadata().is_ok() {
+            return None;
+        }
+        missing.push(existing.file_name()?.to_os_string());
+        existing.pop();
+    }
+    let mut real = existing.canonicalize().ok()?;
+    real.extend(missing.iter().rev());
+    Some(real)
+}
+
+/// An existing destination must be a regular file with no other hard links, so a write
+/// cannot block on a FIFO or change a file another path shares.
+fn check_destination(path: &Path) -> anyhow::Result<()> {
+    let Ok(meta) = path.symlink_metadata() else {
+        return Ok(());
+    };
+    if !meta.is_file() {
+        bail!(
+            "refusing to write {}: it is not a regular file",
+            path.display()
+        );
+    }
+    if std::os::unix::fs::MetadataExt::nlink(&meta) > 1 {
+        bail!(
+            "refusing to write {}: it is hardlinked to another file",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -490,7 +564,95 @@ pub fn render_config(runners: &[DetectedRunner]) -> String {
         out.push('\n');
     }
     out.push_str("[gate]\n# fail_on_survivors = false\n# fail_on_passes_on_base = false\n# fail_on_scan = false\n# fail_on_crap = false\n");
+    let excluded: Vec<String> = runners
+        .iter()
+        .flat_map(|r| {
+            TOOL_CONFIGS
+                .iter()
+                .filter(move |(kind, _)| *kind == r.kind)
+                .filter(move |_| !has_glob_syntax(&r.cwd))
+                .map(move |(_, glob)| quote(&under(&r.cwd, glob)))
+        })
+        .collect();
+    if !excluded.is_empty() {
+        out.push_str("\n[mutate]\n# Tool configs, which the tests load but do not test.\nexclude_globs = [\n");
+        for glob in excluded {
+            out.push_str(&format!("    {glob},\n"));
+        }
+        out.push_str("]\n");
+    }
     out
+}
+
+/// Tool configs in a runner's dir, per kind. The test runner loads them, so a canary in one
+/// can neither be killed nor survive cleanly, and their mutants say nothing about the tests.
+/// Only known tools' names, since an app can keep its own source in a file such as
+/// `app.config.ts`.
+const TOOL_CONFIGS: &[(&str, &str)] = &[
+    (
+        "vitest",
+        "{vite,vitest,eslint,prettier,stylelint,tailwind,postcss,babel,jest,playwright,cypress,webpack,rollup,rolldown,esbuild,tsup,svelte,astro,next,nuxt,remix,commitlint,lint-staged}.config.*",
+    ),
+    ("vitest", "vitest.workspace.*"),
+    (
+        "vitest",
+        ".{eslint,prettier,babel,stylelint,lintstaged,mocha}rc.*",
+    ),
+    ("pytest", "setup.py"),
+    ("pytest", "noxfile.py"),
+    ("unittest", "setup.py"),
+    ("unittest", "noxfile.py"),
+];
+
+/// Whether a path has characters that globset reads as glob syntax. Escaping them does not
+/// round-trip for every character, so such a runner dir gets no generated globs.
+fn has_glob_syntax(path: &str) -> bool {
+    path.contains(['*', '?', '[', ']', '{', '}', '\\', '!'])
+}
+
+/// Dirs that conventionally hold build or tooling scripts.
+const SCRIPT_DIRS: &[&str] = &["scripts", "tools"];
+
+/// `glob` relative to the repo root, for a runner in repo-relative `cwd`.
+fn under(cwd: &str, glob: &str) -> String {
+    if cwd == "." {
+        glob.to_string()
+    } else {
+        format!("{cwd}/{glob}")
+    }
+}
+
+/// Repo-relative script dirs at the root or in a runner's dir that hold source files, at any
+/// depth outside dependency and build dirs, which
+/// titer would mutate. Whether they hold only scripts is the developer's call.
+fn script_dirs(root: &Path, runners: &[DetectedRunner]) -> Vec<String> {
+    let mut bases: Vec<&str> = vec!["."];
+    bases.extend(runners.iter().map(|r| r.cwd.as_str()));
+    let mut out: Vec<String> = Vec::new();
+    for base in bases {
+        for name in SCRIPT_DIRS {
+            let rel = under(base, name);
+            if !out.contains(&rel) && !has_glob_syntax(&rel) && holds_source(&root.join(&rel)) {
+                out.push(rel);
+            }
+        }
+    }
+    out
+}
+
+fn holds_source(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let path = e.path();
+        // file_type does not follow symlinks, so a link cycle cannot recurse forever.
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
+            !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()) && holds_source(&path)
+        } else {
+            crate::lang::Lang::of(&path.to_string_lossy()).is_some()
+        }
+    })
 }
 
 fn quote(text: &str) -> String {
@@ -543,19 +705,67 @@ pub fn pin_npm(text: &str) -> anyhow::Result<String> {
         .context("package.json is not an object")?;
     let dev = object
         .entry("devDependencies")
-        .or_insert_with(|| serde_json::Value::Object(Default::default()));
-    dev.as_object_mut()
-        .context("devDependencies is not an object")?
-        .insert(
-            NPM_PACKAGE.to_string(),
-            serde_json::Value::String(VERSION.to_string()),
-        );
+        .or_insert_with(|| serde_json::Value::Object(Default::default()))
+        .as_object_mut()
+        .context("devDependencies is not an object")?;
+    let pin = serde_json::Value::String(VERSION.to_string());
+    if let Some(existing) = dev.get_mut(NPM_PACKAGE) {
+        *existing = pin;
+    } else {
+        // npm keeps dependency maps sorted and `npm install` does not re-sort them, so a
+        // pin appended to a sorted map stays out of order. An unsorted map gets it last.
+        let mut entries: Vec<(String, serde_json::Value)> =
+            std::mem::take(dev).into_iter().collect();
+        let at = if entries.is_sorted_by(|a, b| npm_order(&a.0, &b.0).is_le()) {
+            entries.partition_point(|(k, _)| npm_order(k, NPM_PACKAGE).is_lt())
+        } else {
+            entries.len()
+        };
+        entries.insert(at, (NPM_PACKAGE.to_string(), pin));
+        dev.extend(entries);
+    }
     let indent = detect_indent(text);
     let mut out = Vec::new();
     let formatter = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
     let mut ser = serde_json::Serializer::with_formatter(&mut out, formatter);
     serde::Serialize::serialize(&json, &mut ser)?;
-    Ok(format!("{}\n", String::from_utf8(out)?))
+    let out = format!("{}\n", String::from_utf8(out)?);
+    Ok(if text.contains("\r\n") {
+        out.replace('\n', "\r\n")
+    } else {
+        out
+    })
+}
+
+/// The order npm sorts dependency names in: `localeCompare` with the `en` locale. ICU's
+/// root collation puts ASCII punctuation first, in this order, then digits, then letters
+/// without regard to case; a tie then puts lowercase first.
+fn npm_order(a: &str, b: &str) -> std::cmp::Ordering {
+    // A JavaScript object lists integer keys first, in numeric order, whatever npm sorts.
+    let index = |k: &str| -> Option<u32> {
+        k.parse::<u32>()
+            .ok()
+            .filter(|n| *n < u32::MAX && n.to_string() == k)
+    };
+    match (index(a), index(b)) {
+        (Some(x), Some(y)) => return x.cmp(&y),
+        (Some(_), None) => return std::cmp::Ordering::Less,
+        (None, Some(_)) => return std::cmp::Ordering::Greater,
+        (None, None) => {}
+    }
+    const PUNCTUATION: &str = "_-,;:!?.'\"()[]{}@*/\\&#%`^+<=>|~$";
+    let primary = |c: char| -> (u8, u32) {
+        match PUNCTUATION.find(c) {
+            Some(i) => (0, i as u32),
+            None if c.is_ascii_digit() => (1, c as u32),
+            None => (2, c.to_ascii_lowercase() as u32),
+        }
+    };
+    let tertiary = |c: char| c.is_ascii_uppercase();
+    a.chars()
+        .map(primary)
+        .cmp(b.chars().map(primary))
+        .then_with(|| a.chars().map(tertiary).cmp(b.chars().map(tertiary)))
 }
 
 fn detect_indent(text: &str) -> String {
@@ -616,9 +826,99 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "{{\n    \"name\": \"web\",\n    \"devDependencies\": {{\n        \"vitest\": \"^5.1.0\",\n        \"@greerviau/titer\": \"{VERSION}\"\n    }},\n    \"scripts\": {{}}\n}}\n"
+                "{{\n    \"name\": \"web\",\n    \"devDependencies\": {{\n        \"@greerviau/titer\": \"{VERSION}\",\n        \"vitest\": \"^5.1.0\"\n    }},\n    \"scripts\": {{}}\n}}\n"
             )
         );
+    }
+
+    #[test]
+    fn pins_npm_in_sorted_position_and_appends_to_an_unsorted_map() {
+        let dev = |text: &str| -> Vec<String> {
+            let json: serde_json::Value = serde_json::from_str(&pin_npm(text).unwrap()).unwrap();
+            json["devDependencies"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            dev(
+                r#"{"devDependencies": {"@eslint/js": "1", "@types/node": "1", "Vite": "1", "vitest": "1"}}"#
+            ),
+            [
+                "@eslint/js",
+                "@greerviau/titer",
+                "@types/node",
+                "Vite",
+                "vitest"
+            ]
+        );
+        assert_eq!(
+            dev(r#"{"devDependencies": {"vitest": "1", "@types/node": "1"}}"#),
+            ["vitest", "@types/node", "@greerviau/titer"]
+        );
+        assert_eq!(
+            dev(r#"{"devDependencies": {"vitest": "1", "@greerviau/titer": "0.0.1"}}"#),
+            ["vitest", "@greerviau/titer"]
+        );
+        assert_eq!(dev("{}"), ["@greerviau/titer"]);
+        // npm puts _ before -, and both before letters.
+        assert_eq!(
+            dev(r#"{"devDependencies": {"a_b": "1", "a-b": "1", "vitest": "1"}}"#),
+            ["@greerviau/titer", "a_b", "a-b", "vitest"]
+        );
+        // Integer names come first in any JavaScript object.
+        assert_eq!(
+            dev(r#"{"devDependencies": {"2": "1", "@types/node": "1", "vitest": "1"}}"#),
+            ["2", "@greerviau/titer", "@types/node", "vitest"]
+        );
+    }
+
+    #[test]
+    fn exclude_globs_match_tool_configs_only_and_escape_the_runner_dir() {
+        let runner = |cwd: &str| DetectedRunner {
+            name: "web".into(),
+            kind: "vitest",
+            cwd: cwd.into(),
+            command: vec!["x".into()],
+            start_dir: None,
+        };
+        for (cwd, prefix) in [("clients/web", "clients/web/"), (".", "")] {
+            let config = Config::parse(&render_config(&[runner(cwd)])).unwrap();
+            let globs = crate::detect::glob_set(&config.mutate.exclude_globs).unwrap();
+            for (file, excluded) in [
+                ("vite.config.ts", true),
+                ("eslint.config.js", true),
+                (".eslintrc.cjs", true),
+                ("app.config.ts", false),
+                ("src/vite.config.ts", false),
+                ("src/half.ts", false),
+            ] {
+                let path = format!("{prefix}{file}");
+                assert_eq!(globs.is_match(&path), excluded, "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_runner_dir_with_glob_syntax_gets_no_exclude_globs() {
+        let runner = DetectedRunner {
+            name: "web".into(),
+            kind: "vitest",
+            cwd: "web[1]".into(),
+            command: vec!["x".into()],
+            start_dir: None,
+        };
+        let config = Config::parse(&render_config(&[runner])).unwrap();
+        assert!(config.mutate.exclude_globs.is_empty());
+    }
+
+    #[test]
+    fn pin_npm_keeps_crlf_line_endings() {
+        let out = pin_npm("{\r\n  \"name\": \"web\"\r\n}\r\n").unwrap();
+        assert!(out.ends_with("}\r\n"), "{out:?}");
+        assert!(!out.replace("\r\n", "").contains('\n'), "{out:?}");
     }
 
     #[test]

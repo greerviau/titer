@@ -79,9 +79,12 @@ fn init_writes_a_config_that_check_runs_with_and_the_skill_for_both_harnesses() 
         "{pyproject}"
     );
     let package = std::fs::read_to_string(repo.path().join("web/package.json")).unwrap();
-    assert!(
-        package.contains(&format!("\"@greerviau/titer\": \"{VERSION}\"")),
-        "{package}"
+    assert_eq!(
+        package,
+        format!(
+            "{{\n  \"name\": \"web\",\n  \"type\": \"module\",\n  \"devDependencies\": {{\n    \"@greerviau/titer\": \"{VERSION}\",\n    \"vitest\": \"5.1.0\"\n  }}\n}}\n"
+        ),
+        "the pin goes in sorted order"
     );
     for skill in [
         ".agents/skills/titer/SKILL.md",
@@ -391,4 +394,215 @@ fn init_detects_pytest_from_dependencies_and_not_from_keywords() {
     assert_eq!(stdout.matches("kind = \"unittest\"").count(), 1, "{stdout}");
     assert!(stdout.contains("cwd = \"svc\""), "{stdout}");
     assert!(stdout.contains("kind = \"cargo\""), "{stdout}");
+}
+
+#[test]
+fn init_excludes_tool_configs_so_a_config_change_still_checks() {
+    let repo = Fixture::new();
+    repo.write(".gitignore", "node_modules\n")
+        .write("clients/web/package.json", "{\n  \"name\": \"web\",\n  \"type\": \"module\",\n  \"devDependencies\": {\n    \"vitest\": \"5.1.0\"\n  }\n}\n")
+        .write("clients/web/vite.config.ts", "import { defineConfig } from \"vitest/config\";\n\nexport default defineConfig({\n  define: { HEADER: JSON.stringify(\"1\") },\n});\n")
+        .write("clients/web/scripts/build.mjs", "console.log(\"build\");\n")
+        .write("clients/web/src/half.ts", "export const half = (x: number) => x / 2;\n")
+        .write("clients/web/src/half.test.ts", "import { it, expect } from \"vitest\";\nimport { half } from \"./half\";\n\nit(\"halves\", () => {\n  expect(half(4)).toBe(2);\n});\n");
+    std::os::unix::fs::symlink(
+        fixture_node_modules(),
+        repo.path().join("clients/web/node_modules"),
+    )
+    .unwrap();
+    repo.commit_all("base");
+
+    let init = repo.titer(&["init"]);
+
+    assert_eq!(
+        init.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let config = std::fs::read_to_string(repo.path().join("titer.toml")).unwrap();
+    assert!(
+        config.contains("[mutate]\n") && config.contains("exclude_globs = ["),
+        "{config}"
+    );
+    assert!(config.contains("\"clients/web/{vite,vitest,"), "{config}");
+    let stdout = String::from_utf8_lossy(&init.stdout);
+    assert!(stdout.contains("\"clients/web/scripts/**\""), "{stdout}");
+
+    repo.commit_all("opt in to titer");
+    repo.git(&["checkout", "-q", "-b", "change"]);
+    repo.write("clients/web/vite.config.ts", "import { defineConfig } from \"vitest/config\";\n\nexport default defineConfig({\n  define: { HEADER: JSON.stringify(2 + 3) },\n});\n");
+    // A change to the config alone makes no mutants and still checks.
+    let config_only = repo.titer(&["check", "--json", "--only", "mutate"]);
+    let report = stdout_json(&config_only);
+    assert_eq!(config_only.status.code(), Some(0), "{report:#}");
+    assert_eq!(report["mutants"], serde_json::json!([]), "{report:#}");
+
+    repo.write(
+        "clients/web/src/half.ts",
+        "export const half = (x: number) => x * 0.5;\n",
+    );
+    let check = repo.titer(&["check", "--json", "--only", "mutate"]);
+    let report = stdout_json(&check);
+    assert_ne!(report["gate"]["status"], "error", "{report:#}");
+    let files: Vec<&str> = report["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["file"].as_str().unwrap())
+        .collect();
+    assert!(!files.is_empty(), "{report:#}");
+    assert!(
+        files.iter().all(|f| *f == "clients/web/src/half.ts"),
+        "{report:#}"
+    );
+}
+
+#[test]
+fn init_writes_the_skill_once_through_an_in_repo_skills_symlink() {
+    let repo = monorepo();
+    std::fs::create_dir_all(repo.path().join(".claude/skills")).unwrap();
+    std::fs::create_dir_all(repo.path().join(".agents")).unwrap();
+    std::os::unix::fs::symlink("../.claude/skills", repo.path().join(".agents/skills")).unwrap();
+
+    let dry = repo.titer(&["init", "--dry-run"]);
+    let output = repo.titer(&["init"]);
+
+    assert_eq!(
+        dry.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&dry.stdout);
+    assert_eq!(stdout.matches("SKILL.md").count(), 1, "{stdout}");
+    assert!(stdout.contains(".claude/skills/titer/SKILL.md"), "{stdout}");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(repo.path().join(".agents/skills").is_symlink());
+    let text = std::fs::read_to_string(repo.path().join(".agents/skills/titer/SKILL.md")).unwrap();
+    assert!(text.contains(&format!("<!-- titer-version: {VERSION} -->")));
+}
+
+#[test]
+fn init_refuses_a_dangling_skill_link_through_an_outside_symlink_and_into_git() {
+    let repo = monorepo();
+    let outside = repo.scratch().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    // `hop` leads outside; `.agents/skills` dangles through it.
+    std::os::unix::fs::symlink(&outside, repo.path().join("hop")).unwrap();
+    std::fs::create_dir_all(repo.path().join(".agents")).unwrap();
+    std::os::unix::fs::symlink("../hop/missing", repo.path().join(".agents/skills")).unwrap();
+
+    let escaped = repo.titer(&["init"]);
+
+    assert_eq!(escaped.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&escaped.stderr).contains("symlink"));
+    assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+
+    std::fs::remove_file(repo.path().join(".agents/skills")).unwrap();
+    std::os::unix::fs::symlink("../.git/hooks", repo.path().join(".agents/skills")).unwrap();
+
+    let into_git = repo.titer(&["init"]);
+
+    assert_eq!(into_git.status.code(), Some(2));
+    assert!(!repo.path().join(".git/hooks/titer").exists());
+    assert!(!repo.path().join("titer.toml").exists());
+}
+
+#[test]
+fn init_refuses_skill_links_into_a_separate_git_dir_through_a_file_or_onto_a_dir() {
+    // Git's files live in `git-data` inside the repo, not in `.git`.
+    let repo = monorepo();
+    let git_data = repo.path().join("git-data");
+    std::fs::rename(repo.path().join(".git"), &git_data).unwrap();
+    std::fs::write(repo.path().join(".git"), "gitdir: git-data\n").unwrap();
+    std::fs::write(repo.path().join("notes.md"), "keep\n").unwrap();
+    std::fs::write(repo.path().join("blocker"), "a file\n").unwrap();
+    let skill_link = |target: &str| {
+        let dir = repo.path().join(".agents/skills/titer");
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("SKILL.md");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(target, &link).unwrap();
+    };
+    let head = std::fs::read_to_string(git_data.join("HEAD")).unwrap();
+
+    for target in [
+        "../../../git-data/HEAD",
+        "../../../blocker/../notes.md",
+        "../../..",
+    ] {
+        skill_link(target);
+
+        let output = repo.titer(&["init"]);
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{target}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(!repo.path().join("titer.toml").exists(), "{target}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(git_data.join("HEAD")).unwrap(),
+        head
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("notes.md")).unwrap(),
+        "keep\n"
+    );
+}
+
+#[test]
+fn init_refuses_dir_links_into_git_files_and_hardlinked_skills() {
+    let repo = monorepo();
+    let git_data = repo.path().join("git-data");
+    std::fs::rename(repo.path().join(".git"), &git_data).unwrap();
+    std::fs::write(repo.path().join(".git"), "gitdir: git-data\n").unwrap();
+    std::fs::create_dir_all(repo.path().join("sub/.git")).unwrap();
+    std::fs::create_dir_all(repo.path().join(".agents")).unwrap();
+    let link = repo.path().join(".agents/skills");
+
+    for target in ["../git-data", "../sub/.git"] {
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(target, &link).unwrap();
+
+        let output = repo.titer(&["init"]);
+
+        assert_eq!(output.status.code(), Some(2), "{target}");
+        assert!(!repo.path().join("titer.toml").exists(), "{target}");
+    }
+    assert!(!git_data.join("titer").exists());
+    assert!(!repo.path().join("sub/.git/titer").exists());
+
+    // A skill hardlinked to a file outside the repo is not overwritten.
+    std::fs::remove_file(&link).unwrap();
+    let outside = repo.scratch().join("shared-skill.md");
+    std::fs::write(&outside, "shared\n").unwrap();
+    std::fs::create_dir_all(repo.path().join(".agents/skills/titer")).unwrap();
+    std::fs::hard_link(&outside, repo.path().join(".agents/skills/titer/SKILL.md")).unwrap();
+
+    let output = repo.titer(&["init"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "shared\n");
+}
+
+#[test]
+fn init_refuses_a_skill_destination_that_is_not_a_regular_file() {
+    let repo = monorepo();
+    std::fs::create_dir_all(repo.path().join(".claude/skills/titer")).unwrap();
+    let fifo = repo.path().join(".claude/skills/titer/SKILL.md");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success());
+
+    let output = repo.titer(&["init"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not a regular file"));
+    assert!(!repo.path().join("titer.toml").exists());
 }
