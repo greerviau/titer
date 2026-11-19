@@ -67,7 +67,80 @@ fn is_test_class(class: Node, source: &str, style: PythonStyle) -> bool {
 pub fn find_tests(root: Node, source: &str, style: PythonStyle) -> Vec<TestDef> {
     let mut out = Vec::new();
     walk_tests(root, source, style, &mut Vec::new(), &mut out);
+    inherited_tests(root, source, style, &mut out);
     out
+}
+
+/// Test methods that a top-level test class inherits from other classes in the same file,
+/// such as a mixin that does not derive from TestCase. The runner runs each one under the
+/// inheriting class, so each gets a test there with the span of the method it inherits.
+fn inherited_tests(root: Node, source: &str, style: PythonStyle, out: &mut Vec<TestDef>) {
+    let classes: Vec<Node> = children(root)
+        .into_iter()
+        .map(|c| unwrap_decorated(c).0)
+        .filter(|c| c.kind() == "class_definition")
+        .collect();
+    let by_name = |name: &str| {
+        classes
+            .iter()
+            .find(|c| name_of(**c, source) == name)
+            .copied()
+    };
+    for class in classes.iter().filter(|c| is_test_class(**c, source, style)) {
+        let suite = vec![name_of(*class, source).to_string()];
+        let mut seen: Vec<String> = test_methods(*class, source)
+            .iter()
+            .map(|(name, _, _)| name.clone())
+            .collect();
+        let mut visited = vec![class.id()];
+        let mut queue: Vec<Node> = base_names(*class, source)
+            .into_iter()
+            .filter_map(by_name)
+            .collect();
+        // Breadth first, which matches Python's method resolution order for the usual
+        // mixin layouts closely enough to pick the method that runs.
+        while !queue.is_empty() {
+            let base = queue.remove(0);
+            if visited.contains(&base.id()) {
+                continue;
+            }
+            visited.push(base.id());
+            for (name, def, outer) in test_methods(base, source) {
+                if seen.contains(&name) {
+                    continue;
+                }
+                seen.push(name.clone());
+                out.push(TestDef {
+                    suite: suite.clone(),
+                    name,
+                    line: line_of(outer),
+                    end_line: end_line_of(outer),
+                    report_line: line_of(def),
+                    skip: false,
+                    parametrized: false,
+                    start_byte: outer.start_byte(),
+                    end_byte: outer.end_byte(),
+                });
+            }
+            queue.extend(base_names(base, source).into_iter().filter_map(by_name));
+        }
+    }
+}
+
+/// The `test*` methods a class body defines: name, definition, and the decorated outer node.
+fn test_methods<'a>(class: Node<'a>, source: &str) -> Vec<(String, Node<'a>, Node<'a>)> {
+    let Some(body) = class.child_by_field_name("body") else {
+        return Vec::new();
+    };
+    children(body)
+        .into_iter()
+        .filter_map(|c| {
+            let (def, outer) = unwrap_decorated(c);
+            let name = name_of(def, source);
+            (def.kind() == "function_definition" && name.starts_with("test"))
+                .then(|| (name.to_string(), def, outer))
+        })
+        .collect()
 }
 
 fn walk_tests(
@@ -253,6 +326,24 @@ class Bogus(Testable):
     fn finds_unittest_methods_only_in_test_case_classes() {
         let tests = find_tests(Lang::Python, SOURCE, PythonStyle::Unittest);
         assert_eq!(summary(&tests), vec!["LoginTests::test_login 36-37 def 36"]);
+    }
+
+    #[test]
+    fn test_cases_inherit_mixin_tests_unless_they_override_them() {
+        let source = "import unittest\n\n\nclass Base:\n    def test_a(self):\n        pass\n\n\nclass Checks(Base):\n    def test_b(self):\n        pass\n\n\nclass ApiTest(Checks, unittest.TestCase):\n    def test_b(self):\n        pass\n\n\nclass TestChild(ApiTest):\n    pass\n";
+        let unittest = find_tests(Lang::Python, source, PythonStyle::Unittest);
+        assert_eq!(
+            summary(&unittest),
+            vec![
+                "ApiTest::test_b 15-16 def 15",
+                "ApiTest::test_a 5-6 def 5",
+                "TestChild::test_b 15-16 def 15",
+                "TestChild::test_a 5-6 def 5",
+            ]
+        );
+        // pytest also collects the Test* class that inherits from the TestCase.
+        let pytest = find_tests(Lang::Python, source, PythonStyle::Pytest);
+        assert_eq!(summary(&pytest), summary(&unittest));
     }
 
     #[test]

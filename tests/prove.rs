@@ -234,3 +234,51 @@ fn prove_catches_a_missing_export_before_the_base_run() {
         ]
     );
 }
+
+#[test]
+fn a_changed_test_in_a_mixin_runs_in_each_test_case_that_inherits_it() {
+    let repo = Fixture::new();
+    repo.write(
+        "titer.toml",
+        &format!(
+            "[[runner]]\nkind = \"unittest\"\ncommand = [\"{}\", \"-m\", \"unittest\"]\nstart_dir = \"tests\"\n",
+            fixture_python()
+        ),
+    )
+    .write("app.py", "def double(x):\n    return x\n")
+    .write(
+        "tests/test_app.py",
+        "import unittest\n\nfrom app import double\n\n\nclass Checks:\n    def test_double(self):\n        pass\n\n\nclass FastTest(Checks, unittest.TestCase):\n    pass\n\n\nclass Slow(Checks, unittest.TestCase):\n    pass\n\n\nclass Other(unittest.TestCase):\n    def test_other(self):\n        pass\n",
+    );
+    repo.commit_all("base");
+    repo.git(&["checkout", "-q", "-b", "fix"]);
+    repo.write("app.py", "def double(x):\n    return x * 2\n").write(
+        "tests/test_app.py",
+        "import unittest\n\nfrom app import double\n\n\nclass Checks:\n    def test_double(self):\n        self.assertEqual(double(2), 4)\n\n\nclass FastTest(Checks, unittest.TestCase):\n    pass\n\n\nclass Slow(Checks, unittest.TestCase):\n    pass\n\n\nclass Other(unittest.TestCase):\n    def test_other(self):\n        pass\n",
+    );
+
+    let output = repo.titer(&["check", "--json", "--only", "prove"]);
+
+    let report = stdout_json(&output);
+    assert_eq!(output.status.code(), Some(0), "{report:#}");
+    let mut tests: Vec<(String, String)> = report["tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            (
+                t["id"].as_str().unwrap().to_string(),
+                t["verdict"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    tests.sort();
+    assert_eq!(
+        tests,
+        vec![
+            ("test_app.FastTest.test_double".into(), "assertion".into()),
+            ("test_app.Slow.test_double".into(), "assertion".into()),
+        ],
+        "{report:#}"
+    );
+}
