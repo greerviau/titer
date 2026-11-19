@@ -45,13 +45,24 @@ fn is_test_base(name: &str) -> bool {
     test_word || name.contains("TestCase") || name.ends_with("Test") || name.ends_with("Tests")
 }
 
+/// Whether the class defines `__init__`, itself or through `@dataclass`.
 fn defines_init(class: Node, source: &str) -> bool {
-    class.child_by_field_name("body").is_some_and(|body| {
-        children(body).into_iter().any(|c| {
-            let def = unwrap_decorated(c).0;
-            def.kind() == "function_definition" && name_of(def, source) == "__init__"
+    let dataclass = class
+        .parent()
+        .filter(|p| p.kind() == "decorated_definition")
+        .is_some_and(|p| {
+            children(p)
+                .into_iter()
+                .filter(|d| d.kind() == "decorator")
+                .any(|d| text(d, source).contains("dataclass"))
+        });
+    dataclass
+        || class.child_by_field_name("body").is_some_and(|body| {
+            children(body).into_iter().any(|c| {
+                let def = unwrap_decorated(c).0;
+                def.kind() == "function_definition" && name_of(def, source) == "__init__"
+            })
         })
-    })
 }
 
 fn is_test_class(class: Node, source: &str, style: PythonStyle) -> bool {
@@ -295,7 +306,7 @@ impl<'a> Module<'a> {
             return Vec::new();
         };
         let mut out: Vec<(&str, Binding)> = Vec::new();
-        let mut bind = |name: &'a str, b: Binding<'a>| {
+        fn bind<'a>(out: &mut Vec<(&'a str, Binding<'a>)>, name: &'a str, b: Binding<'a>) {
             if !name.starts_with("test") {
                 return;
             }
@@ -303,19 +314,39 @@ impl<'a> Module<'a> {
                 Some(slot) => slot.1 = b,
                 None => out.push((name, b)),
             }
-        };
+        }
         for child in children(body) {
             let (def, outer) = unwrap_decorated(child);
             if def.kind() == "function_definition" {
-                bind(name_of(def, self.source), Binding::Method(def, outer));
+                bind(
+                    &mut out,
+                    name_of(def, self.source),
+                    Binding::Method(def, outer),
+                );
             } else if def.kind() == "expression_statement" {
-                for assign in children(def).into_iter().filter(|n| {
-                    n.kind() == "assignment" && n.child_by_field_name("right").is_some()
-                }) {
-                    if let Some(left) = assign.child_by_field_name("left")
-                        && left.kind() == "identifier"
+                for assign in children(def) {
+                    // `a = b = value` nests, and binds every target to the same value.
+                    let mut targets = Vec::new();
+                    let mut node = assign;
+                    while node.kind() == "assignment"
+                        && let Some(right) = node.child_by_field_name("right")
                     {
-                        bind(text(left, self.source), Binding::Other);
+                        targets.extend(node.child_by_field_name("left"));
+                        node = right;
+                    }
+                    // A plain value such as None hides the test. Anything else, such as
+                    // `test_x = skipUnless(...)(test_x)`, may wrap the method, so the
+                    // method found so far stays the test.
+                    let hides = matches!(
+                        node.kind(),
+                        "none" | "true" | "false" | "integer" | "float" | "string"
+                    );
+                    for left in targets.into_iter().filter(|l| l.kind() == "identifier") {
+                        let name = text(left, self.source);
+                        let known = out.iter().any(|(n, _)| *n == name);
+                        if hides || !known {
+                            bind(&mut out, name, Binding::Other);
+                        }
                     }
                 }
             }
@@ -557,18 +588,21 @@ class Bogus(Testable):
             ["Concrete::test_conflict 12"]
         );
         // A subscripted base is the class it subscripts.
-        let generic = "import unittest\n\nclass Mixin:\n    def test_generic(self):\n        pass\n\nclass Concrete(Mixin[int], unittest.TestCase):\n    pass\n";
+        let generic = "import unittest\nfrom typing import Generic, TypeVar\n\nT = TypeVar(\"T\")\n\nclass Mixin(Generic[T]):\n    def test_generic(self):\n        pass\n\nclass Concrete(Mixin[int], unittest.TestCase):\n    pass\n";
         assert_eq!(
             names(generic, PythonStyle::Unittest),
-            ["Concrete::test_generic 4"]
+            ["Concrete::test_generic 7"]
         );
         // The last binding in a class body wins, and a bare annotation binds nothing.
-        let rebound = "import unittest\n\nclass A(unittest.TestCase):\n    def test_x(self):\n        pass\n    test_x = None\n    test_y = None\n    def test_y(self):\n        pass\n    test_z: int\n    def test_z(self):\n        pass\n";
+        // A chained assignment binds each target, and a wrapping call keeps the method.
+        let rebound = "import unittest\n\nclass A(unittest.TestCase):\n    def test_x(self):\n        pass\n    test_x = None\n    test_y = None\n    def test_y(self):\n        pass\n    def test_z(self):\n        pass\n    test_z: int\n    def test_w(self):\n        pass\n    other = test_w = None\n    def test_v(self):\n        pass\n    test_v = unittest.skipUnless(True, \"x\")(test_v)\n";
         assert_eq!(
             names(rebound, PythonStyle::Unittest),
-            ["A::test_y 8", "A::test_z 11"]
+            ["A::test_y 8", "A::test_z 10", "A::test_v 16"]
         );
-        // pytest skips a Test class that inherits __init__.
+        // pytest skips a Test class that inherits __init__, also one a dataclass makes.
+        let dataclass = "from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    x: int = 0\n\n    def test_x(self):\n        pass\n\nclass TestConcrete(Base):\n    pass\n";
+        assert!(names(dataclass, PythonStyle::Pytest).is_empty());
         let init = "class Base:\n    def __init__(self):\n        pass\n\n    def test_x(self):\n        pass\n\nclass TestConcrete(Base):\n    pass\n";
         assert!(names(init, PythonStyle::Pytest).is_empty());
     }
