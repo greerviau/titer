@@ -433,7 +433,12 @@ fn pin_dependencies(root: &Path, dirs: &[String], plan: &mut Plan) -> anyhow::Re
     } else {
         dirs.iter().map(|d| root.join(d)).collect()
     };
-    targets.dedup();
+    let mut seen = Vec::new();
+    targets.retain(|t| {
+        let new = !seen.contains(t);
+        seen.push(t.clone());
+        new
+    });
     for dir in targets {
         let package = dir.join("package.json");
         let pyproject = dir.join("pyproject.toml");

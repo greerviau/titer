@@ -96,7 +96,7 @@ By default the gate fails only on an unproven change. Each key below adds a fail
 
 | Key | Default | Meaning |
 |---|---|---|
-| `budget` | `"120s"` | The deadline for starting mutants, counted from the start of the check. The head and base test runs keep their own timeouts, so a check can run longer. `--budget` overrides it. |
+| `budget` | `"120s"` | The deadline for starting mutants, counted from the start of the check. The head and base test runs keep their own timeouts, so a check can run longer. A budget above 300 s also raises those timeouts. `--budget` overrides it. |
 | `exclude_operators` | `[]` | Mutation operators to skip, for example `["remove_call"]`. |
 | `exclude_globs` | `[]` | Repo-relative source files that titer never mutates. |
 | `exclude_calls` | `[]` | Callee names whose calls titer never removes, in addition to logging calls. |
