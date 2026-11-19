@@ -346,9 +346,7 @@ fn detect_python(dir: &Path, rel: &str) -> Option<DetectedRunner> {
     if !is_project {
         return None;
     }
-    let pytest = pyproject.contains("[tool.pytest")
-        || pyproject.contains("\"pytest")
-        || pyproject.contains("'pytest")
+    let pytest = pyproject_uses_pytest(&pyproject)
         || dir.join("pytest.ini").is_file()
         || dir.join("conftest.py").is_file()
         || dir.join("tests/conftest.py").is_file()
@@ -379,6 +377,82 @@ fn detect_python(dir: &Path, rel: &str) -> Option<DetectedRunner> {
         cwd: rel.to_string(),
         command,
         start_dir: unittest.then(|| tests_dir.unwrap_or(".").to_string()),
+    })
+}
+
+/// Whether pyproject.toml configures pytest or depends on it or a pytest plugin. Other
+/// mentions, such as a `pytest` keyword, do not count.
+fn pyproject_uses_pytest(text: &str) -> bool {
+    let Ok(doc) = text.parse::<toml::Table>() else {
+        return false;
+    };
+    let tool = doc.get("tool").and_then(|t| t.as_table());
+    if tool.is_some_and(|t| t.get("pytest").is_some_and(toml::Value::is_table)) {
+        return true;
+    }
+    let mut lists: Vec<&toml::Value> = Vec::new();
+    if let Some(project) = doc.get("project").and_then(|p| p.as_table()) {
+        lists.extend(project.get("dependencies"));
+        if let Some(extras) = project
+            .get("optional-dependencies")
+            .and_then(|e| e.as_table())
+        {
+            lists.extend(extras.values());
+        }
+    }
+    if let Some(groups) = doc.get("dependency-groups").and_then(|g| g.as_table()) {
+        lists.extend(groups.values());
+    }
+    let tool_table = |name: &str| tool.and_then(|t| t.get(name)).and_then(|v| v.as_table());
+    if let Some(uv) = tool_table("uv") {
+        lists.extend(uv.get("dev-dependencies"));
+    }
+    if let Some(dev) = tool_table("pdm").and_then(|p| p.get("dev-dependencies")?.as_table()) {
+        lists.extend(dev.values());
+    }
+    if let Some(envs) = tool_table("hatch").and_then(|h| h.get("envs")?.as_table()) {
+        for env in envs.values().filter_map(|e| e.as_table()) {
+            lists.extend(env.get("dependencies"));
+            lists.extend(env.get("extra-dependencies"));
+        }
+    }
+    let requirement = lists
+        .iter()
+        .filter_map(|l| l.as_array())
+        .flatten()
+        .filter_map(|v| v.as_str())
+        // The distribution name is the leading run of name characters, whatever follows:
+        // a version, extras, a marker, or a direct reference such as `pytest@https://...`.
+        .map(|s| {
+            let s = s.trim_start();
+            let end = s
+                .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+                .unwrap_or(s.len());
+            &s[..end]
+        });
+    // Poetry lists dependencies as table keys.
+    let poetry = tool
+        .and_then(|t| t.get("poetry"))
+        .and_then(|p| p.as_table())
+        .into_iter()
+        .flat_map(|p| {
+            let groups = p
+                .get("group")
+                .and_then(|g| g.as_table())
+                .into_iter()
+                .flat_map(|g| g.values())
+                .filter_map(|g| g.get("dependencies"));
+            ["dependencies", "dev-dependencies"]
+                .into_iter()
+                .filter_map(|k| p.get(k))
+                .chain(groups)
+                .filter_map(|d| d.as_table())
+                .flat_map(|d| d.keys().map(String::as_str))
+                .collect::<Vec<_>>()
+        });
+    requirement.chain(poetry).any(|name| {
+        let name = normalize_name(name);
+        name == "pytest" || name.starts_with("pytest-")
     })
 }
 
@@ -545,6 +619,32 @@ mod tests {
                 "{{\n    \"name\": \"web\",\n    \"devDependencies\": {{\n        \"vitest\": \"^5.1.0\",\n        \"@greerviau/titer\": \"{VERSION}\"\n    }},\n    \"scripts\": {{}}\n}}\n"
             )
         );
+    }
+
+    #[test]
+    fn pyproject_uses_pytest_reads_config_and_dependency_tables() {
+        for yes in [
+            "[tool.pytest.ini_options]\n",
+            "[project]\ndependencies = [\"pytest>=8; python_version>'3.8'\"]\n",
+            "[tool.uv]\ndev-dependencies = [\"pytest_xdist\"]\n",
+            "[tool.poetry.dev-dependencies]\npytest = \"^8\"\n",
+            "[tool.poetry.group.test.dependencies]\nPytest = \"^8\"\n",
+            "[project]\ndependencies = [\"pytest@https://example.org/pytest.whl\"]\n",
+            "[project]\ndependencies = [\"pytest(>=8)\"]\n",
+            "[tool.hatch.envs.test]\ndependencies = [\"pytest\"]\n",
+            "[tool.pdm.dev-dependencies]\ntest = [\"pytest\"]\n",
+        ] {
+            assert!(pyproject_uses_pytest(yes), "{yes}");
+        }
+        for no in [
+            "[project]\nkeywords = [\"pytest\"]\n",
+            "[project]\ndependencies = [\"pytestish\"]\n",
+            "[tool.poetry.dependencies]\npython = \"^3.12\"\n",
+            "[tool]\npytest = false\n",
+            "not toml [",
+        ] {
+            assert!(!pyproject_uses_pytest(no), "{no}");
+        }
     }
 
     #[test]
