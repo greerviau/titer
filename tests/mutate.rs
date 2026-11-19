@@ -137,7 +137,12 @@ fn a_test_that_catches_the_import_error_still_runs_its_mutants() {
     let repo = repo("120s");
     // An optional fast path: the test falls back when the module fails to import, which
     // also swallows the canary, though the tests load the module and catch real mutants.
-    repo.write("app.py", CLAMP_HEAD).write(
+    // A future import must stay first, so the canary goes after it.
+    repo.write(
+        "app.py",
+        &format!("from __future__ import annotations\n\n{CLAMP_HEAD}"),
+    )
+    .write(
         "test_app.py",
         &CLAMP_TEST.replace(
             "from app import clamp\n",

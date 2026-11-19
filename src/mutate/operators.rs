@@ -628,14 +628,40 @@ pub fn canary(lang: Lang, source: &str, marker: &Path) -> String {
     let marker = serde_json::to_string(&marker.to_string_lossy()).expect("a string serializes");
     match lang {
         Lang::Python => {
-            format!("open({marker}, \"w\").close()\nraise RuntimeError(\"titer canary\")\n{source}")
+            // `from __future__` imports must come first, or the module does not compile.
+            let at = python_after_future_imports(source);
+            format!(
+                "{}open({marker}, \"w\").close()\nraise RuntimeError(\"titer canary\")\n{}",
+                &source[..at],
+                &source[at..]
+            )
         }
-        // getBuiltinModule works in CommonJS and ESM alike; outside Node there is no marker.
+        // getBuiltinModule works in CommonJS and ESM alike. Outside Node, such as in vitest
+        // browser mode, there is no marker. ts-ignore keeps a type-checking runner from
+        // rejecting `process` where only browser typings are loaded.
         Lang::TypeScript | Lang::Tsx => format!(
-            "try {{ globalThis.process?.getBuiltinModule?.(\"node:fs\")?.writeFileSync({marker}, \"\"); }} catch {{}}\nthrow new Error(\"titer canary\");\n{source}"
+            "// @ts-ignore\ntry {{ globalThis.process?.getBuiltinModule?.(\"node:fs\")?.writeFileSync({marker}, \"\"); }} catch {{}}\nthrow new Error(\"titer canary\");\n{source}"
         ),
         Lang::Rust => format!("{source}\ncompile_error!(\"titer canary\");\n"),
     }
+}
+
+/// The byte offset just after the line that ends the module's last top-level
+/// `from __future__` import, or 0 when it has none.
+fn python_after_future_imports(source: &str) -> usize {
+    let Some(tree) = Lang::Python.parse(source) else {
+        return 0;
+    };
+    let Some(last) = children(tree.root_node())
+        .into_iter()
+        .rfind(|n| n.kind() == "future_import_statement")
+    else {
+        return 0;
+    };
+    let end = last.end_byte();
+    source[end..]
+        .find('\n')
+        .map_or(source.len(), |i| end + i + 1)
 }
 
 /// Inserts a raise or throw before the statement that encloses `line`, so a run that stays
@@ -837,6 +863,17 @@ def g():
                 "15 IncrementInt 2 -> 3",
             ]
         );
+    }
+
+    #[test]
+    fn python_canary_goes_after_future_imports() {
+        let source = "\"\"\"Doc.\"\"\"\nfrom __future__ import annotations  # why\nfrom __future__ import (\n    division,\n)\nimport os\n";
+        let out = canary(Lang::Python, source, Path::new("/m"));
+        assert!(
+            out.starts_with("\"\"\"Doc.\"\"\"\nfrom __future__ import annotations  # why\nfrom __future__ import (\n    division,\n)\nopen(\"/m\", \"w\").close()\nraise RuntimeError"),
+            "{out}"
+        );
+        assert!(canary(Lang::Python, "import os\n", Path::new("/m")).starts_with("open(\"/m\""),);
     }
 
     #[test]
