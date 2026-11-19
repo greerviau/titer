@@ -5,6 +5,7 @@ pub mod agent;
 pub mod operators;
 
 use std::collections::{BTreeMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -541,16 +542,24 @@ pub fn canaries(
     plans: &BTreeMap<usize, RunnerPlan>,
     files: &[(usize, String, String)],
 ) -> anyhow::Result<Vec<String>> {
-    let jobs: Vec<Job> = files
+    let files: Vec<&(usize, String, String)> = files
         .iter()
         .filter(|(runner, _, _)| !matches!(plans[runner].plan, Plan::Nothing))
-        .map(|(runner, file, original)| Job {
+        .collect();
+    let markers: Vec<PathBuf> = (0..files.len())
+        .map(|i| ctx.session.run_dir.join(&format!("canary-{i}.loaded")))
+        .collect();
+    let jobs: Vec<Job> = files
+        .iter()
+        .zip(&markers)
+        .map(|((runner, file, original), marker)| Job {
             runner: *runner,
             file: file.clone(),
             original: original.clone(),
             mutated: operators::canary(
                 Lang::of(file).expect("source files have a language"),
                 original,
+                marker,
             ),
         })
         .collect();
@@ -560,6 +569,13 @@ pub fn canaries(
     let mut results = run_jobs(ctx, workers, plans, &jobs, None);
     for r in results.iter_mut().filter(|r| r.compile_failed) {
         r.outcome = MutantOutcome::Killed;
+    }
+    // A canary that survived after its marker appeared ran and was caught by a test, so the
+    // worktree does load the module.
+    for (r, marker) in results.iter_mut().zip(&markers) {
+        if r.outcome == MutantOutcome::Survived && marker.exists() {
+            r.outcome = MutantOutcome::Killed;
+        }
     }
     let unconfirmed: Vec<&str> = jobs
         .iter()

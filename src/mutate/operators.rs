@@ -1,6 +1,7 @@
 //! Mutation operators: tree-sitter edits on changed lines of a source file.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use tree_sitter::Node;
 
@@ -619,12 +620,48 @@ pub fn budget_order<T>(items: Vec<T>, key: impl Fn(&T) -> (String, u32)) -> Vec<
 /// loads, so its canary is a compile error at the end of the file instead: it fails the
 /// build only when the build compiles that file. The end of the file keeps it after any
 /// inner attributes.
-pub fn canary(lang: Lang, source: &str) -> String {
+///
+/// Before it raises, a Python or TypeScript canary creates the file `marker`. A test that
+/// imports the module inside `try` and falls back on failure swallows the raise, and the
+/// marker still shows that the module was loaded.
+pub fn canary(lang: Lang, source: &str, marker: &Path) -> String {
+    let marker = serde_json::to_string(&marker.to_string_lossy()).expect("a string serializes");
     match lang {
-        Lang::Python => format!("raise RuntimeError(\"titer canary\")\n{source}"),
-        Lang::TypeScript | Lang::Tsx => format!("throw new Error(\"titer canary\");\n{source}"),
+        Lang::Python => {
+            // `from __future__` imports must come first, or the module does not compile.
+            let at = python_after_future_imports(source);
+            format!(
+                "{}open({marker}, \"w\").close()\nraise RuntimeError(\"titer canary\")\n{}",
+                &source[..at],
+                &source[at..]
+            )
+        }
+        // getBuiltinModule works in CommonJS and ESM alike. Outside Node, such as in vitest
+        // browser mode, there is no marker. ts-ignore keeps a type-checking runner from
+        // rejecting `process` where only browser typings are loaded.
+        Lang::TypeScript | Lang::Tsx => format!(
+            "// @ts-ignore\ntry {{ globalThis.process?.getBuiltinModule?.(\"node:fs\")?.writeFileSync({marker}, \"\"); }} catch {{}}\nthrow new Error(\"titer canary\");\n{source}"
+        ),
         Lang::Rust => format!("{source}\ncompile_error!(\"titer canary\");\n"),
     }
+}
+
+/// The byte offset just after the line that ends the module's last top-level
+/// `from __future__` import, or 0 when it has none.
+fn python_after_future_imports(source: &str) -> usize {
+    let Some(tree) = Lang::Python.parse(source) else {
+        return 0;
+    };
+    let Some(last) = children(tree.root_node())
+        .into_iter()
+        .rfind(|n| n.kind() == "future_import_statement")
+    else {
+        return 0;
+    };
+    let end = last.end_byte();
+    source[end..]
+        .find('\n')
+        .map_or(source.len(), |i| end + i + 1)
 }
 
 /// Inserts a raise or throw before the statement that encloses `line`, so a run that stays
@@ -829,9 +866,24 @@ def g():
     }
 
     #[test]
+    fn python_canary_goes_after_future_imports() {
+        let source = "\"\"\"Doc.\"\"\"\nfrom __future__ import annotations  # why\nfrom __future__ import (\n    division,\n)\nimport os\n";
+        let out = canary(Lang::Python, source, Path::new("/m"));
+        assert!(
+            out.starts_with("\"\"\"Doc.\"\"\"\nfrom __future__ import annotations  # why\nfrom __future__ import (\n    division,\n)\nopen(\"/m\", \"w\").close()\nraise RuntimeError"),
+            "{out}"
+        );
+        assert!(canary(Lang::Python, "import os\n", Path::new("/m")).starts_with("open(\"/m\""),);
+    }
+
+    #[test]
     fn rust_canary_and_sentinel() {
         assert_eq!(
-            canary(Lang::Rust, "#![allow(dead_code)]\nfn f() {}\n"),
+            canary(
+                Lang::Rust,
+                "#![allow(dead_code)]\nfn f() {}\n",
+                Path::new("/m")
+            ),
             "#![allow(dead_code)]\nfn f() {}\n\ncompile_error!(\"titer canary\");\n"
         );
         let source = "fn f(x: i32) -> i32 {\n    let y = match x {\n        0 => 1,\n        _ => x + 1,\n    };\n    y\n}\n";
