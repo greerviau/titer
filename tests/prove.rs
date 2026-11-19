@@ -283,3 +283,48 @@ fn a_changed_test_in_a_mixin_runs_in_each_test_case_that_inherits_it() {
         "{report:#}"
     );
 }
+
+#[test]
+fn two_vitest_tests_on_one_line_are_reported_as_sharing_a_selector() {
+    let repo = Fixture::new();
+    let vitest = fixture_node_modules().join(".bin/vitest");
+    repo.write(
+        "titer.toml",
+        &format!(
+            "[[runner]]\nkind = \"vitest\"\ncommand = [\"{}\", \"run\"]\n",
+            vitest.display()
+        ),
+    )
+    .write(".gitignore", "node_modules\n")
+    .write("package.json", "{\"type\": \"module\"}\n")
+    .write("src/f.ts", "export const f = () => 1;\nexport const g = () => 1;\n")
+    .write(
+        "src/f.test.ts",
+        "import { it, expect } from \"vitest\";\nimport { f, g } from \"./f\";\n\nit(\"a\", () => { expect(f()).toBe(1); }); it(\"b\", () => { expect(g()).toBe(1); });\n",
+    );
+    std::os::unix::fs::symlink(fixture_node_modules(), repo.path().join("node_modules")).unwrap();
+    repo.commit_all("base");
+    repo.git(&["checkout", "-q", "-b", "fix"]);
+    repo.write("src/f.ts", "export const f = () => 1;\nexport const g = () => 2;\n")
+        .write(
+            "src/f.test.ts",
+            "import { it, expect } from \"vitest\";\nimport { f, g } from \"./f\";\n\nit(\"a\", () => { expect(f()).toBe(1); }); it(\"b\", () => { expect(g()).toBe(2); });\n",
+        );
+
+    let output = repo.titer(&["check", "--json", "--only", "prove"]);
+
+    let report = stdout_json(&output);
+    assert_schema_valid(&report);
+    let warnings: Vec<&str> = report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap())
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("src/f.test.ts:4") && w.contains("\"a\"") && w.contains("\"b\"")),
+        "{report:#}"
+    );
+}

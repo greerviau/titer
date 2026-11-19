@@ -1,7 +1,7 @@
 //! Changed-test and source-function detection: which files, tests, and functions a change
 //! touches.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -192,6 +192,8 @@ pub struct Detection {
     pub functions: Vec<ChangedFunction>,
     /// Changed files titer does not analyze.
     pub not_analyzed: Vec<String>,
+    /// Changed tests that the runner cannot select apart from other tests.
+    pub warnings: Vec<String>,
 }
 
 impl Detection {
@@ -230,7 +232,8 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
                 let source = read_head(session, &path)?;
                 let lang = Lang::of(&path).expect("test files have a language");
                 let found = changed_tests(&runners[runner], &path, lang, &source, &change.added);
-                detection.tests.extend(found);
+                detection.tests.extend(found.tests);
+                detection.warnings.extend(found.warnings);
             }
             Role::Support { runner } => detection.test_paths.push((runner, path)),
             Role::Source { runner, lang } => {
@@ -244,10 +247,11 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
                     detection.rust_sources.push(path.clone());
                     let found =
                         changed_tests(&runners[runner], &path, lang, &source, &change.added);
-                    if !found.is_empty() {
+                    if !found.tests.is_empty() {
                         detection.test_files.push((runner, path.clone()));
                     }
-                    detection.tests.extend(found);
+                    detection.tests.extend(found.tests);
+                    detection.warnings.extend(found.warnings);
                     // Test code is never a mutant's target and never makes a change touch
                     // source. A line it shares with other code still counts.
                     let test_lines = lang::rust::test_lines(&source);
@@ -287,28 +291,69 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
     Ok(detection)
 }
 
-/// The tests in `source` whose spans intersect a changed line.
+struct ChangedTests {
+    tests: Vec<TestCase>,
+    warnings: Vec<String>,
+}
+
+/// The tests in `source` whose spans intersect a changed line. A changed test whose id it
+/// shares with another test, such as two vitest calls on one line, gets a warning: the
+/// runner selects them together and titer reports their combined result for each.
 fn changed_tests(
     runner: &Runner,
     path: &str,
     lang: Lang,
     source: &str,
     added: &BTreeSet<u32>,
-) -> Vec<TestCase> {
-    lang::find_tests(lang, source, python_style(runner.config.kind))
+) -> ChangedTests {
+    let all: Vec<(String, lang::TestDef)> =
+        lang::find_tests(lang, source, python_style(runner.config.kind))
+            .into_iter()
+            .map(|def| {
+                (
+                    runner.test_id(path, &def.suite, &def.name, def.report_line),
+                    def,
+                )
+            })
+            .collect();
+    let changed = |def: &lang::TestDef| added.iter().any(|l| (def.line..=def.end_line).contains(l));
+    let mut by_id: BTreeMap<&str, Vec<&lang::TestDef>> = BTreeMap::new();
+    for (id, def) in &all {
+        by_id.entry(id.as_str()).or_default().push(def);
+    }
+    let warnings = by_id
         .into_iter()
-        .filter(|def| added.iter().any(|l| (def.line..=def.end_line).contains(l)))
-        .map(|def| TestCase {
+        .filter(|(_, defs)| defs.len() > 1 && defs.iter().any(|d| changed(d)))
+        .map(|(id, defs)| {
+            let names: Vec<String> = defs.iter().map(|d| format!("{:?}", full_name(d))).collect();
+            format!(
+                "tests {} share the selector {id}, so titer runs them together and reports their combined result for each",
+                names.join(" and ")
+            )
+        })
+        .collect();
+    let tests = all
+        .into_iter()
+        .filter(|(_, def)| changed(def))
+        .map(|(id, def)| TestCase {
             runner: runner.name().to_string(),
             file: path.to_string(),
             line: def.report_line,
             end_line: def.end_line,
-            id: runner.test_id(path, &def.suite, &def.name, def.report_line),
+            id,
             suite: def.suite,
             name: def.name,
             skip: def.skip,
         })
-        .collect()
+        .collect();
+    ChangedTests { tests, warnings }
+}
+
+/// A test's suite and name, as a person reads them.
+fn full_name(def: &lang::TestDef) -> String {
+    let mut parts = def.suite.clone();
+    parts.push(def.name.clone());
+    parts.join(" > ")
 }
 
 pub fn read_head(session: &Session, path: &str) -> anyhow::Result<String> {
