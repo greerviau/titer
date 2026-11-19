@@ -1,5 +1,7 @@
 //! Python: tests, functions, and the other structure titer reads from Python sources.
 
+use std::cell::RefCell;
+
 use tree_sitter::Node;
 
 use super::{FunctionDef, PythonStyle, TestDef, children, end_line_of, line_of, text};
@@ -83,9 +85,13 @@ pub fn find_tests(root: Node, source: &str, style: PythonStyle) -> Vec<TestDef> 
                 if module.shadowed(i) || !module.is_test_class(i, style) {
                     continue;
                 }
+                // The class's own and inherited methods come from its resolution order;
+                // the walk adds only the nested test classes.
+                module.class_tests(i, &mut out);
+                let mut nested = Vec::new();
                 let mut suite = vec![name_of(def, source).to_string()];
-                walk_tests(def, source, style, &mut suite, &mut out);
-                module.inherited_tests(i, &mut out);
+                walk_tests(def, source, style, &mut suite, &mut nested);
+                out.extend(nested.into_iter().filter(|t| t.suite.len() > 1));
             }
             _ => {}
         }
@@ -112,16 +118,39 @@ fn test_def(suite: Vec<String>, name: String, def: Node, outer: Node) -> TestDef
 struct Module<'a> {
     source: &'a str,
     classes: Vec<Node<'a>>,
+    mro: RefCell<Vec<Option<Vec<Base>>>>,
+    unittest: RefCell<Vec<Option<bool>>>,
+}
+
+/// A base in a resolution order: a class this file defines, or any other by its text.
+#[derive(Clone, Debug, PartialEq)]
+enum Base {
+    Local(usize),
+    Other(String),
+}
+
+/// What a class body binds a name to last: a method, or something else, such as
+/// `test_x = None`, which hides an inherited test.
+#[derive(Clone, Copy)]
+enum Binding<'a> {
+    Method(Node<'a>, Node<'a>),
+    Other,
 }
 
 impl<'a> Module<'a> {
     fn new(root: Node<'a>, source: &'a str) -> Module<'a> {
-        let classes = children(root)
+        let classes: Vec<Node> = children(root)
             .into_iter()
             .map(|c| unwrap_decorated(c).0)
             .filter(|c| c.kind() == "class_definition")
             .collect();
-        Module { source, classes }
+        let n = classes.len();
+        Module {
+            source,
+            classes,
+            mro: RefCell::new(vec![None; n]),
+            unittest: RefCell::new(vec![None; n]),
+        }
     }
 
     fn name(&self, i: usize) -> &'a str {
@@ -135,24 +164,31 @@ impl<'a> Module<'a> {
             .any(|c| name_of(*c, self.source) == self.name(i))
     }
 
-    /// Each base: the same-file class it names, which is the last one of that name defined
-    /// before this class, or None and its last dotted segment for any other base.
-    fn bases(&self, i: usize) -> Vec<(Option<usize>, &'a str)> {
+    /// The class's bases in order. A plain name, or a subscript of one such as
+    /// `Mixin[int]`, is the last class of that name defined before this one.
+    fn bases(&self, i: usize) -> Vec<Base> {
         let Some(list) = self.classes[i].child_by_field_name("superclasses") else {
             return Vec::new();
         };
         children(list)
             .into_iter()
-            .filter_map(|n| match n.kind() {
-                "identifier" => {
-                    let name = text(n, self.source);
-                    Some(((0..i).rev().find(|j| self.name(*j) == name), name))
+            .filter_map(|n| {
+                let n = if n.kind() == "subscript" {
+                    n.child_by_field_name("value")?
+                } else {
+                    n
+                };
+                let name = text(n, self.source);
+                match n.kind() {
+                    "identifier" => Some(
+                        (0..i)
+                            .rev()
+                            .find(|j| self.name(*j) == name)
+                            .map_or_else(|| Base::Other(name.to_string()), Base::Local),
+                    ),
+                    "attribute" => Some(Base::Other(name.to_string())),
+                    _ => None,
                 }
-                "attribute" => Some((
-                    None,
-                    text(n, self.source).rsplit('.').next().unwrap_or_default(),
-                )),
-                _ => None,
             })
             .collect()
     }
@@ -160,10 +196,15 @@ impl<'a> Module<'a> {
     /// Whether the class derives from `unittest.TestCase`: through a same-file base that
     /// does, or through another base whose name says so.
     fn is_unittest(&self, i: usize) -> bool {
-        self.bases(i).into_iter().any(|(local, name)| match local {
-            Some(j) => self.is_unittest(j),
-            None => is_test_base(name),
-        })
+        if let Some(known) = self.unittest.borrow()[i] {
+            return known;
+        }
+        let found = self.bases(i).into_iter().any(|b| match b {
+            Base::Local(j) => self.is_unittest(j),
+            Base::Other(name) => is_test_base(name.rsplit('.').next().unwrap_or_default()),
+        });
+        self.unittest.borrow_mut()[i] = Some(found);
+        found
     }
 
     fn is_test_class(&self, i: usize, style: PythonStyle) -> bool {
@@ -173,61 +214,69 @@ impl<'a> Module<'a> {
             PythonStyle::Pytest => {
                 unittest
                     || (self.name(i).starts_with("Test")
-                        && !self
-                            .mro(i)
-                            .into_iter()
-                            .any(|c| defines_init(self.classes[c], self.source)))
+                        && !self.mro(i).iter().any(|b| {
+                            matches!(b, Base::Local(c) if defines_init(self.classes[*c], self.source))
+                        }))
             }
             PythonStyle::Unittest => unittest,
         }
     }
 
-    /// The C3 method resolution order over same-file classes, as Python computes it. Bases
-    /// from other files define nothing this file can see, so they are left out.
-    fn mro(&self, i: usize) -> Vec<usize> {
-        let bases: Vec<usize> = self.bases(i).into_iter().filter_map(|(b, _)| b).collect();
-        let mut seqs: Vec<Vec<usize>> = bases.iter().map(|b| self.mro(*b)).collect();
+    /// The C3 method resolution order, as Python computes it, with bases from other files
+    /// as opaque entries so they still constrain the order of this file's classes.
+    fn mro(&self, i: usize) -> Vec<Base> {
+        if let Some(known) = &self.mro.borrow()[i] {
+            return known.clone();
+        }
+        let bases = self.bases(i);
+        let mut seqs: Vec<Vec<Base>> = bases
+            .iter()
+            .map(|b| match b {
+                Base::Local(j) => self.mro(*j),
+                other => vec![other.clone()],
+            })
+            .collect();
         seqs.push(bases);
-        let mut out = vec![i];
+        let mut out = vec![Base::Local(i)];
         loop {
             seqs.retain(|s| !s.is_empty());
             let Some(head) = seqs
                 .iter()
-                .map(|s| s[0])
+                .map(|s| s[0].clone())
                 .find(|h| seqs.iter().all(|s| !s[1..].contains(h)))
             else {
                 break;
             };
-            out.push(head);
             for s in &mut seqs {
                 if s[0] == head {
                     s.remove(0);
                 }
             }
+            out.push(head);
         }
         // Python rejects an inconsistent order; keep the rest in declaration order.
-        for c in seqs.into_iter().flatten() {
-            if !out.contains(&c) {
-                out.push(c);
+        for b in seqs.into_iter().flatten() {
+            if !out.contains(&b) {
+                out.push(b);
             }
         }
+        self.mro.borrow_mut()[i] = Some(out.clone());
         out
     }
 
-    /// Test methods the class inherits from same-file classes: for each name, the first
-    /// class in the method resolution order that binds it, when that class is another one
-    /// and binds it to a method. The runner runs each one under this class, so each gets a
-    /// test here with the span of the method it inherits.
-    fn inherited_tests(&self, i: usize, out: &mut Vec<TestDef>) {
-        let mro = self.mro(i);
-        let mut bound: Vec<&str> = self.test_names(i).into_iter().map(|(n, _)| n).collect();
-        for c in &mro[1..] {
-            for (name, method) in self.test_names(*c) {
+    /// The tests the runner collects under the class: for each `test*` name, the first
+    /// class in the resolution order that binds it, when it binds it to a method. An
+    /// inherited method gets a test here with the span of the method it inherits.
+    fn class_tests(&self, i: usize, out: &mut Vec<TestDef>) {
+        let mut bound: Vec<&str> = Vec::new();
+        for base in self.mro(i) {
+            let Base::Local(c) = base else { continue };
+            for (name, binding) in self.bindings(c) {
                 if bound.contains(&name) {
                     continue;
                 }
                 bound.push(name);
-                if let Some((def, outer)) = method {
+                if let Binding::Method(def, outer) = binding {
                     out.push(test_def(
                         vec![self.name(i).to_string()],
                         name.to_string(),
@@ -239,31 +288,38 @@ impl<'a> Module<'a> {
         }
     }
 
-    /// The `test*` names a class body binds, with the method for a `def` and None for an
-    /// assignment such as `test_x = None`, which hides an inherited test.
-    fn test_names(&self, i: usize) -> Vec<(&'a str, Option<(Node<'a>, Node<'a>)>)> {
+    /// The `test*` names a class body binds, each with its last binding, in the order of
+    /// first appearance. A bare annotation binds nothing.
+    fn bindings(&self, i: usize) -> Vec<(&'a str, Binding<'a>)> {
         let Some(body) = self.classes[i].child_by_field_name("body") else {
             return Vec::new();
         };
-        let mut out = Vec::new();
+        let mut out: Vec<(&str, Binding)> = Vec::new();
+        let mut bind = |name: &'a str, b: Binding<'a>| {
+            if !name.starts_with("test") {
+                return;
+            }
+            match out.iter_mut().find(|(n, _)| *n == name) {
+                Some(slot) => slot.1 = b,
+                None => out.push((name, b)),
+            }
+        };
         for child in children(body) {
             let (def, outer) = unwrap_decorated(child);
             if def.kind() == "function_definition" {
-                out.push((name_of(def, self.source), Some((def, outer))));
+                bind(name_of(def, self.source), Binding::Method(def, outer));
             } else if def.kind() == "expression_statement" {
-                for assign in children(def)
-                    .into_iter()
-                    .filter(|n| n.kind() == "assignment")
-                {
+                for assign in children(def).into_iter().filter(|n| {
+                    n.kind() == "assignment" && n.child_by_field_name("right").is_some()
+                }) {
                     if let Some(left) = assign.child_by_field_name("left")
                         && left.kind() == "identifier"
                     {
-                        out.push((text(left, self.source), None));
+                        bind(text(left, self.source), Binding::Other);
                     }
                 }
             }
         }
-        out.retain(|(name, _)| name.starts_with("test"));
         out
     }
 }
@@ -494,9 +550,44 @@ class Bogus(Testable):
         // An assignment hides the inherited test; a later definition of a name wins.
         let hidden = "import unittest\n\nclass Checks:\n    def test_x(self):\n        pass\n\nclass Checks:\n    def test_y(self):\n        pass\n\nclass A(Checks, unittest.TestCase):\n    test_y = None\n\nclass B(Checks, unittest.TestCase):\n    pass\n";
         assert_eq!(names(hidden, PythonStyle::Unittest), ["B::test_y 8"]);
+        // An imported base still orders this file's classes: Right comes before Ancestor.
+        let external = "import unittest\nfrom lib import Shared\n\nclass Ancestor:\n    def test_conflict(self):\n        pass\n\nclass Left(Shared, Ancestor):\n    pass\n\nclass Right(Shared):\n    def test_conflict(self):\n        pass\n\nclass Concrete(Left, Right, unittest.TestCase):\n    pass\n";
+        assert_eq!(
+            names(external, PythonStyle::Unittest),
+            ["Concrete::test_conflict 12"]
+        );
+        // A subscripted base is the class it subscripts.
+        let generic = "import unittest\n\nclass Mixin:\n    def test_generic(self):\n        pass\n\nclass Concrete(Mixin[int], unittest.TestCase):\n    pass\n";
+        assert_eq!(
+            names(generic, PythonStyle::Unittest),
+            ["Concrete::test_generic 4"]
+        );
+        // The last binding in a class body wins, and a bare annotation binds nothing.
+        let rebound = "import unittest\n\nclass A(unittest.TestCase):\n    def test_x(self):\n        pass\n    test_x = None\n    test_y = None\n    def test_y(self):\n        pass\n    test_z: int\n    def test_z(self):\n        pass\n";
+        assert_eq!(
+            names(rebound, PythonStyle::Unittest),
+            ["A::test_y 8", "A::test_z 11"]
+        );
         // pytest skips a Test class that inherits __init__.
         let init = "class Base:\n    def __init__(self):\n        pass\n\n    def test_x(self):\n        pass\n\nclass TestConcrete(Base):\n    pass\n";
         assert!(names(init, PythonStyle::Pytest).is_empty());
+    }
+
+    #[test]
+    fn deep_inheritance_graphs_resolve_without_repeating_work() {
+        // Each class inherits from the two before it, which doubles the paths per level.
+        let mut source = String::from(
+            "import unittest\n\nclass C0(unittest.TestCase):\n    def test_0(self):\n        pass\n\nclass C1(C0):\n    pass\n",
+        );
+        for i in 2..60 {
+            source.push_str(&format!(
+                "\nclass C{i}(C{}, C{}):\n    pass\n",
+                i - 1,
+                i - 2
+            ));
+        }
+        let tests = find_tests(Lang::Python, &source, PythonStyle::Unittest);
+        assert_eq!(tests.len(), 60);
     }
 
     #[test]
