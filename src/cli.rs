@@ -59,8 +59,8 @@ struct CheckArgs {
     /// Print the JSON report on stdout.
     #[arg(long)]
     json: bool,
-    /// Time budget for mutation, for example 120s or 3m. The head and base runs keep
-    /// their own timeouts.
+    /// Deadline for starting mutants, counted from the start of the check, for example
+    /// 120s or 3m. The head and base runs keep their own timeouts.
     #[arg(long, value_parser = humantime::parse_duration)]
     budget: Option<Duration>,
     /// Mutation workers. Defaults to a value sized from cores and memory.

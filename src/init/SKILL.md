@@ -17,7 +17,7 @@ Run the version the repo pins:
 
 titer compares the working tree, including untracked files, with the merge-base of `--base` (default: the remote default branch). It never modifies the checkout.
 
-`--budget 60s` caps the time spent on mutation only. The head and base test runs keep their own timeouts, so a slow test suite stays slow. To skip mutation, pass `--only scan,prove`.
+`--budget 60s` limits mutation only: titer starts no mutant after 60 s from the start of the check. The head and base test runs keep their own timeouts, so a slow test suite stays slow, and a long build can leave every mutant `not_run`. To skip mutation, pass `--only scan,prove`.
 
 ## Exit codes
 
