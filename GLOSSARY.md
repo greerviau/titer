@@ -18,7 +18,7 @@ Code, docs, the report, and the repo skill use these terms with these meanings.
 - Survivor: a mutant that the changed tests do not kill.
 - Unchanged from base: a mutant whose code also appears in the base lines that its hunk replaces. The change may only have moved or reformatted that code.
 - Not executed: a survivor whose line the changed tests never run. The sentinel check detects this.
-- Sentinel: a raise, throw, or Rust abort inserted before the statement that encloses a survivor's line, or inside the condition when that line starts an `elif` or `else if` condition.
+- Sentinel: a raise, throw, or Rust abort inserted before the statement that encloses a survivor's line, or inside the condition when that line is part of an `elif` or `else if` condition that has its lines to itself.
 - Caught by other tests: a survivor that the other tests in the changed test files kill.
 - Not run: a mutant that the budget did not reach.
 - No result: a run in which zero tests executed or every test skipped. It is never a kill or a survivor.

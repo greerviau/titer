@@ -69,7 +69,7 @@ A mutant whose code also appears in the base lines its hunk replaces gets `uncha
 
 Each survivor gets two follow-up runs:
 
-1. titer inserts a sentinel raise before the line's statement. On the condition line of an `elif` or `else if`, the sentinel goes inside the condition instead, so it raises only when a test evaluates that condition. In Rust the sentinel is `std::process::abort()`, which `#[should_panic]` and `catch_unwind` cannot catch. If no test fails, the outcome is `not_executed`: nothing runs the line.
+1. titer inserts a sentinel raise before the line's statement. On a line of an `elif` or `else if` condition that shares its lines with no other code, the sentinel goes inside the condition instead, so it raises only when a test evaluates that condition. In Rust the sentinel is `std::process::abort()`, which `#[should_panic]` and `catch_unwind` cannot catch. If no test fails, the outcome is `not_executed`: nothing runs the line.
 2. titer reruns the whole changed test files. If another test kills the mutant, the outcome is `caught_by_other`.
 
 Mutant outcomes are `killed`, `timed_out`, `survived`, `not_executed`, `caught_by_other`, `not_run` (the budget ran out first), and `no_result`.
