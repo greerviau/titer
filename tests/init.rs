@@ -368,6 +368,15 @@ fn init_detects_pytest_from_dependencies_and_not_from_keywords() {
         .write(
             "lib/pyproject.toml",
             "[project]\nname = \"lib\"\n\n[project.optional-dependencies]\ntest = [\"pytest-cov\"]\n",
+        )
+        // A pytest keyword in a unittest project still leaves it a unittest project.
+        .write(
+            "svc/pyproject.toml",
+            "[project]\nname = \"svc\"\nkeywords = [\"pytest\"]\n",
+        )
+        .write(
+            "svc/tests/test_svc.py",
+            "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_x(self):\n        pass\n",
         );
     repo.commit_all("base");
 
@@ -379,5 +388,7 @@ fn init_detects_pytest_from_dependencies_and_not_from_keywords() {
     assert_eq!(stdout.matches("kind = \"pytest\"").count(), 2, "{stdout}");
     assert!(stdout.contains("cwd = \"api\""), "{stdout}");
     assert!(stdout.contains("cwd = \"lib\""), "{stdout}");
+    assert_eq!(stdout.matches("kind = \"unittest\"").count(), 1, "{stdout}");
+    assert!(stdout.contains("cwd = \"svc\""), "{stdout}");
     assert!(stdout.contains("kind = \"cargo\""), "{stdout}");
 }
