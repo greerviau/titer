@@ -671,10 +671,18 @@ fn python_after_future_imports(source: &str) -> usize {
 pub fn sentinel(lang: Lang, source: &str, line: u32) -> Option<String> {
     let tree = lang.parse(source)?;
     let row = line.checked_sub(1)? as usize;
-    if let Some(out) = else_if_sentinel(lang, source, &tree, row) {
-        return Some(out);
+    // A line in an `elif` or `else if` condition gets the condition probe or nothing: a
+    // sentinel before its statement would run for tests that never evaluate it, and one
+    // placed by the line's first statement can land in the previous arm.
+    if let Some(probe) = else_if_sentinel(lang, source, &tree, row) {
+        return probe;
     }
     let text_line = source.lines().nth(row)?;
+    if text_line.trim_start().starts_with('}') {
+        // A line such as `} else if let ...` starts by closing the previous arm, so a
+        // sentinel before its statement would land in that arm.
+        return None;
+    }
     let column = text_line.len() - text_line.trim_start().len();
     let point = tree_sitter::Point { row, column };
     let mut node = tree.root_node().descendant_for_point_range(point, point)?;
@@ -721,12 +729,14 @@ pub fn sentinel(lang: Lang, source: &str, line: u32) -> Option<String> {
 /// tests that take an earlier branch and never evaluate this condition. The probe raises
 /// when the condition is evaluated and leaves its value as it was. It applies only when
 /// the condition's lines hold nothing else, such as an earlier branch on the same line.
+/// Returns None when `row` is in no such condition, and Some(None) when it is in one that
+/// cannot take the probe.
 fn else_if_sentinel(
     lang: Lang,
     source: &str,
     tree: &tree_sitter::Tree,
     row: usize,
-) -> Option<String> {
+) -> Option<Option<String>> {
     let mut stack = vec![tree.root_node()];
     let mut condition = None;
     while let Some(node) = stack.pop() {
@@ -756,7 +766,7 @@ fn else_if_sentinel(
     let c = condition?;
     // Wrapping an `if let` value changes how Rust moves and borrows it.
     if lang == Lang::Rust && matches!(c.kind(), "let_condition" | "let_chain") {
-        return None;
+        return Some(None);
     }
     let line_start = source[..c.start_byte()].rfind('\n').map_or(0, |i| i + 1);
     let before = source[line_start..c.start_byte()]
@@ -764,15 +774,18 @@ fn else_if_sentinel(
         .replace("else", "")
         .replace("if", "");
     if !before.chars().all(|ch| ch.is_whitespace() || ch == '}') {
-        return None;
+        return Some(None);
     }
     let line_end = source[c.end_byte()..]
         .find('\n')
         .map_or(source.len(), |i| c.end_byte() + i);
-    let after = source[c.end_byte()..line_end].trim();
+    // The opener, then at most a line comment.
     let opener = if lang == Lang::Python { ":" } else { "{" };
-    if !(after.is_empty() || after == opener) {
-        return None;
+    let comment = if lang == Lang::Python { "#" } else { "//" };
+    let after = source[c.end_byte()..line_end].trim_start();
+    let after = after.strip_prefix(opener).unwrap_or(after).trim_start();
+    if !(after.is_empty() || after.starts_with(comment)) {
+        return Some(None);
     }
     let cond = &source[c.start_byte()..c.end_byte()];
     let probe = match lang {
@@ -782,9 +795,10 @@ fn else_if_sentinel(
             format!("(_ for _ in ()).throw(SystemExit(\"titer sentinel\")) or ({cond})")
         }
         // A comma expression keeps the condition's value and its type narrowing. The probe
-        // returns normally in the type checker's view, so the branch stays reachable.
+        // returns normally in the type checker's view, so the branch stays reachable, and
+        // its test cannot be shadowed by a local name.
         Lang::TypeScript | Lang::Tsx => format!(
-            "((() => {{ if (globalThis) throw new Error(\"titer sentinel\"); }})(), {cond})"
+            "((() => {{ if (typeof 0 === \"number\") throw new Error(\"titer sentinel\"); }})(), {cond})"
         ),
         // An if expression needs no parentheses, so no unused_parens lint fires.
         Lang::Rust => format!("if true {{ std::process::abort() }} else {{ {cond} }}"),
@@ -794,9 +808,11 @@ fn else_if_sentinel(
         &source[..c.start_byte()],
         &source[c.end_byte()..]
     );
-    lang.parse(&out)
-        .is_some_and(|t| !t.root_node().has_error())
-        .then_some(out)
+    Some(
+        lang.parse(&out)
+            .is_some_and(|t| !t.root_node().has_error())
+            .then_some(out),
+    )
 }
 
 #[cfg(test)]
@@ -1072,17 +1088,23 @@ def g():
         let ts = "function f(x: number) {\n  if (x > 1) {\n    return 2;\n  } else if (x < 0) {\n    return 0;\n  }\n  return x;\n}\n";
         assert_eq!(
             sentinel(Lang::TypeScript, ts, 4).unwrap(),
-            "function f(x: number) {\n  if (x > 1) {\n    return 2;\n  } else if ((() => { if (globalThis) throw new Error(\"titer sentinel\"); })(), (x < 0)) {\n    return 0;\n  }\n  return x;\n}\n"
+            "function f(x: number) {\n  if (x > 1) {\n    return 2;\n  } else if ((() => { if (typeof 0 === \"number\") throw new Error(\"titer sentinel\"); })(), (x < 0)) {\n    return 0;\n  }\n  return x;\n}\n"
         );
         let rs = "fn f(x: i32) -> i32 {\n    if x > 1 {\n        2\n    } else if x < 0 {\n        0\n    } else {\n        x\n    }\n}\n";
         assert_eq!(
             sentinel(Lang::Rust, rs, 4).unwrap(),
             "fn f(x: i32) -> i32 {\n    if x > 1 {\n        2\n    } else if if true { std::process::abort() } else { x < 0 } {\n        0\n    } else {\n        x\n    }\n}\n"
         );
-        // Wrapping an `if let` value would move or drop it, so it gets no probe.
+        // Wrapping an `if let` value would move or drop it, and a sentinel before `}` would
+        // land in the previous arm, so the line gets none.
         let rs_let = "fn f(x: Option<i32>) -> i32 {\n    if x == None {\n        2\n    } else if let Some(y) = x {\n        y\n    } else {\n        0\n    }\n}\n";
+        assert_eq!(sentinel(Lang::Rust, rs_let, 4), None);
+        // A trailing comment after the condition still gets the probe.
+        let commented = "def f(x):\n    if x > 1:\n        return 2\n    elif x < 0:  # invalid input\n        return 0\n";
         assert!(
-            sentinel(Lang::Rust, rs_let, 4).is_none_or(|out| !out.contains("abort() } else { x }"))
+            sentinel(Lang::Python, commented, 4)
+                .unwrap()
+                .contains("elif (_ for _ in ()).throw(SystemExit(\"titer sentinel\")) or (x < 0):  # invalid input")
         );
         // A survivor on a continuation line of the condition gets the probe too.
         let py = "def f(x):\n    if x > 1:\n        return 2\n    elif (\n        x < 0\n    ):\n        return 0\n";
@@ -1091,14 +1113,12 @@ def g():
                 .unwrap()
                 .contains("elif (_ for _ in ()).throw(SystemExit(\"titer sentinel\")) or ((\n        x < 0\n    )):")
         );
-        // An earlier branch on the same line keeps the statement sentinel, since the probe
-        // would also stand for that branch's condition.
+        // An earlier branch on the same line gets no sentinel: the probe would also stand
+        // for that branch's condition, and one before the line could land in another arm.
         let one_line = "function f(x: number) {\n  if (x > 1) return 2; else if (x < 0) return 0;\n  return x;\n}\n";
-        assert!(
-            sentinel(Lang::TypeScript, one_line, 2)
-                .unwrap()
-                .contains("  throw new Error(\"titer sentinel\");\n  if (x > 1)")
-        );
+        assert_eq!(sentinel(Lang::TypeScript, one_line, 2), None);
+        let after_return = "function f(x: number) {\n  if (x > 1) {\n    return \"else\" + \"if\"; } else if (x < 0) {\n    return 0;\n  }\n  return x;\n}\n";
+        assert_eq!(sentinel(Lang::TypeScript, after_return, 3), None);
         // A plain if keeps the statement sentinel.
         assert!(
             sentinel(Lang::TypeScript, ts, 2)
