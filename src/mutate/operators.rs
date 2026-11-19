@@ -665,11 +665,15 @@ fn python_after_future_imports(source: &str) -> usize {
 }
 
 /// Inserts a raise or throw before the statement that encloses `line`, so a run that stays
-/// green shows that no selected test executes that statement. Returns None when no
-/// statement encloses the line or the result does not parse.
+/// green shows that no selected test executes that statement. On the line where an `elif`
+/// or `else if` condition starts, the probe goes inside that condition instead. Returns
+/// None when no statement encloses the line or the result does not parse.
 pub fn sentinel(lang: Lang, source: &str, line: u32) -> Option<String> {
     let tree = lang.parse(source)?;
     let row = line.checked_sub(1)? as usize;
+    if let Some(out) = else_if_sentinel(lang, source, &tree, row) {
+        return Some(out);
+    }
     let text_line = source.lines().nth(row)?;
     let column = text_line.len() - text_line.trim_start().len();
     let point = tree_sitter::Point { row, column };
@@ -710,6 +714,89 @@ pub fn sentinel(lang: Lang, source: &str, line: u32) -> Option<String> {
     let had_errors = tree.root_node().has_error();
     let parses = lang.parse(&out).is_some_and(|t| !t.root_node().has_error());
     (had_errors || parses).then_some(out)
+}
+
+/// A sentinel inside the condition of an `elif` or `else if` that `row` is part of. No
+/// statement can go between the branches, and a sentinel before the whole `if` also runs for
+/// tests that take an earlier branch and never evaluate this condition. The probe raises
+/// when the condition is evaluated and leaves its value as it was. It applies only when
+/// the condition's lines hold nothing else, such as an earlier branch on the same line.
+fn else_if_sentinel(
+    lang: Lang,
+    source: &str,
+    tree: &tree_sitter::Tree,
+    row: usize,
+) -> Option<String> {
+    let mut stack = vec![tree.root_node()];
+    let mut condition = None;
+    while let Some(node) = stack.pop() {
+        if node.start_position().row > row || node.end_position().row < row {
+            continue;
+        }
+        let clause = match lang {
+            Lang::Python => node.kind() == "elif_clause",
+            Lang::TypeScript | Lang::Tsx => {
+                node.kind() == "if_statement"
+                    && node.parent().is_some_and(|p| p.kind() == "else_clause")
+            }
+            Lang::Rust => {
+                node.kind() == "if_expression"
+                    && node.parent().is_some_and(|p| p.kind() == "else_clause")
+            }
+        };
+        if clause
+            && let Some(c) = node.child_by_field_name("condition")
+            && (c.start_position().row..=c.end_position().row).contains(&row)
+        {
+            condition = Some(c);
+            break;
+        }
+        stack.extend(children(node));
+    }
+    let c = condition?;
+    // Wrapping an `if let` value changes how Rust moves and borrows it.
+    if lang == Lang::Rust && matches!(c.kind(), "let_condition" | "let_chain") {
+        return None;
+    }
+    let line_start = source[..c.start_byte()].rfind('\n').map_or(0, |i| i + 1);
+    let before = source[line_start..c.start_byte()]
+        .replace("elif", "")
+        .replace("else", "")
+        .replace("if", "");
+    if !before.chars().all(|ch| ch.is_whitespace() || ch == '}') {
+        return None;
+    }
+    let line_end = source[c.end_byte()..]
+        .find('\n')
+        .map_or(source.len(), |i| c.end_byte() + i);
+    let after = source[c.end_byte()..line_end].trim();
+    let opener = if lang == Lang::Python { ":" } else { "{" };
+    if !(after.is_empty() || after == opener) {
+        return None;
+    }
+    let cond = &source[c.start_byte()..c.end_byte()];
+    let probe = match lang {
+        // SystemExit, as in the statement sentinel, so `except Exception` cannot swallow
+        // it. A generator's throw raises it directly, so a test that stubs sys.exit cannot.
+        Lang::Python => {
+            format!("(_ for _ in ()).throw(SystemExit(\"titer sentinel\")) or ({cond})")
+        }
+        // A comma expression keeps the condition's value and its type narrowing. The probe
+        // returns normally in the type checker's view, so the branch stays reachable.
+        Lang::TypeScript | Lang::Tsx => format!(
+            "((() => {{ if (globalThis) throw new Error(\"titer sentinel\"); }})(), {cond})"
+        ),
+        // An if expression needs no parentheses, so no unused_parens lint fires.
+        Lang::Rust => format!("if true {{ std::process::abort() }} else {{ {cond} }}"),
+    };
+    let out = format!(
+        "{}{probe}{}",
+        &source[..c.start_byte()],
+        &source[c.end_byte()..]
+    );
+    lang.parse(&out)
+        .is_some_and(|t| !t.root_node().has_error())
+        .then_some(out)
 }
 
 #[cfg(test)]
@@ -962,11 +1049,10 @@ def g():
             sentinel(Lang::Python, py, 3).unwrap(),
             "def f(x):\n    if x > 1:\n        raise SystemExit(\"titer sentinel\")\n        return 2\n    elif x < 0:\n        return 3\n    return x\n"
         );
-        // An elif condition belongs to the whole if statement.
-        assert!(
-            sentinel(Lang::Python, py, 4)
-                .unwrap()
-                .contains("    raise SystemExit(\"titer sentinel\")\n    if x > 1:")
+        // No statement fits between branches, so an elif probes its own condition.
+        assert_eq!(
+            sentinel(Lang::Python, py, 4).unwrap(),
+            "def f(x):\n    if x > 1:\n        return 2\n    elif (_ for _ in ()).throw(SystemExit(\"titer sentinel\")) or (x < 0):\n        return 3\n    return x\n"
         );
         let ts = "export function f(x: number) {\n  const y = x > 1\n    ? 2\n    : 3;\n  return <a href={y} />;\n}\n";
         assert!(
@@ -978,6 +1064,46 @@ def g():
             sentinel(Lang::Tsx, ts, 5)
                 .unwrap()
                 .contains("  throw new Error(\"titer sentinel\");\n  return")
+        );
+    }
+
+    #[test]
+    fn else_if_sentinels_probe_their_own_condition() {
+        let ts = "function f(x: number) {\n  if (x > 1) {\n    return 2;\n  } else if (x < 0) {\n    return 0;\n  }\n  return x;\n}\n";
+        assert_eq!(
+            sentinel(Lang::TypeScript, ts, 4).unwrap(),
+            "function f(x: number) {\n  if (x > 1) {\n    return 2;\n  } else if ((() => { if (globalThis) throw new Error(\"titer sentinel\"); })(), (x < 0)) {\n    return 0;\n  }\n  return x;\n}\n"
+        );
+        let rs = "fn f(x: i32) -> i32 {\n    if x > 1 {\n        2\n    } else if x < 0 {\n        0\n    } else {\n        x\n    }\n}\n";
+        assert_eq!(
+            sentinel(Lang::Rust, rs, 4).unwrap(),
+            "fn f(x: i32) -> i32 {\n    if x > 1 {\n        2\n    } else if if true { std::process::abort() } else { x < 0 } {\n        0\n    } else {\n        x\n    }\n}\n"
+        );
+        // Wrapping an `if let` value would move or drop it, so it gets no probe.
+        let rs_let = "fn f(x: Option<i32>) -> i32 {\n    if x == None {\n        2\n    } else if let Some(y) = x {\n        y\n    } else {\n        0\n    }\n}\n";
+        assert!(
+            sentinel(Lang::Rust, rs_let, 4).is_none_or(|out| !out.contains("abort() } else { x }"))
+        );
+        // A survivor on a continuation line of the condition gets the probe too.
+        let py = "def f(x):\n    if x > 1:\n        return 2\n    elif (\n        x < 0\n    ):\n        return 0\n";
+        assert!(
+            sentinel(Lang::Python, py, 5)
+                .unwrap()
+                .contains("elif (_ for _ in ()).throw(SystemExit(\"titer sentinel\")) or ((\n        x < 0\n    )):")
+        );
+        // An earlier branch on the same line keeps the statement sentinel, since the probe
+        // would also stand for that branch's condition.
+        let one_line = "function f(x: number) {\n  if (x > 1) return 2; else if (x < 0) return 0;\n  return x;\n}\n";
+        assert!(
+            sentinel(Lang::TypeScript, one_line, 2)
+                .unwrap()
+                .contains("  throw new Error(\"titer sentinel\");\n  if (x > 1)")
+        );
+        // A plain if keeps the statement sentinel.
+        assert!(
+            sentinel(Lang::TypeScript, ts, 2)
+                .unwrap()
+                .contains("  throw new Error(\"titer sentinel\");\n  if (x > 1)")
         );
     }
 

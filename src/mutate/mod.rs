@@ -698,7 +698,7 @@ pub fn run(
 }
 
 /// Survivor follow-up. First the sentinel: a raise before the statement that encloses each
-/// surviving line. If the selected tests still pass, no green selected test runs that line,
+/// surviving line, or inside an `elif` or `else if` condition. If the selected tests still pass, no green selected test runs that line,
 /// and its survivors are not executed. Then the other tests: the remaining survivors run
 /// against the whole changed test files, and a kill there is caught by other tests.
 fn follow_up(
