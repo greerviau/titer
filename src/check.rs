@@ -73,6 +73,10 @@ pub fn run(cwd: &Path, options: &CheckOptions) -> anyhow::Result<Report> {
     report.head_tree = Some(ctx.session.head_tree.clone());
     report.tiers = options.tiers.clone();
     report.not_analyzed = ctx.detection.not_analyzed.clone();
+    // The warnings are about how tests are selected, which only prove and mutate do.
+    if ctx.wants(Tier::Prove) || ctx.wants(Tier::Mutate) {
+        report.warnings.extend(ctx.detection.warnings.clone());
+    }
     report
         .warnings
         .extend(crate::init::stamp_warning(ctx.session.git.root()));
