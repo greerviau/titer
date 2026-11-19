@@ -130,9 +130,11 @@ fn a_second_init_refuses_and_update_restamps_the_skill() {
     let repo = monorepo();
     assert_eq!(repo.titer(&["init"]).status.code(), Some(0));
     let skill = repo.path().join(".claude/skills/titer/SKILL.md");
+    // An old skill: another version stamp, and text that predates `--only scan,prove`.
     let old = std::fs::read_to_string(&skill)
         .unwrap()
-        .replace(VERSION, "0.0.1");
+        .replace(VERSION, "0.0.1")
+        .replace("`--only scan,prove`", "nothing");
     std::fs::write(&skill, old).unwrap();
     std::fs::remove_file(repo.path().join(".agents/skills/titer/SKILL.md")).unwrap();
     repo.commit_all("init");
@@ -159,6 +161,7 @@ fn a_second_init_refuses_and_update_restamps_the_skill() {
             text.contains(&format!("<!-- titer-version: {VERSION} -->")),
             "{path}"
         );
+        assert!(text.contains("`--only scan,prove`"), "{path}");
     }
 }
 
@@ -210,14 +213,44 @@ fn runner_names_stay_unique_and_the_skill_runs_from_the_pinned_dir() {
         "{config}"
     );
     let skill = std::fs::read_to_string(repo.path().join(".claude/skills/titer/SKILL.md")).unwrap();
+    let run = skill_section(&skill, "## Run");
+    assert_eq!(run.matches("titer check --json").count(), 1, "{run}");
     assert!(
-        skill.contains("- `npx titer check --json` from `web/app/`"),
-        "{skill}"
+        run.contains("`uv run titer check --json` from `api/app/`"),
+        "{run}"
     );
-    assert!(
-        skill.contains("- `uv run titer check --json` from `api/app/`"),
-        "{skill}"
-    );
+    assert!(run.contains("`web/app/`"), "{run}");
+    assert!(run.contains("same check"), "{run}");
+    let description = skill.lines().nth(2).unwrap();
+    assert!(!description.contains("titer check"), "{description}");
+}
+
+/// The text of one `## ` section of the skill, without the next section.
+fn skill_section<'a>(skill: &'a str, heading: &str) -> &'a str {
+    let start = skill
+        .find(heading)
+        .unwrap_or_else(|| panic!("no {heading}: {skill}"));
+    let rest = &skill[start + heading.len()..];
+    &rest[..rest.find("\n## ").unwrap_or(rest.len())]
+}
+
+#[test]
+fn the_skill_says_what_budget_limits_and_when_crap_has_scores() {
+    let repo = monorepo();
+
+    assert_eq!(repo.titer(&["init"]).status.code(), Some(0));
+
+    let skill = std::fs::read_to_string(repo.path().join(".claude/skills/titer/SKILL.md")).unwrap();
+    let run = skill_section(&skill, "## Run");
+    assert!(run.contains("`--budget"), "{run}");
+    assert!(run.contains("limits mutation only"), "{run}");
+    assert!(run.contains("from the start of the check"), "{run}");
+    assert!(run.contains("`--only scan,prove`"), "{run}");
+    assert!(!run.contains("makes it shorter"), "{run}");
+    let report = skill_section(&skill, "## Read the report");
+    assert!(report.contains("`--coverage"), "{report}");
+    assert!(report.contains("`coverage_file`"), "{report}");
+    assert!(report.contains("complexity only"), "{report}");
 }
 
 #[test]
@@ -294,4 +327,22 @@ fn init_gives_a_nested_crate_outside_the_workspace_its_own_runner() {
     assert!(stdout.contains("cwd = \"fuzz\""), "{stdout}");
     assert!(!stdout.contains("cwd = \"crates/member\""), "{stdout}");
     assert!(!stdout.contains("cwd = \"helper\""), "{stdout}");
+}
+
+#[test]
+fn update_pins_each_manifest_once_whatever_the_runner_order() {
+    let repo = Fixture::new();
+    repo.write(
+        "titer.toml",
+        "[[runner]]\nname = \"a\"\nkind = \"pytest\"\ncwd = \"api\"\ncommand = [\"x\"]\n\n[[runner]]\nname = \"w\"\nkind = \"vitest\"\ncwd = \"web\"\ncommand = [\"x\"]\n\n[[runner]]\nname = \"b\"\nkind = \"unittest\"\ncwd = \"api\"\ncommand = [\"x\"]\n",
+    )
+    .write("api/pyproject.toml", "[project]\nname = \"api\"\n")
+    .write("web/package.json", "{\n  \"name\": \"web\"\n}\n");
+    repo.commit_all("base");
+
+    let output = repo.titer(&["init", "--update", "--dry-run"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert_eq!(stdout.matches("api/pyproject.toml").count(), 1, "{stdout}");
 }

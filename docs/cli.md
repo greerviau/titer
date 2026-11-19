@@ -35,7 +35,7 @@ titer check [OPTIONS]
 | `--base REF` | The base ref. Defaults to `base` in `titer.toml`, then to the remote default branch. |
 | `--only TIERS` | Runs only these tiers, comma separated: `scan`, `prove`, `mutate`, `crap`. |
 | `--json` | Prints the JSON report on stdout instead of the text summary. |
-| `--budget DURATION` | The time budget for the whole check, for example `120s` or `3m`. |
+| `--budget DURATION` | The deadline for starting mutants, counted from the start of the check, for example `120s` or `3m`. The head and base test runs keep their own timeouts, so a check can run longer. |
 | `--workers N` | The number of mutation workers. Defaults to a value sized from cores and memory. |
 | `--mutants FILE` | Adds agent-written mutants from a JSON lines file. |
 | `--coverage FILE` | A coverage file for CRAP: lcov, Cobertura XML, or coverage.py JSON. |

@@ -86,7 +86,7 @@ Agents can add their own mutants with `--mutants`. See the [CLI reference](cli.m
 CRAP = complexity^2 * (1 - coverage)^3 + complexity
 ```
 
-Coverage comes from `--coverage` (lcov, Cobertura XML, or coverage.py JSON) or from `[crap] coverage_command` in `titer.toml`. Functions that score above `[crap] threshold` (default 30) are flagged.
+Coverage comes from `--coverage` (lcov, Cobertura XML, or coverage.py JSON) or from `[crap] coverage_command` and the `coverage_file` it writes in `titer.toml`. Without a coverage source, `crap` reports complexity only. Functions that score above `[crap] threshold` (default 30) are flagged.
 
 ## Rust
 
