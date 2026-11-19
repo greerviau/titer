@@ -98,7 +98,7 @@ By default the gate fails only on an unproven change. Each key below adds a fail
 |---|---|---|
 | `budget` | `"120s"` | The deadline for starting mutants, counted from the start of the check. The head and base test runs keep their own timeouts, so a check can run longer. A budget above 300 s also raises those timeouts. `--budget` overrides it. |
 | `exclude_operators` | `[]` | Mutation operators to skip, for example `["remove_call"]`. |
-| `exclude_globs` | `[]` | Repo-relative source files that titer never mutates. |
+| `exclude_globs` | `[]` | Repo-relative source files that titer never mutates. `init` adds known tools' configs in each runner's dir, such as `vite.config.*` and `.eslintrc.*` for vitest and `setup.py` for Python. |
 | `exclude_calls` | `[]` | Callee names whose calls titer never removes, in addition to logging calls. |
 
 ## crap
