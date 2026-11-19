@@ -195,6 +195,59 @@ fn a_vitest_test_that_catches_the_import_error_still_runs_its_mutants() {
 }
 
 #[test]
+fn survivors_on_an_elif_the_tests_never_reach_are_not_executed() {
+    let repo = Fixture::new();
+    repo.write(
+        "titer.toml",
+        &format!(
+            "[[runner]]\nkind = \"pytest\"\ncommand = [\"{}\", \"-m\", \"pytest\"]\n",
+            fixture_python()
+        ),
+    )
+    .write(
+        "app.py",
+        "def f(x):\n    if x > 1:\n        return 2\n    return x\n",
+    )
+    .write(
+        "test_app.py",
+        "from app import f\n\n\ndef test_big():\n    assert f(2) == 2\n",
+    );
+    repo.commit_all("base");
+    repo.git(&["checkout", "-q", "-b", "fix"]);
+    // The test takes the first branch, so it never evaluates the new elif.
+    repo.write(
+        "app.py",
+        "def f(x):\n    if x > 1:\n        return 2\n    elif x < 0:\n        return 0\n    return x\n",
+    );
+
+    let output = repo.titer(&["check", "--json", "--only", "mutate"]);
+
+    let report = stdout_json(&output);
+    let elif: Vec<(u64, String, String, String)> =
+        outcomes(&report).into_iter().filter(|o| o.0 == 4).collect();
+    assert!(!elif.is_empty(), "{report:#}");
+    assert!(
+        elif.iter().all(|o| o.3 == "not_executed"),
+        "{elif:?}\n{report:#}"
+    );
+
+    // f(0) evaluates the elif, and no mutant of it changes the result, so they survive.
+    repo.write(
+        "test_app.py",
+        // A test that stubs sys.exit must not hide the probe.
+        "import sys\n\nfrom app import f\n\n\ndef test_big():\n    assert f(2) == 2\n\n\ndef test_zero(monkeypatch):\n    monkeypatch.setattr(sys, \"exit\", lambda *a: None)\n    assert f(0) == 0\n",
+    );
+    let report = stdout_json(&repo.titer(&["check", "--json", "--only", "mutate"]));
+    let elif: Vec<(u64, String, String, String)> =
+        outcomes(&report).into_iter().filter(|o| o.0 == 4).collect();
+    assert!(!elif.is_empty(), "{report:#}");
+    assert!(
+        elif.iter().all(|o| o.3 == "survived"),
+        "{elif:?}\n{report:#}"
+    );
+}
+
+#[test]
 fn without_changed_tests_the_suite_runs_against_mutants() {
     let repo = repo("120s");
     repo.write("test_app.py", CLAMP_TEST);
