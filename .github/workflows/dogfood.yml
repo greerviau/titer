@@ -1,0 +1,57 @@
+name: Dogfood
+
+# Runs titer, built from this branch, on this branch's own change through this repo's
+# Action. It is advisory: the job passes whatever the gate says, and the result is in the
+# job summary and the diff annotations.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dogfood-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  titer:
+    runs-on: ubuntu-latest
+    # Each cargo build in a worktree can take up to its own 30 minute timeout, apart from
+    # the mutation budget.
+    timeout-minutes: 90
+    steps:
+      # The pull request head, so annotations land on the diff's lines.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Fixture runners
+        run: scripts/setup-fixture-deps.sh
+      - run: cargo build --release --locked
+      - name: titer check
+        id: titer
+        continue-on-error: true
+        uses: ./
+        with:
+          base: origin/${{ github.base_ref }}
+          command: ${{ github.workspace }}/target/release/titer
+          # Every worktree starts with a cold cargo build, so the default budget ends
+          # before the first mutant starts.
+          args: --budget 20m
+      - name: Result
+        if: always()
+        env:
+          CODE: ${{ steps.titer.outputs.exit-code }}
+        run: |
+          if [ -n "$CODE" ]; then
+            echo "::notice::titer exited $CODE; the gate is advisory here. See the job summary."
+          else
+            echo "::notice::titer did not run or wrote no exit code; see the earlier steps."
+          fi

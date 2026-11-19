@@ -1,0 +1,14 @@
+# titer checks its own changes. See docs/configuration.md for every option.
+
+[[runner]]
+kind = "cargo"
+command = ["cargo", "test", "--locked"]
+# The fixture tests run pytest and vitest from here; scripts/setup-fixture-deps.sh
+# installs them.
+deps = [".fixture-deps"]
+
+[gate]
+# fail_on_survivors = false
+# fail_on_passes_on_base = false
+# fail_on_scan = false
+# fail_on_crap = false
