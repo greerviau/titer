@@ -645,7 +645,10 @@ pub fn annotations(report: &Report) -> String {
         ));
     }
     let mut out = String::new();
-    for level in [errors, warnings, notices] {
+    for mut level in [errors, warnings, notices] {
+        // Tests that share one inherited method share its findings' lines and messages.
+        let mut seen = std::collections::HashSet::new();
+        level.retain(|line| seen.insert(line.clone()));
         for line in level.into_iter().take(SHOWN) {
             out.push_str(&line);
             out.push('\n');
@@ -767,6 +770,15 @@ mod tests {
             lines[2].starts_with("::notice file=app.py,line=9,"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn identical_annotations_appear_once() {
+        let mut r = report();
+        // Two classes that inherit one test method get the same finding twice.
+        let finding = r.findings[0].clone();
+        r.findings.push(finding);
+        assert_eq!(annotations(&r), annotations(&report()));
     }
 
     #[test]
