@@ -93,7 +93,7 @@ pub fn run(cwd: &Path, dry_run: bool, update: bool) -> anyhow::Result<Plan> {
     for path in SKILL_PATHS {
         plan.writes.push((root.join(path), skill.clone()));
     }
-    plan.writes = resolve_writes(&root, std::mem::take(&mut plan.writes))?;
+    plan.writes = resolve_writes(&git, &root, std::mem::take(&mut plan.writes))?;
     if !dry_run {
         for (path, contents) in &plan.writes {
             if let Some(parent) = path.parent() {
@@ -113,12 +113,25 @@ pub fn run(cwd: &Path, dry_run: bool, update: bool) -> anyhow::Result<Plan> {
 /// shared with other repos, the user's own config, or git's files. An existing
 /// destination must be a regular file with no other hard links.
 fn resolve_writes(
+    git: &Git,
     root: &Path,
     writes: Vec<(PathBuf, String)>,
 ) -> anyhow::Result<Vec<(PathBuf, String)>> {
     let real_root = root
         .canonicalize()
         .with_context(|| format!("cannot resolve {}", root.display()))?;
+    // A worktree or `--separate-git-dir` keeps git's files outside `.git`. Each query is
+    // separate, and only git's own line end comes off, so no path is split or trimmed.
+    let mut git_dirs = Vec::new();
+    for flag in ["--git-dir", "--git-common-dir"] {
+        let out = git.run(["rev-parse", flag])?;
+        let dir = out.strip_suffix('\n').unwrap_or(&out);
+        git_dirs.push(
+            root.join(dir)
+                .canonicalize()
+                .with_context(|| format!("cannot resolve git's dir {dir}"))?,
+        );
+    }
     let mut direct: Vec<(PathBuf, String)> = Vec::new();
     let mut linked: Vec<(PathBuf, String)> = Vec::new();
     for (path, contents) in writes {
@@ -134,11 +147,17 @@ fn resolve_writes(
             current.push(part);
             through_link |= current.is_symlink();
         }
+        let real = real_root.join(rel);
+        if rel.components().any(|c| c.as_os_str() == ".git")
+            || git_dirs.iter().any(|g| real.starts_with(g))
+        {
+            bail!("refusing to write {}: it is in git's files", path.display());
+        }
         if through_link {
             linked.push((path, contents));
         } else {
-            check_destination(&path)?;
-            direct.push((real_root.join(rel), contents));
+            check_destination(root, &path)?;
+            direct.push((real, contents));
         }
     }
     for (path, contents) in linked {
@@ -149,7 +168,7 @@ fn resolve_writes(
         match target {
             Some((_, existing)) if *existing == contents => {}
             _ => bail!(
-                "refusing to write {}: a symlink is on its path, and titer follows one only when it leads to another file titer writes",
+                "refusing to write {}: a symlink is on its path, and titer follows one only when it leads to another file titer writes (if it points at a dir that does not exist yet, create that dir first)",
                 path.display()
             ),
         }
@@ -176,7 +195,17 @@ fn real_path(path: &Path) -> Option<PathBuf> {
 
 /// An existing destination must be a regular file with no other hard links, so a write
 /// cannot block on a FIFO or change a file another path shares.
-fn check_destination(path: &Path) -> anyhow::Result<()> {
+fn check_destination(root: &Path, path: &Path) -> anyhow::Result<()> {
+    // A missing destination needs directories all the way down, or the write fails late.
+    for dir in path.ancestors().skip(1).take_while(|d| d.starts_with(root)) {
+        if dir.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
+            bail!(
+                "refusing to write {}: {} is not a directory",
+                path.display(),
+                dir.display()
+            );
+        }
+    }
     let Ok(meta) = path.symlink_metadata() else {
         return Ok(());
     };

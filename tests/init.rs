@@ -606,3 +606,29 @@ fn init_refuses_a_skill_destination_that_is_not_a_regular_file() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("not a regular file"));
     assert!(!repo.path().join("titer.toml").exists());
 }
+
+#[test]
+fn init_refuses_a_file_on_the_skill_path_and_a_git_dir_at_the_skill_dir() {
+    let repo = monorepo();
+    std::fs::create_dir_all(repo.path().join(".claude")).unwrap();
+    std::fs::write(repo.path().join(".claude/skills"), "a file\n").unwrap();
+
+    let dry = repo.titer(&["init", "--dry-run"]);
+    let real = repo.titer(&["init"]);
+
+    assert_eq!(dry.status.code(), Some(2));
+    assert_eq!(real.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&real.stderr).contains("not a directory"));
+    assert!(!repo.path().join("titer.toml").exists());
+
+    // Git's own dir moved to where the skill goes.
+    std::fs::remove_file(repo.path().join(".claude/skills")).unwrap();
+    std::fs::rename(repo.path().join(".git"), repo.path().join(".claude/skills")).unwrap();
+    std::fs::write(repo.path().join(".git"), "gitdir: .claude/skills\n").unwrap();
+
+    let into_git = repo.titer(&["init"]);
+
+    assert_eq!(into_git.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&into_git.stderr).contains("git's files"));
+    assert!(!repo.path().join(".claude/skills/titer").exists());
+}
