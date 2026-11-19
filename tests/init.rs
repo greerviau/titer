@@ -346,3 +346,38 @@ fn update_pins_each_manifest_once_whatever_the_runner_order() {
     assert_eq!(output.status.code(), Some(0), "{stdout}");
     assert_eq!(stdout.matches("api/pyproject.toml").count(), 1, "{stdout}");
 }
+
+#[test]
+fn init_detects_pytest_from_dependencies_and_not_from_keywords() {
+    let repo = Fixture::new();
+    repo.write(".gitignore", "target\n")
+        .write(
+            "Cargo.toml",
+            "[package]\nname = \"tool\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .write("src/lib.rs", "")
+        // A Rust tool packaged for PyPI that mentions pytest only as a keyword.
+        .write(
+            "pyproject.toml",
+            "[project]\nname = \"tool\"\nkeywords = [\"testing\", \"pytest\"]\ndescription = \"works with \\\"pytest\\\"\"\n",
+        )
+        .write(
+            "api/pyproject.toml",
+            "[project]\nname = \"api\"\n\n[dependency-groups]\ndev = [\"PyTest>=8\"]\n",
+        )
+        .write(
+            "lib/pyproject.toml",
+            "[project]\nname = \"lib\"\n\n[project.optional-dependencies]\ntest = [\"pytest-cov\"]\n",
+        );
+    repo.commit_all("base");
+
+    let output = repo.titer(&["init", "--dry-run"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    // A pytest plugin such as pytest-cov needs pytest, so it counts too.
+    assert_eq!(stdout.matches("kind = \"pytest\"").count(), 2, "{stdout}");
+    assert!(stdout.contains("cwd = \"api\""), "{stdout}");
+    assert!(stdout.contains("cwd = \"lib\""), "{stdout}");
+    assert!(stdout.contains("kind = \"cargo\""), "{stdout}");
+}
