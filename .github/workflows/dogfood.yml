@@ -17,7 +17,9 @@ concurrency:
 jobs:
   titer:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Each cargo build in a worktree can take up to its own 30 minute timeout, apart from
+    # the mutation budget.
+    timeout-minutes: 90
     steps:
       # The pull request head, so annotations land on the diff's lines.
       - uses: actions/checkout@v7
@@ -44,6 +46,12 @@ jobs:
           # before the first mutant starts.
           args: --budget 20m
       - name: Result
+        if: always()
         env:
           CODE: ${{ steps.titer.outputs.exit-code }}
-        run: echo "::notice::titer exited ${CODE:-unknown}; the gate is advisory here. See the job summary."
+        run: |
+          if [ -n "$CODE" ]; then
+            echo "::notice::titer exited $CODE; the gate is advisory here. See the job summary."
+          else
+            echo "::notice::titer did not run or wrote no exit code; see the earlier steps."
+          fi
