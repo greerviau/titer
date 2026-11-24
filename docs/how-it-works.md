@@ -74,7 +74,7 @@ Each survivor gets two follow-up runs:
 
 Mutant outcomes are `killed`, `timed_out`, `survived`, `not_executed`, `caught_by_other`, `not_run` (the budget ran out first), and `no_result`.
 
-The budget is a hard deadline for mutation. titer starts a canary, mutant, or follow-up run only when the head run's duration still fits before the deadline, and kills the process group of any run still going at the deadline. A mutant whose run did not finish is `not_run`, never killed, timed out, or survived. So is a mutant whose canary did not finish, and a survivor whose follow-up runs did not finish. A mutant's own timeout, 3x the head run plus 10 s, covers every attempt of its run: a runner that retries without a missing test does not restart it.
+The budget is a hard deadline for mutation. titer starts a canary, mutant, or follow-up run only when the head run's duration still fits before the deadline, and kills the process group of any run still going at the deadline. A mutant whose run the deadline stops is `not_run`, never killed, timed out, or survived. So is a mutant whose canary the deadline stops, and a survivor whose follow-up runs it stops. A mutant that reaches its own timeout first is `timed_out`. A mutant's own timeout, 3x the head run plus 10 s, covers every attempt of its run: a runner that retries without a missing test does not restart it.
 
 A mutant survives only when every selected test ran and passed. A mutant that leaves any selected target unbuildable or unlistable, or a selected test missing, gets `no_result`, unless a selected test fails. A compile or link error is never a kill.
 

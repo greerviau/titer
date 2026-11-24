@@ -443,10 +443,11 @@ fn run_job(
             .join(&format!("logs-{}", worktree_name(worktree))),
     });
     if let Err(e) = worktree.restore(&job.file, job.original.as_bytes()) {
-        return (
-            error_result(e.context("cannot restore the mutated file")),
-            false,
-        );
+        let mut result = error_result(e.context("cannot restore the mutated file"));
+        if run.as_ref().is_ok_and(|r| r.past_deadline) {
+            result.outcome = MutantOutcome::NotRun;
+        }
+        return (result, false);
     }
     let run = match run {
         Ok(run) => run,

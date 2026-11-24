@@ -287,8 +287,21 @@ impl Runner {
     }
 }
 
-/// Runs `cmd` under `limit`. A timeout that the deadline set is also `past_deadline`.
+/// Runs `cmd` under `limit`. A timeout that the deadline set is also `past_deadline`, and a
+/// process the deadline leaves no time for never starts.
 pub(crate) fn run_limited(cmd: Command, limit: Limit, scratch: &Path) -> anyhow::Result<RunOutput> {
+    if limit.at_deadline && limit.timeout.is_some_and(|t| t.is_zero()) {
+        return Ok(RunOutput {
+            exit_code: None,
+            signal: None,
+            timed_out: true,
+            past_deadline: true,
+            duration: Duration::ZERO,
+            max_rss_bytes: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        });
+    }
     let mut out = process::run(cmd, limit.timeout, scratch)?;
     out.past_deadline = out.timed_out && limit.at_deadline;
     Ok(out)

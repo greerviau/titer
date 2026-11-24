@@ -545,5 +545,7 @@ fn the_budget_kills_a_running_mutant_and_its_follow_up() {
         total < 10_000,
         "the check overran its 8 s budget: {total} ms"
     );
+    // Only the hanging mutant can keep a run going until the deadline.
+    assert!(total > 7_500, "the hanging mutant never ran: {total} ms");
     assert!(repo.leftover_tmp().is_empty(), "{:?}", repo.leftover_tmp());
 }

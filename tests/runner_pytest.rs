@@ -276,9 +276,16 @@ fn a_conftest_that_fails_to_load_fails_the_selected_tests() {
 #[test]
 fn retries_share_one_timeout() {
     let repo = repo("");
-    // Every attempt loads the conftest, so each takes over 1 s. The first fits the timeout
+    // Every attempt loads the conftest, so each takes over 1.5 s. The first fits the timeout
     // and drops the missing test; a retry with a fresh timeout would fit too.
-    repo.write("tests/conftest.py", "import time\n\ntime.sleep(1)\n");
+    let loads = repo.scratch().join("loads");
+    repo.write(
+        "tests/conftest.py",
+        &format!(
+            "import time\n\nopen({:?}, 'a').write('x')\ntime.sleep(1.5)\n",
+            loads.display().to_string()
+        ),
+    );
     let runner = runner(".");
     let cases = vec![
         case(&runner, "tests/test_a.py", &["TestX"], "test_ok"),
@@ -292,7 +299,7 @@ fn retries_share_one_timeout() {
             worktree: repo.path(),
             selection: Selection::Tests(&cases),
             fail_fast: false,
-            timeout: Some(std::time::Duration::from_millis(2000)),
+            timeout: Some(std::time::Duration::from_millis(3000)),
             deadline: Deadline::NONE,
             scratch: &scratch,
         })
@@ -300,8 +307,13 @@ fn retries_share_one_timeout() {
 
     let elapsed = started.elapsed();
     assert!(run.timed_out, "{run:?}");
+    assert_eq!(
+        std::fs::read_to_string(&loads).unwrap(),
+        "xx",
+        "the retry did not start"
+    );
     assert!(
-        elapsed < std::time::Duration::from_millis(2800),
+        elapsed < std::time::Duration::from_millis(3800),
         "the retry restarted the timeout: {elapsed:?}"
     );
 }
