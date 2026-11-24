@@ -1470,11 +1470,24 @@ pub fn file_imports(
     };
     match lang {
         Lang::TypeScript | Lang::Tsx => {
-            for node in children(tree.root_node()) {
-                if !matches!(node.kind(), "import_statement" | "export_statement") {
-                    continue;
-                }
-                let Some(spec_node) = node.child_by_field_name("source") else {
+            for node in descendants(tree.root_node()) {
+                let spec_node = match node.kind() {
+                    "import_statement" | "export_statement" => node.child_by_field_name("source"),
+                    // `require("x")` and `import("x")`, which CommonJS and lazy code use.
+                    "call_expression" => {
+                        let callee = node.child_by_field_name("function");
+                        let is_loader = callee.is_some_and(|c| {
+                            c.kind() == "import"
+                                || (c.kind() == "identifier" && text(c, source) == "require")
+                        });
+                        node.child_by_field_name("arguments")
+                            .filter(|_| is_loader)
+                            .and_then(|a| children(a).into_iter().next())
+                            .filter(|a| a.kind() == "string")
+                    }
+                    _ => None,
+                };
+                let Some(spec_node) = spec_node else {
                     continue;
                 };
                 let spec = crate::lang::ts::title(spec_node, source);
@@ -1503,22 +1516,42 @@ pub fn file_imports(
                         } else {
                             resolve_py(module, &roots, files)
                         };
-                        let package_dir = resolved.as_ref().and_then(|(_, d)| d.clone());
-                        add(resolved.map(|(path, _)| path), module);
-                        // `from pkg import mod` imports the submodule file too.
-                        let Some(package_dir) = package_dir else {
-                            continue;
+                        // `from pkg import mod` imports the submodule file too. A namespace
+                        // package has no `__init__.py`, so its candidate dirs come from the
+                        // module path itself.
+                        let package_dirs: Vec<String> = match &resolved {
+                            Some((_, Some(d))) => vec![d.clone()],
+                            Some((_, None)) => Vec::new(),
+                            None if module_node.kind() == "relative_import" => {
+                                let dots = module.chars().take_while(|c| *c == '.').count();
+                                let mut base = dir.clone();
+                                for _ in 1..dots {
+                                    base = parent(&base);
+                                }
+                                vec![join(&base, &module[dots..].replace('.', "/"))]
+                            }
+                            None => roots
+                                .iter()
+                                .map(|r| join(r, &module.replace('.', "/")))
+                                .collect(),
                         };
+                        let mut submodules = Vec::new();
                         let mut cursor = node.walk();
                         for name_node in node.children_by_field_name("name", &mut cursor) {
                             let (name, _) = imported_name(name_node, source);
-                            let base = join(&package_dir, &name);
-                            let found = [format!("{base}.py"), join(&base, "__init__.py")]
-                                .into_iter()
-                                .find(|p| files.contains(p));
-                            if let Some(path) = found {
-                                add(Some(path), "");
-                            }
+                            let found = package_dirs.iter().find_map(|d| {
+                                let base = join(d, &name);
+                                [format!("{base}.py"), join(&base, "__init__.py")]
+                                    .into_iter()
+                                    .find(|p| files.contains(p))
+                            });
+                            submodules.extend(found);
+                        }
+                        if resolved.is_some() || submodules.is_empty() {
+                            add(resolved.map(|(path, _)| path), module);
+                        }
+                        for path in submodules {
+                            add(Some(path), "");
                         }
                     }
                     "import_statement" => {
@@ -1539,6 +1572,24 @@ pub fn file_imports(
             }
         }
         Lang::Rust => {}
+    }
+    if lang.is_python() {
+        // Importing `pkg.mod` runs every `__init__.py` above it first.
+        let mut packages = Vec::new();
+        for path in &out.local {
+            let mut dir = parent(path);
+            while !dir.is_empty() {
+                let init = join(&dir, "__init__.py");
+                if !files.contains(&init) {
+                    break;
+                }
+                if init != *path && !packages.contains(&init) {
+                    packages.push(init);
+                }
+                dir = parent(&dir);
+            }
+        }
+        out.local.extend(packages);
     }
     out
 }

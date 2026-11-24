@@ -688,7 +688,7 @@ fn init_adds_test_helpers_and_setup_files_to_support_globs() {
         "{globs:?}"
     );
 
-    // A change to the helper is a test path: titer copies it and never mutates it.
+    // A change to the helper is a test path, so titer never mutates it.
     repo.commit_all("opt in to titer");
     repo.git(&["checkout", "-q", "-b", "change"]);
     repo.write("web/src/testing.ts", "import { vi } from \"vitest\";\nimport { half } from \"./half\";\n\nexport const spyHalf = () => vi.fn((x: number) => half(x) + 0);\n")
@@ -752,4 +752,29 @@ fn init_adds_a_python_test_helper_outside_tests_to_support_globs() {
     );
     assert!(globs.contains(&"**/conftest.py".to_string()), "{globs:?}");
     assert!(!globs.iter().any(|g| g.contains("app.py")), "{globs:?}");
+}
+
+#[test]
+fn init_resolves_a_helper_against_the_working_tree_not_the_index() {
+    let repo = web_with_helpers();
+    // The deletion is not staged, so the index still lists src/testing.ts.
+    repo.remove("web/src/testing.ts").write(
+        "web/src/testing/index.ts",
+        "import { vi } from \"vitest\";\nimport { half } from \"../half\";\n\nexport const spyHalf = () => vi.fn(half);\n",
+    );
+
+    let init = repo.titer(&["init"]);
+
+    assert_eq!(
+        init.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let globs = support_globs(&repo);
+    assert!(
+        globs.contains(&"src/testing/index.ts".to_string()),
+        "{globs:?}"
+    );
+    assert!(!globs.contains(&"src/testing.ts".to_string()), "{globs:?}");
 }

@@ -82,28 +82,34 @@ pub fn run(cwd: &Path, dry_run: bool, update: bool) -> anyhow::Result<Plan> {
         }
         let defaults = Config::parse(&render_config(&runners))
             .context("the generated titer.toml does not parse")?;
-        let files = repo_files(&git)?;
+        let files = repo_files(&git, &root)?;
         let read = |p: &str| std::fs::read_to_string(root.join(p)).ok();
         for (runner, config) in runners.iter_mut().zip(&defaults.runners) {
             let helpers = support::helpers(config, &files, &read)?;
-            if helpers.is_empty() {
+            if !helpers.unwritable.is_empty() {
+                plan.notes.push(format!(
+                    "these look like test helpers of {}, but no glob can name them, so titer will mutate them: {}",
+                    config.name,
+                    helpers.unwritable.join(", ")
+                ));
+            }
+            if helpers.globs.is_empty() {
                 continue;
             }
             plan.notes.push(format!(
                 "check the test helpers added to {}'s support_globs, which titer copies onto base and never mutates: {}",
                 config.name,
-                helpers.join(", ")
+                helpers.globs.join(", ")
             ));
             let mut globs = config.support_globs.clone();
-            globs.extend(helpers);
+            globs.extend(helpers.globs);
             runner.support_globs = Some(globs);
         }
         let text = render_config(&runners);
         Config::parse(&text).context("the generated titer.toml does not parse")?;
         plan.writes.push((config_path, text));
-        let mut script_bases = vec![".".to_string()];
-        script_bases.extend(runners.iter().map(|r| r.cwd.clone()));
-        let scripts = support::test_scripts(&root, &script_bases);
+        let runner_dirs: Vec<String> = runners.iter().map(|r| r.cwd.clone()).collect();
+        let scripts = support::test_scripts(&root, &runner_dirs);
         if !scripts.is_empty() {
             plan.notes.push(format!(
                 "found these test scripts: {}; if they set environment variables the suite needs, copy them into the runner's `env` in titer.toml",
@@ -406,8 +412,8 @@ fn collect_dirs(root: &Path, dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The repo's files: tracked ones plus untracked ones that are not ignored, as head sees them.
-fn repo_files(git: &Git) -> anyhow::Result<std::collections::HashSet<String>> {
+/// The repo's files as head sees them: tracked and untracked files that are not ignored.
+fn repo_files(git: &Git, root: &Path) -> anyhow::Result<std::collections::HashSet<String>> {
     let bytes = git.run_bytes([
         "ls-files",
         "-z",
@@ -419,6 +425,8 @@ fn repo_files(git: &Git) -> anyhow::Result<std::collections::HashSet<String>> {
         .split(|b| *b == 0)
         .filter(|p| !p.is_empty())
         .map(|p| String::from_utf8_lossy(p).into_owned())
+        // A file deleted from the working tree but still in the index is not in head.
+        .filter(|p| root.join(p).symlink_metadata().is_ok())
         .collect())
 }
 
