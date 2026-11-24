@@ -328,3 +328,140 @@ fn two_vitest_tests_on_one_line_are_reported_as_sharing_a_selector() {
         "{report:#}"
     );
 }
+
+const API_BASE: &str = r#"export const api = {
+  get(key: string): string {
+    return key;
+  },
+};
+
+export class Store {
+  static open(): Store {
+    return new Store();
+  }
+  read(): number {
+    return 0;
+  }
+}
+
+export const limits = { max: 1 };
+"#;
+
+// Head adds a method to an exported object, a static and an instance method to an exported
+// class, a property to an exported object, and a new export reached through a namespace.
+const API_HEAD: &str = r#"export const api = {
+  get(key: string): string {
+    return key.toUpperCase();
+  },
+  post(key: string): string {
+    return `posted ${key}`;
+  },
+};
+
+export class Store {
+  static open(): Store {
+    return new Store();
+  }
+  static create(): Store {
+    return new Store();
+  }
+  read(): number {
+    return 1;
+  }
+  size(): number {
+    return 2;
+  }
+}
+
+export const limits = { max: 1, min: 0 };
+
+export function ping(): number {
+  return 1;
+}
+"#;
+
+const API_TEST: &str = r#"import { describe, it, expect } from "vitest";
+import { api, Store, limits } from "./api";
+import * as mod from "./api";
+
+describe("api", () => {
+  it("gets", () => {
+    expect(api.get("a")).toBe("A");
+  });
+  it("posts", () => {
+    expect(api.post("a")).toBe("posted a");
+  });
+  it("reads", () => {
+    expect(Store.open().read()).toBe(1);
+  });
+  it("creates", () => {
+    expect(Store.create()).toBeInstanceOf(Store);
+  });
+  it("sizes", () => {
+    const store = new Store();
+    expect(store.size()).toBe(2);
+  });
+  it("has a min", () => {
+    expect(limits.min).toBe(0);
+  });
+  it("pings", () => {
+    expect(mod.ping()).toBe(1);
+  });
+});
+"#;
+
+#[test]
+fn prove_catches_a_new_member_on_an_imported_object() {
+    let repo = Fixture::new();
+    let vitest = fixture_node_modules().join(".bin/vitest");
+    repo.write(
+        "titer.toml",
+        &format!(
+            "[[runner]]\nkind = \"vitest\"\ncommand = [\"{}\", \"run\"]\n",
+            vitest.display()
+        ),
+    )
+    .write(".gitignore", "node_modules\n")
+    .write("package.json", "{\"type\": \"module\"}\n")
+    .write("src/api.ts", API_BASE);
+    std::os::unix::fs::symlink(fixture_node_modules(), repo.path().join("node_modules")).unwrap();
+    repo.commit_all("base");
+    repo.git(&["checkout", "-q", "-b", "fix"]);
+    repo.write("src/api.ts", API_HEAD)
+        .write("src/api.test.ts", API_TEST);
+
+    let output = repo.titer(&["check", "--json", "--only", "prove"]);
+
+    let report = stdout_json(&output);
+    assert_schema_valid(&report);
+    let missing = |name: &str| {
+        (
+            format!("api > {name}"),
+            "green".into(),
+            "missing_symbol".into(),
+        )
+    };
+    assert_eq!(
+        verdicts(&report),
+        vec![
+            ("api > gets".into(), "green".into(), "assertion".into()),
+            missing("posts"),
+            ("api > reads".into(), "green".into(), "assertion".into()),
+            missing("creates"),
+            missing("sizes"),
+            missing("has a min"),
+            missing("pings"),
+        ],
+        "{report:#}"
+    );
+    let posts = report["tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "api > posts")
+        .unwrap();
+    assert_eq!(
+        posts["message"],
+        "uses api.post from ./api, which base does not define"
+    );
+}

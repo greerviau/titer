@@ -1,9 +1,10 @@
 //! The static import check: does a changed test import a module or name that exists only in
-//! head? Such a test cannot prove anything on base. vitest does not type-check, so a missing
-//! export arrives as `undefined` and can fail an assertion that proves nothing; this check
+//! head, or use a member that only head defines on an imported object, class, or namespace?
+//! Such a test cannot prove anything on base. vitest does not type-check, so a missing export
+//! or member arrives as `undefined` and can fail an assertion that proves nothing; this check
 //! runs before the base run's result is read.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -31,6 +32,9 @@ pub struct MissingImport {
     pub module: String,
     pub line: u32,
     pub message: String,
+    /// For a member that base lacks on an imported value, the lines that use it. None finds
+    /// uses by the binding's name instead.
+    pub uses: Option<Vec<u32>>,
 }
 
 pub fn missing_imports(
@@ -69,6 +73,11 @@ pub fn affecting<'m>(
     let lines: Vec<&str> = source.lines().collect();
     let in_any_test = |line: u32| test_spans.iter().any(|(s, e)| (*s..=*e).contains(&line));
     missing.iter().find(|m| {
+        if let Some(uses) = &m.uses {
+            return uses
+                .iter()
+                .any(|l| (span.0..=span.1).contains(l) || !in_any_test(*l));
+        }
         let Some(local) = &m.local else {
             return true;
         };
@@ -126,6 +135,7 @@ fn python(
                         module: module.clone(),
                         line: line_of(node),
                         message: format!("imports module {module}, which base lacks"),
+                        uses: None,
                     });
                     continue;
                 }
@@ -156,6 +166,7 @@ fn python(
                             module: module.clone(),
                             line: line_of(node),
                             message: format!("imports {name} from {module}, which base lacks"),
+                            uses: None,
                         });
                     }
                 }
@@ -178,6 +189,7 @@ fn python(
                             module: dotted.to_string(),
                             line: line_of(node),
                             message: format!("imports module {dotted}, which base lacks"),
+                            uses: None,
                         });
                     }
                 }
@@ -363,6 +375,7 @@ fn typescript(file: &str, root: Node, source: &str, trees: &Trees) -> Vec<Missin
                 module: spec.clone(),
                 line: line_of(node),
                 message: format!("imports module {spec}, which base lacks"),
+                uses: None,
             });
             continue;
         }
@@ -371,16 +384,58 @@ fn typescript(file: &str, root: Node, source: &str, trees: &Trees) -> Vec<Missin
         };
         let head_exports = ts_exports(&head);
         let base_exports = ts_exports(&base);
-        if base_exports.star {
-            continue;
-        }
+        let mut head_members = None;
+        let mut base_members = None;
         for (imported, local) in ts_bindings(node, source) {
-            if head_exports.names.contains(&imported) && !base_exports.names.contains(&imported) {
+            let missing: Vec<String> = if imported == "*" {
+                if base_exports.star {
+                    continue;
+                }
+                head_exports
+                    .names
+                    .difference(&base_exports.names)
+                    .cloned()
+                    .collect()
+            } else if !head_exports.names.contains(&imported) {
+                continue;
+            } else if !base_exports.names.contains(&imported) {
+                if !base_exports.star {
+                    out.push(MissingImport {
+                        local: Some(local),
+                        module: spec.clone(),
+                        line: line_of(node),
+                        message: format!(
+                            "imports {imported} from {spec}, which base does not export"
+                        ),
+                        uses: None,
+                    });
+                }
+                continue;
+            } else {
+                let head = head_members.get_or_insert_with(|| ts_members(&head));
+                let base = base_members.get_or_insert_with(|| ts_members(&base));
+                match (head.get(&imported), base.get(&imported)) {
+                    (Some(h), Some(b)) => h.difference(b).cloned().collect(),
+                    _ => continue,
+                }
+            };
+            let missing: HashSet<String> = missing
+                .into_iter()
+                .filter(|m| !INHERITED.contains(&m.as_str()))
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+            let verb = if imported == "*" { "export" } else { "define" };
+            for (member, uses) in member_uses(root, source, &local, &missing) {
                 out.push(MissingImport {
-                    local: Some(local),
+                    local: Some(local.clone()),
                     module: spec.clone(),
                     line: line_of(node),
-                    message: format!("imports {imported} from {spec}, which base does not export"),
+                    message: format!(
+                        "uses {local}.{member} from {spec}, which base does not {verb}"
+                    ),
+                    uses: Some(uses),
                 });
             }
         }
@@ -388,12 +443,425 @@ fn typescript(file: &str, root: Node, source: &str, trees: &Trees) -> Vec<Missin
     out
 }
 
+/// Members every object or class has without defining them; base resolves them anyway.
+const INHERITED: &[&str] = &[
+    "__proto__",
+    "apply",
+    "arguments",
+    "bind",
+    "call",
+    "caller",
+    "constructor",
+    "hasOwnProperty",
+    "isPrototypeOf",
+    "length",
+    "name",
+    "propertyIsEnumerable",
+    "prototype",
+    "toLocaleString",
+    "toString",
+    "valueOf",
+];
+
+/// The lines in the test file that read each of `missing` from the binding `local`:
+/// `local.m`, `local["m"]`, `const { m } = local`, and `m` on an instance from `new local()`.
+/// Sorted by member; members with no use are left out.
+fn member_uses(
+    root: Node,
+    source: &str,
+    local: &str,
+    missing: &HashSet<String>,
+) -> Vec<(String, Vec<u32>)> {
+    let mut uses: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    let mut record = |member: String, line: u32| {
+        if missing.contains(&member) {
+            uses.entry(member).or_default().push(line);
+        }
+    };
+    let is = |n: Option<Node>, name: &str| {
+        n.is_some_and(|n| n.kind() == "identifier" && text(n, source) == name)
+    };
+    let mut instances: Vec<(String, Node)> = Vec::new();
+    for node in descendants(root) {
+        match node.kind() {
+            "member_expression" | "subscript_expression" => {
+                if is(node.child_by_field_name("object"), local)
+                    && let Some((member, line)) = accessed(node, source)
+                {
+                    record(member, line);
+                }
+            }
+            "variable_declarator" => {
+                let (Some(name), Some(value)) = (
+                    node.child_by_field_name("name"),
+                    node.child_by_field_name("value"),
+                ) else {
+                    continue;
+                };
+                if name.kind() == "object_pattern" && is(Some(value), local) {
+                    for key in pattern_keys(name, source) {
+                        record(key, line_of(node));
+                    }
+                }
+            }
+            "new_expression" if is(node.child_by_field_name("constructor"), local) => {
+                let Some(parent) = node.parent() else {
+                    continue;
+                };
+                match parent.kind() {
+                    "member_expression" | "subscript_expression" => {
+                        if let Some((member, line)) = accessed(parent, source) {
+                            record(member, line);
+                        }
+                    }
+                    "variable_declarator" => {
+                        if let Some(name) = parent.child_by_field_name("name")
+                            && name.kind() == "identifier"
+                            && let Some(scope) = ancestor(parent, &["statement_block", "program"])
+                        {
+                            instances.push((text(name, source).to_string(), scope));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    for (name, scope) in instances {
+        for node in descendants(scope) {
+            if matches!(node.kind(), "member_expression" | "subscript_expression")
+                && is(node.child_by_field_name("object"), &name)
+                && let Some((member, line)) = accessed(node, source)
+            {
+                record(member, line);
+            }
+        }
+    }
+    uses.into_iter().collect()
+}
+
+/// The member a `member_expression` or `subscript_expression` reads, when it is a fixed
+/// name, and the line it is on.
+fn accessed(node: Node, source: &str) -> Option<(String, u32)> {
+    if node.kind() == "member_expression" {
+        let prop = node.child_by_field_name("property")?;
+        (prop.kind() == "property_identifier")
+            .then(|| (text(prop, source).to_string(), line_of(prop)))
+    } else {
+        let index = node.child_by_field_name("index")?;
+        (index.kind() == "string").then(|| (crate::lang::ts::title(index, source), line_of(index)))
+    }
+}
+
+fn pattern_keys(pattern: Node, source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in children(pattern) {
+        match part.kind() {
+            "shorthand_property_identifier_pattern" => out.push(text(part, source).to_string()),
+            "pair_pattern" | "object_assignment_pattern" => {
+                let key = part
+                    .child_by_field_name("key")
+                    .or_else(|| part.child_by_field_name("left"));
+                if let Some(k) = key
+                    && matches!(
+                        k.kind(),
+                        "property_identifier" | "shorthand_property_identifier_pattern"
+                    )
+                {
+                    out.push(text(k, source).to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn ancestor<'t>(node: Node<'t>, kinds: &[&str]) -> Option<Node<'t>> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if kinds.contains(&n.kind()) {
+            return Some(n);
+        }
+        cur = n.parent();
+    }
+    None
+}
+
+fn descendants(node: Node) -> Vec<Node> {
+    let mut out = Vec::new();
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        out.push(n);
+        stack.extend(children(n).into_iter().rev());
+    }
+    out
+}
+
+/// The members of each exported object literal or class whose full set of members the
+/// module shows. A value that is not an object or class, a `let` or `var` binding, a class
+/// that extends another, and a value with spread, computed, or index members are left out,
+/// as is a value the module passes to a call, aliases, or assigns a computed member on,
+/// since any of those can add members that the source does not name.
+fn ts_members(source: &str) -> HashMap<String, HashSet<String>> {
+    let mut out = HashMap::new();
+    let Some(tree) = parse_ts(source) else {
+        return out;
+    };
+    let root = tree.root_node();
+    let mut locals: HashMap<String, Node> = HashMap::new();
+    // (export name, local binding or None for an inline value, inline value)
+    let mut exported: Vec<(String, Option<String>, Option<Node>)> = Vec::new();
+    for node in children(root) {
+        let (decl, is_export) = if node.kind() == "export_statement" {
+            (node.child_by_field_name("declaration"), true)
+        } else {
+            (Some(node), false)
+        };
+        let is_default = is_export && text(node, source).starts_with("export default");
+        if let Some(decl) = decl {
+            match decl.kind() {
+                "lexical_declaration" if text(decl, source).starts_with("const") => {
+                    for d in children(decl) {
+                        if let (Some(n), Some(v)) = (
+                            d.child_by_field_name("name"),
+                            d.child_by_field_name("value"),
+                        ) && n.kind() == "identifier"
+                        {
+                            let name = text(n, source).to_string();
+                            locals.insert(name.clone(), v);
+                            if is_export {
+                                exported.push((name.clone(), Some(name), None));
+                            }
+                        }
+                    }
+                }
+                "class_declaration" | "class" => {
+                    let name = decl
+                        .child_by_field_name("name")
+                        .map(|n| text(n, source).to_string());
+                    if let Some(name) = &name {
+                        locals.insert(name.clone(), decl);
+                    }
+                    if is_default {
+                        exported.push(("default".to_string(), name, Some(decl)));
+                    } else if is_export && let Some(name) = name {
+                        exported.push((name.clone(), Some(name), None));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !is_export || node.child_by_field_name("source").is_some() {
+            continue;
+        }
+        if let Some(value) = node.child_by_field_name("value") {
+            if value.kind() == "identifier" {
+                let name = text(value, source).to_string();
+                exported.push(("default".to_string(), Some(name), None));
+            } else {
+                exported.push(("default".to_string(), None, Some(value)));
+            }
+        }
+        for clause in children(node) {
+            if clause.kind() != "export_clause" {
+                continue;
+            }
+            for spec in children(clause) {
+                let Some(name) = spec.child_by_field_name("name") else {
+                    continue;
+                };
+                let local = text(name, source).to_string();
+                let alias = spec
+                    .child_by_field_name("alias")
+                    .map(|a| crate::lang::ts::title(a, source))
+                    .unwrap_or_else(|| local.clone());
+                exported.push((alias, Some(local), None));
+            }
+        }
+    }
+    for (name, local, inline) in exported {
+        let Some(value) = inline.or_else(|| local.as_ref().and_then(|l| locals.get(l).copied()))
+        else {
+            continue;
+        };
+        let Some(mut members) = declared_members(value, source) else {
+            continue;
+        };
+        if !added_members(value, source, "this", &mut members) {
+            continue;
+        }
+        if let Some(local) = &local
+            && !added_members(root, source, local, &mut members)
+        {
+            continue;
+        }
+        out.insert(name, members);
+    }
+    out
+}
+
+/// The members an object literal or class body names, or None when it is neither or when
+/// members can come from somewhere the body does not name.
+fn declared_members(value: Node, source: &str) -> Option<HashSet<String>> {
+    let mut value = value;
+    while matches!(
+        value.kind(),
+        "parenthesized_expression"
+            | "as_expression"
+            | "satisfies_expression"
+            | "non_null_expression"
+    ) {
+        value = children(value).into_iter().next()?;
+    }
+    let mut out = HashSet::new();
+    match value.kind() {
+        "object" => {
+            for part in children(value) {
+                let key = match part.kind() {
+                    "pair" => part.child_by_field_name("key")?,
+                    "method_definition" => part.child_by_field_name("name")?,
+                    "shorthand_property_identifier" => part,
+                    "comment" => continue,
+                    _ => return None,
+                };
+                out.insert(member_name(key, source)?);
+            }
+        }
+        "class" | "class_declaration" => {
+            if children(value).iter().any(|c| c.kind() == "class_heritage") {
+                return None;
+            }
+            let body = value.child_by_field_name("body")?;
+            for part in children(body) {
+                match part.kind() {
+                    "method_definition" | "public_field_definition" => {
+                        let key = part
+                            .child_by_field_name("name")
+                            .or_else(|| part.child_by_field_name("property"))?;
+                        if key.kind() == "private_property_identifier" {
+                            continue;
+                        }
+                        let name = member_name(key, source)?;
+                        if name == "constructor" {
+                            out.extend(parameter_properties(part, source));
+                        }
+                        out.insert(name);
+                    }
+                    "index_signature" => return None,
+                    _ => {}
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+fn member_name(key: Node, source: &str) -> Option<String> {
+    match key.kind() {
+        "property_identifier" | "shorthand_property_identifier" | "number" => {
+            Some(text(key, source).to_string())
+        }
+        "string" => Some(crate::lang::ts::title(key, source)),
+        _ => None,
+    }
+}
+
+/// `constructor(private x: T)` and `readonly x` parameters, which define instance members.
+fn parameter_properties(constructor: Node, source: &str) -> Vec<String> {
+    let Some(params) = constructor.child_by_field_name("parameters") else {
+        return Vec::new();
+    };
+    children(params)
+        .into_iter()
+        .filter(|p| {
+            children(*p)
+                .iter()
+                .any(|c| matches!(c.kind(), "accessibility_modifier" | "override_modifier"))
+                || text(*p, source).starts_with("readonly ")
+        })
+        .filter_map(|p| p.child_by_field_name("pattern"))
+        .filter(|p| p.kind() == "identifier")
+        .map(|p| text(p, source).to_string())
+        .collect()
+}
+
+/// Adds the members that `owner.m = ...` and `owner.prototype.m = ...` assign under `scope`.
+/// Returns false when `owner` escapes where members can be added unseen: as a call
+/// argument, an alias, a reassignment, or a computed-member assignment target.
+fn added_members(scope: Node, source: &str, owner: &str, members: &mut HashSet<String>) -> bool {
+    let kind = if owner == "this" {
+        "this"
+    } else {
+        "identifier"
+    };
+    for node in descendants(scope) {
+        if node.kind() != kind || text(node, source) != owner {
+            continue;
+        }
+        let Some(parent) = node.parent() else {
+            continue;
+        };
+        let is_object = parent.child_by_field_name("object") == Some(node);
+        match parent.kind() {
+            "member_expression" | "subscript_expression" if is_object => {
+                let mut target = parent;
+                if let Some(("prototype", _)) = accessed(parent, source)
+                    .as_ref()
+                    .map(|(m, l)| (m.as_str(), l))
+                    && let Some(up) = parent.parent()
+                    && matches!(up.kind(), "member_expression" | "subscript_expression")
+                    && up.child_by_field_name("object") == Some(parent)
+                {
+                    target = up;
+                }
+                if is_assigned(target) {
+                    match accessed(target, source) {
+                        Some((member, _)) => {
+                            members.insert(member);
+                        }
+                        None => return false,
+                    }
+                }
+            }
+            "arguments" | "spread_element" => return false,
+            "variable_declarator" if parent.child_by_field_name("value") == Some(node) => {
+                return false;
+            }
+            "assignment_expression" | "augmented_assignment_expression" => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn is_assigned(target: Node) -> bool {
+    target.parent().is_some_and(|p| {
+        matches!(
+            p.kind(),
+            "assignment_expression" | "augmented_assignment_expression"
+        ) && p.child_by_field_name("left") == Some(target)
+    })
+}
+
+fn parse_ts(source: &str) -> Option<tree_sitter::Tree> {
+    let lang = if source.contains("</") || source.contains("/>") {
+        Lang::Tsx
+    } else {
+        Lang::TypeScript
+    };
+    lang.parse(source)
+}
+
 fn is_type_only(node: Node, source: &str) -> bool {
     let header = text(node, source);
     header.starts_with("import type ") || header.starts_with("import typeof ")
 }
 
-/// (imported name, local binding) pairs; the default import is named `default`.
+/// (imported name, local binding) pairs; the default import is named `default` and a
+/// namespace import `*`.
 fn ts_bindings(node: Node, source: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for child in children(node) {
@@ -403,6 +871,14 @@ fn ts_bindings(node: Node, source: &str) -> Vec<(String, String)> {
         for part in children(child) {
             match part.kind() {
                 "identifier" => out.push(("default".to_string(), text(part, source).to_string())),
+                "namespace_import" => {
+                    if let Some(n) = children(part)
+                        .into_iter()
+                        .find(|n| n.kind() == "identifier")
+                    {
+                        out.push(("*".to_string(), text(n, source).to_string()));
+                    }
+                }
                 "named_imports" => {
                     for spec in children(part) {
                         if spec.kind() != "import_specifier"
@@ -437,12 +913,7 @@ struct TsExports {
 fn ts_exports(source: &str) -> TsExports {
     let mut names = HashSet::new();
     let mut star = false;
-    let lang = if source.contains("</") || source.contains("/>") {
-        Lang::Tsx
-    } else {
-        Lang::TypeScript
-    };
-    let Some(tree) = lang.parse(source) else {
+    let Some(tree) = parse_ts(source) else {
         return TsExports { names, star: true };
     };
     for node in children(tree.root_node()) {
@@ -756,12 +1227,167 @@ mod tests {
             module: "./a".into(),
             line: 1,
             message: "m".into(),
+            uses: None,
         }];
         let spans = [(3, 5), (6, 8)];
         assert!(affecting(Lang::TypeScript, source, &missing, (3, 5), &spans).is_some());
         assert!(affecting(Lang::TypeScript, source, &missing, (6, 8), &spans).is_none());
         let helper = format!("{source}function h() {{ return fresh; }}\n");
         assert!(affecting(Lang::TypeScript, &helper, &missing, (6, 8), &spans).is_some());
+    }
+
+    fn members(source: &str) -> Vec<(String, Vec<String>)> {
+        let mut out: Vec<(String, Vec<String>)> = ts_members(source)
+            .into_iter()
+            .map(|(k, v)| {
+                let mut v: Vec<String> = v.into_iter().collect();
+                v.sort();
+                (k, v)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn reads_members_of_exported_objects_and_classes() {
+        let source = r#"
+const inner = { a: 1, "b-c": 2, 3: 3, d, e() {}, get f() { return 1; } };
+export { inner as renamed };
+export const obj = { g: 1 } as const;
+export class C {
+  static s() {}
+  field = 1;
+  #hidden = 2;
+  constructor(private p: number, readonly q: number, r: number) {
+    this.t = r;
+  }
+  m() {}
+}
+C.u = 1;
+C.prototype.v = function () {};
+export default { w: 1 };
+"#;
+        assert_eq!(
+            members(source),
+            vec![
+                (
+                    "C".into(),
+                    names(&["constructor", "field", "m", "p", "q", "s", "t", "u", "v"])
+                ),
+                ("default".into(), names(&["w"])),
+                ("obj".into(), names(&["g"])),
+                ("renamed".into(), names(&["3", "a", "b-c", "d", "e", "f"])),
+            ]
+        );
+    }
+
+    #[test]
+    fn leaves_out_values_whose_members_can_come_from_elsewhere() {
+        let source = r#"
+const extra = { a: 1 };
+export const spread = { ...extra, b: 1 };
+const key = "k";
+export const computed = { [key]: 1 };
+class Base {}
+export class Child extends Base {}
+export let mutable = { a: 1 };
+export const made = make();
+export const assigned = { a: 1 };
+Object.assign(assigned, extra);
+export const aliased = { a: 1 };
+const alias = aliased;
+export const indexed = { a: 1 };
+indexed[key] = 2;
+export class Indexed { [k: string]: unknown; }
+export class SelfIndexed { constructor() { this[key] = 1; } }
+export function f() {}
+export { other } from "./other";
+"#;
+        assert_eq!(members(source), vec![]);
+    }
+
+    #[test]
+    fn typescript_flags_members_that_only_head_defines() {
+        let head_files = set(&["web/api.ts", "web/api.test.ts"]);
+        let base_files = head_files.clone();
+        let read_head = |p: &str| {
+            match p {
+            "web/api.ts" => Some("export const api = { get() {}, post() {}, toString() {} };\nexport const open = { ...x, a: 1 };\nexport class S { m() {} n() {} }\nexport function ping() {}\n".to_string()),
+            _ => None,
+        }
+        };
+        let read_base = |p: &str| {
+            match p {
+            "web/api.ts" => Some("export const api = { get() {} };\nexport const open = { ...x };\nexport class S { m() {} }\n".to_string()),
+            _ => None,
+        }
+        };
+        let trees = Trees {
+            head: &head_files,
+            base: &base_files,
+            read_head: &read_head,
+            read_base: &read_base,
+            aliases: &[],
+        };
+        let r = runner("[[runner]]\nkind = \"vitest\"\ncwd = \"web\"\ncommand = [\"vitest\"]\n");
+        let source = r#"import { api, open, S } from "./api";
+import * as mod from "./api";
+it("a", () => {
+  api.get();
+  api.post();
+  api["post"];
+  api.toString();
+  open.a;
+  const { post } = api;
+  new S().n();
+  const s = new S();
+  s.n();
+  mod.ping();
+});
+"#;
+
+        let missing = missing_imports(&r, "web/api.test.ts", source, &trees);
+
+        let summary: Vec<(String, Option<Vec<u32>>)> = missing
+            .iter()
+            .map(|m| (m.message.clone(), m.uses.clone()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    "uses api.post from ./api, which base does not define".into(),
+                    Some(vec![5, 6, 9])
+                ),
+                (
+                    "uses S.n from ./api, which base does not define".into(),
+                    Some(vec![10, 12])
+                ),
+                (
+                    "uses mod.ping from ./api, which base does not export".into(),
+                    Some(vec![13])
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn affecting_follows_member_uses() {
+        let missing = vec![MissingImport {
+            local: Some("api".into()),
+            module: "./a".into(),
+            line: 1,
+            message: "m".into(),
+            uses: Some(vec![4]),
+        }];
+        let spans = [(3, 5), (6, 8)];
+        assert!(affecting(Lang::TypeScript, "", &missing, (3, 5), &spans).is_some());
+        assert!(affecting(Lang::TypeScript, "", &missing, (6, 8), &spans).is_none());
     }
 
     #[test]
