@@ -246,7 +246,7 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
                 let source = read_head(session, &path)?;
                 let lang = Lang::of(&path).expect("test files have a language");
                 let found =
-                    changed_tests(&runners[runner], &path, lang, &source, &change.added, None);
+                    changed_tests(&runners[runner], &path, lang, &source, &change.added, false);
                 detection.tests.extend(found.tests);
                 detection.warnings.extend(found.warnings);
             }
@@ -260,15 +260,8 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
                 let mut test_ranges = Vec::new();
                 if lang == Lang::Rust {
                     detection.rust_sources.push(path.clone());
-                    test_ranges = lang::rust::test_ranges(&source);
-                    let found = changed_tests(
-                        &runners[runner],
-                        &path,
-                        lang,
-                        &source,
-                        &change.added,
-                        Some(&test_ranges),
-                    );
+                    let found =
+                        changed_tests(&runners[runner], &path, lang, &source, &change.added, true);
                     if !found.tests.is_empty() {
                         detection.test_files.push((runner, path.clone()));
                     }
@@ -277,6 +270,7 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
                     // Test code is never a mutant's target and never makes a change touch
                     // source. A line it shares with other code still counts.
                     let test_lines = lang::rust::test_lines(&source);
+                    test_ranges = lang::rust::test_ranges(&source);
                     changed.retain(|l| !test_lines.iter().any(|(s, e)| (*s..=*e).contains(l)));
                 }
                 if changed.is_empty() {
@@ -334,8 +328,8 @@ struct ChangedTests {
 }
 
 /// The tests in `source` whose spans intersect a changed line, and the tests that read a
-/// declaration changed outside every test span, such as a table of cases. `test_code`
-/// limits those declarations to a Rust source file's test code. A changed test whose id it
+/// declaration changed outside every test span, such as a table of cases. With
+/// `rust_source`, only the file's test code counts as data. A changed test whose id it
 /// shares with another test, such as two vitest calls on one line, gets a warning: the
 /// runner selects them together and titer reports their combined result for each.
 fn changed_tests(
@@ -344,10 +338,11 @@ fn changed_tests(
     lang: Lang,
     source: &str,
     added: &BTreeSet<u32>,
-    test_code: Option<&[(usize, usize)]>,
+    rust_source: bool,
 ) -> ChangedTests {
     let defs = lang::find_tests(lang, source, python_style(runner.config.kind));
-    let reads_data = lang::refs::tests_reading_changed_data(lang, source, &defs, added, test_code);
+    let reads_data =
+        lang::refs::tests_reading_changed_data(lang, source, &defs, added, rust_source);
     let all: Vec<(String, lang::TestDef, bool)> = defs
         .into_iter()
         .enumerate()
