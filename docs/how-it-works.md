@@ -8,7 +8,7 @@ The [glossary](../GLOSSARY.md) defines the terms on this page.
 
 titer snapshots the working tree as head, including untracked files that are not ignored. It diffs head against base, the merge-base of HEAD and `--base`. `--base` defaults to `base` in `titer.toml`, then to the remote default branch.
 
-Tests run in temporary worktrees under the user cache dir. Set `$TITER_TMPDIR` to use another disk-backed directory. Each worktree links the checkout's dependency dirs, such as `.venv` or `node_modules`. So base runs with head's dependencies. When the change edits `uv.lock`, `poetry.lock`, `requirements*.txt`, `package-lock.json`, `pnpm-lock.yaml`, or `yarn.lock` under a runner that links dependency dirs, prove adds a warning to the report. Cargo runners link nothing, so base builds from its own `Cargo.lock`.
+Tests run in temporary worktrees under the user cache dir. Set `$TITER_TMPDIR` to use another disk-backed directory. Each worktree links the checkout's dependency dirs, such as `.venv` or `node_modules`. So base runs with head's dependencies. When the change edits `uv.lock`, `poetry.lock`, `requirements*.txt`, `package-lock.json`, `pnpm-lock.yaml`, or `yarn.lock` under a runner that links dependency dirs, or a JS lockfile at the repo root when the checkout has a root `node_modules`, prove adds a warning to the report. Cargo runners link nothing, so base builds from its own `Cargo.lock`.
 
 titer runs tests through the repo's own command and the runner's native selection:
 

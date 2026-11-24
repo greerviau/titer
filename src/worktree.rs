@@ -119,6 +119,10 @@ impl Worktree {
     }
 }
 
+/// The dependency dir at the repo root that every worktree links, whatever the runners'
+/// `deps`, for workspaces that hoist dependencies.
+pub const ROOT_DEPS: &str = "node_modules";
+
 /// Symlinks each runner's dependency dirs (such as `.venv` or `node_modules`) from the
 /// checkout into the worktree when the tree does not contain them. The repo root's
 /// `node_modules` is linked too, for workspaces that hoist dependencies.
@@ -129,7 +133,7 @@ fn link_deps(root: &Path, dest: &Path, runners: &[RunnerConfig]) -> anyhow::Resu
             candidates.push(Path::new(&runner.cwd).join(dep));
         }
     }
-    candidates.push(PathBuf::from("node_modules"));
+    candidates.push(PathBuf::from(ROOT_DEPS));
     for rel in candidates {
         let rel = rel.strip_prefix(".").unwrap_or(&rel).to_path_buf();
         let source = root.join(&rel);

@@ -82,6 +82,7 @@ fn pytest_repo() -> Fixture {
         ),
     )
     .write("app.py", APP_BASE)
+    .write("uv.lock", "version = 1\n")
     .write(
         "test_app.py",
         "from app import double\n\n\ndef test_double():\n    assert double(1) == 2\n",
@@ -341,7 +342,7 @@ fn warnings(report: &Value) -> Vec<String> {
 #[test]
 fn a_changed_lockfile_warns_that_base_runs_with_heads_dependencies() {
     let repo = pytest_repo();
-    repo.write("uv.lock", "version = 1\n");
+    repo.write("uv.lock", "version = 2\n");
 
     let output = repo.titer(&["check", "--json", "--only", "prove"]);
 
@@ -356,7 +357,7 @@ fn a_changed_lockfile_warns_that_base_runs_with_heads_dependencies() {
 }
 
 #[test]
-fn an_unchanged_lockfile_gives_no_dependency_warning() {
+fn an_untouched_lockfile_gives_no_dependency_warning() {
     let repo = pytest_repo();
 
     let output = repo.titer(&["check", "--json", "--only", "prove"]);

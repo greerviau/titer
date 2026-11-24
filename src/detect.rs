@@ -218,14 +218,18 @@ pub fn python_style(kind: RunnerKind) -> PythonStyle {
 pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection> {
     let classifier = Classifier::in_checkout(runners, session.git.root())?;
     let mut detection = Detection::default();
+    let root_deps = session.git.root().join(crate::worktree::ROOT_DEPS).exists();
     for change in &session.changes.files {
-        let paths = [change.old_path.as_deref(), change.new_path.as_deref()];
-        if paths
+        // A rename moves the pins away from the old path, so either side counts.
+        for path in [change.old_path.as_deref(), change.new_path.as_deref()]
             .into_iter()
             .flatten()
-            .any(|p| is_linked_lockfile(runners, p))
         {
-            detection.lockfiles.push(change.path().to_string());
+            if is_linked_lockfile(runners, root_deps, path)
+                && !detection.lockfiles.iter().any(|l| l == path)
+            {
+                detection.lockfiles.push(path.to_string());
+            }
         }
         if change.status == FileStatus::Deleted {
             continue;
@@ -304,16 +308,17 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
 /// Whether `path` pins the dependencies in a dir that worktrees link from the checkout.
 /// Base then runs with head's dependencies, so a change to it can skew results on base.
 /// Cargo runners link nothing, so base builds from its own Cargo.lock.
-fn is_linked_lockfile(runners: &[Runner], path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    let lockfile = matches!(
-        name,
-        "uv.lock" | "poetry.lock" | "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock"
-    ) || (name.starts_with("requirements") && name.ends_with(".txt"));
-    lockfile
-        && runners
-            .iter()
-            .any(|r| !r.config.deps.is_empty() && under(path, &r.config.cwd))
+/// `root_deps` says whether the checkout has the root node_modules that every worktree links.
+fn is_linked_lockfile(runners: &[Runner], root_deps: bool, path: &str) -> bool {
+    let (dir, name) = path.rsplit_once('/').unwrap_or((".", path));
+    let js = matches!(name, "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock");
+    let python = matches!(name, "uv.lock" | "poetry.lock")
+        || (name.starts_with("requirements") && name.ends_with(".txt"));
+    (js && root_deps && dir == ".")
+        || ((js || python)
+            && runners
+                .iter()
+                .any(|r| !r.config.deps.is_empty() && under(path, &r.config.cwd)))
 }
 
 struct ChangedTests {
@@ -450,11 +455,45 @@ mod tests {
             "api/pnpm-lock.yaml",
             "api/yarn.lock",
         ] {
-            assert!(is_linked_lockfile(&runners, path), "{path}");
+            assert!(is_linked_lockfile(&runners, false, path), "{path}");
         }
         for path in ["uv.lock", "Cargo.lock", "api/Cargo.lock", "api/notes.txt"] {
-            assert!(!is_linked_lockfile(&runners, path), "{path}");
+            assert!(!is_linked_lockfile(&runners, false, path), "{path}");
         }
+    }
+
+    #[test]
+    fn a_root_js_lockfile_counts_when_worktrees_link_the_root_node_modules() {
+        let runners: Vec<Runner> = Config::parse(
+            r#"
+            [[runner]]
+            kind = "vitest"
+            cwd = "packages/web"
+            command = ["npx", "vitest", "run"]
+
+            [[runner]]
+            kind = "pytest"
+            command = ["python", "-m", "pytest"]
+            deps = []
+            "#,
+        )
+        .unwrap()
+        .runners
+        .into_iter()
+        .map(Runner::new)
+        .collect();
+        for path in [
+            "pnpm-lock.yaml",
+            "package-lock.json",
+            "packages/web/yarn.lock",
+        ] {
+            assert!(is_linked_lockfile(&runners, true, path), "{path}");
+        }
+        for path in ["uv.lock", "packages/api/yarn.lock"] {
+            assert!(!is_linked_lockfile(&runners, true, path), "{path}");
+        }
+        // Without a root node_modules, link_deps links nothing there.
+        assert!(!is_linked_lockfile(&runners, false, "pnpm-lock.yaml"));
     }
 
     #[test]
