@@ -84,7 +84,7 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
         python_path.push(rest);
     }
     cmd.env("PYTHONPATH", python_path);
-    let out = runner.exec(cmd, req)?;
+    let out = runner.exec(cmd, req, std::time::Duration::ZERO)?;
     let mut parsed = parse(&out.stderr, &config.start_dir);
     // unittest turns only ImportError into a failed test. Any other exception while a
     // selected module loads crashes the loader before a test runs; every selected module
@@ -124,6 +124,7 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
         outcomes: parsed.outcomes,
         file_errors: parsed.file_errors,
         timed_out: out.timed_out,
+        past_deadline: out.past_deadline,
         duration: out.duration,
         max_rss_bytes: out.max_rss_bytes,
         runner_error,

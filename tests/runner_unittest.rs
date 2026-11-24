@@ -92,6 +92,7 @@ fn run(
             selection,
             fail_fast,
             timeout: None,
+            deadline: titer::deadline::Deadline::NONE,
             scratch: &scratch,
         })
         .unwrap()

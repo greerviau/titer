@@ -20,7 +20,7 @@ Code, docs, the report, and the repo skill use these terms with these meanings.
 - Not executed: a survivor whose line the changed tests never run. The sentinel check detects this.
 - Sentinel: a raise, throw, or Rust abort inserted before the statement that encloses a survivor's line, or inside the condition when that line is part of an `elif` or `else if` condition that has its lines to itself.
 - Caught by other tests: a survivor that the other tests in the changed test files kill.
-- Not run: a mutant that the budget did not reach.
+- Not run: a mutant whose run, canary, or survivor follow-up the budget did not let finish.
 - No result: a run in which zero tests executed or every test skipped. It is never a kill or a survivor.
 - Canary: a mutant that raises at the top of a changed module, or for Rust a `compile_error!` that fails the build. Before it raises, it writes a marker file. It must be killed or leave its marker, or the worktree is not loading the code it mutates.
 - Worktree: a temporary directory that holds a materialized tree (head or base) plus symlinks to the checkout's dependency dirs.

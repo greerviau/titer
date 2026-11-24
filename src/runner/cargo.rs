@@ -174,6 +174,7 @@ fn build(
     let build = exec(runner, req, &args, Some(BUILD_TIMEOUT))?;
     if build.timed_out {
         run.timed_out = true;
+        run.past_deadline |= build.past_deadline;
         run.incomplete = true;
         return Ok(false);
     }
@@ -197,21 +198,25 @@ fn build(
     Ok(false)
 }
 
-/// The test names that the target's binary lists, or why it could not list them.
+/// The test names that the target's binary lists, or why it could not list them: None when
+/// the check deadline stopped the listing.
 fn list(
     runner: &Runner,
     req: &RunRequest,
     target_args: &[String],
-) -> anyhow::Result<Result<Vec<String>, String>> {
+) -> anyhow::Result<Result<Vec<String>, Option<String>>> {
     let mut args = target_args.to_vec();
     args.extend(["--", "--list", "--format", "terse"].map(String::from));
     let out = exec(runner, req, &args, Some(BUILD_TIMEOUT))?;
+    if out.past_deadline {
+        return Ok(Err(None));
+    }
     if out.timed_out || !out.success() {
-        return Ok(Err(format!(
+        return Ok(Err(Some(format!(
             "cannot list the tests of {}:\n{}",
             target_args.join(" "),
             output_tail(&out)
-        )));
+        ))));
     }
     Ok(Ok(out
         .stdout
@@ -240,6 +245,7 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
         outcomes: Vec::new(),
         file_errors: Vec::new(),
         timed_out: false,
+        past_deadline: false,
         duration: Duration::ZERO,
         max_rss_bytes: 0,
         runner_error: None,
@@ -262,10 +268,16 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
             Some(_) => {
                 let listed = match list(runner, req, &target_args)? {
                     Ok(listed) => listed,
-                    Err(why) => {
+                    Err(Some(why)) => {
                         run.runner_error = Some(why);
                         run.incomplete = true;
                         continue;
+                    }
+                    Err(None) => {
+                        run.timed_out = true;
+                        run.past_deadline = true;
+                        run.incomplete = true;
+                        break;
                     }
                 };
                 let selected = resolve(&group.wanted, &listed);
@@ -308,6 +320,7 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
             );
             if out.timed_out {
                 run.timed_out = true;
+                run.past_deadline |= out.past_deadline;
                 break 'groups;
             }
         }
@@ -418,7 +431,7 @@ fn exec(
     if !runner.config.env.contains_key("RUST_BACKTRACE") {
         cmd.env("RUST_BACKTRACE", "0");
     }
-    crate::process::run(cmd, timeout, req.scratch)
+    super::run_limited(cmd, req.deadline.limit(timeout), req.scratch)
 }
 
 /// The outcome for a reported libtest name. A selected case's outcome carries its id, so

@@ -31,7 +31,7 @@ fail_on_scan = false
 fail_on_crap = false
 
 [mutate]
-budget = "120s"                 # deadline for starting mutants
+budget = "120s"                 # deadline for mutation
 exclude_operators = []          # for example ["remove_call"]
 exclude_globs = []              # repo-relative source files never mutated
 exclude_calls = []              # callees never removed, beyond logging calls
@@ -96,7 +96,7 @@ By default the gate fails only on an unproven change. Each key below adds a fail
 
 | Key | Default | Meaning |
 |---|---|---|
-| `budget` | `"120s"` | The deadline for starting mutants, counted from the start of the check. The head and base test runs keep their own timeouts, so a check can run longer. A budget above 300 s also raises those timeouts. `--budget` overrides it. |
+| `budget` | `"120s"` | The deadline for mutation, counted from the start of the check. titer stops every canary, mutant, and survivor follow-up run at the deadline, and mutants they leave unfinished are `not_run`. The head and base test runs keep their own timeouts, so a check can run longer. A budget above 300 s also raises those timeouts. `--budget` overrides it. |
 | `exclude_operators` | `[]` | Mutation operators to skip, for example `["remove_call"]`. |
 | `exclude_globs` | `[]` | Repo-relative source files that titer never mutates. `init` adds known tools' configs in each runner's dir, such as `vite.config.*` and `.eslintrc.*` for vitest and `setup.py` for Python. |
 | `exclude_calls` | `[]` | Callee names whose calls titer never removes, in addition to logging calls. |

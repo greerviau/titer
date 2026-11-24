@@ -81,6 +81,7 @@ fn run(repo: &Fixture, runner: &Runner, selection: Selection, fail_fast: bool) -
             selection,
             fail_fast,
             timeout: None,
+            deadline: titer::deadline::Deadline::NONE,
             scratch: &scratch,
         })
         .unwrap()

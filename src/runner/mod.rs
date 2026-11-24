@@ -10,6 +10,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::config::{RunnerConfig, RunnerKind};
+use crate::deadline::{Deadline, Limit};
 use crate::process::{self, RunOutput};
 
 /// One selectable test, found by test detection.
@@ -103,6 +104,8 @@ pub struct TestRun {
     pub outcomes: Vec<TestOutcome>,
     pub file_errors: Vec<FileError>,
     pub timed_out: bool,
+    /// The check deadline stopped the run, so it has no result. `timed_out` is also set.
+    pub past_deadline: bool,
     pub duration: Duration,
     pub max_rss_bytes: u64,
     /// Set when the runner itself failed, for example on a usage error, and gave no results.
@@ -196,7 +199,10 @@ pub struct RunRequest<'a> {
     pub selection: Selection<'a>,
     /// Stop at the first failure.
     pub fail_fast: bool,
+    /// The run's own timeout, shared by every process it starts, retries included.
     pub timeout: Option<Duration>,
+    /// The check deadline. No process of the run outlives it.
+    pub deadline: Deadline,
     /// Where the run writes its output and report files.
     pub scratch: &'a Path,
 }
@@ -268,9 +274,24 @@ impl Runner {
         }
     }
 
-    pub(crate) fn exec(&self, cmd: Command, req: &RunRequest) -> anyhow::Result<RunOutput> {
-        process::run(cmd, req.timeout, req.scratch)
+    /// Runs one process of the request. `spent` is what its earlier processes took, so a
+    /// retry gets only what is left of the run's timeout.
+    pub(crate) fn exec(
+        &self,
+        cmd: Command,
+        req: &RunRequest,
+        spent: Duration,
+    ) -> anyhow::Result<RunOutput> {
+        let own = req.timeout.map(|t| t.saturating_sub(spent));
+        run_limited(cmd, req.deadline.limit(own), req.scratch)
     }
+}
+
+/// Runs `cmd` under `limit`. A timeout that the deadline set is also `past_deadline`.
+pub(crate) fn run_limited(cmd: Command, limit: Limit, scratch: &Path) -> anyhow::Result<RunOutput> {
+    let mut out = process::run(cmd, limit.timeout, scratch)?;
+    out.past_deadline = out.timed_out && limit.at_deadline;
+    Ok(out)
 }
 
 /// `file` relative to the runner's `cwd`. Both are repo-relative.

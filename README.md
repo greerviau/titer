@@ -89,7 +89,7 @@ Common options:
 
 - `--base REF` sets the base ref.
 - `--only scan,prove` runs only some tiers.
-- `--budget 60s` stops starting mutants 60 s after the check starts. It does not cut short the head and base test runs, so a check can run longer.
+- `--budget 60s` ends mutation 60 s after the check starts. titer stops any canary, mutant, or survivor follow-up run still going then and reports what did not finish as `not_run`. It does not cut short the head and base test runs, so a check can run longer.
 
 ## Run in CI
 

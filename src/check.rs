@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use crate::deadline::Deadline;
 use crate::detect::{self, Detection};
 use crate::gate;
 use crate::mutate;
@@ -40,8 +41,9 @@ impl Context {
         self.options.tiers.contains(&tier)
     }
 
-    pub fn remaining(&self) -> Duration {
-        self.budget.saturating_sub(self.started.elapsed())
+    /// The budget as a hard limit: every run that mutation starts ends by this instant.
+    pub fn deadline(&self) -> Deadline {
+        Deadline::at(self.started + self.budget)
     }
 }
 

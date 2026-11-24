@@ -1,6 +1,7 @@
 //! pytest: select by node id, parse `--junitxml`.
 
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use regex::Regex;
 
@@ -33,6 +34,7 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
     selectors.dedup();
     let mut file_errors: Vec<FileError> = Vec::new();
     let mut attempt = 0;
+    let mut spent = Duration::ZERO;
     loop {
         attempt += 1;
         let junit = req.scratch.join(format!("junit-{}.xml", unique()));
@@ -50,7 +52,8 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
         }
         args.extend(selectors.iter().cloned());
         let cmd = runner.command(req.worktree, &args);
-        let out = runner.exec(cmd, req)?;
+        let out = runner.exec(cmd, req, spent)?;
+        spent += out.duration;
         let xml = std::fs::read_to_string(&junit).unwrap_or_default();
         let _ = std::fs::remove_file(&junit);
         let parsed = parse_junit(&xml);
@@ -101,7 +104,8 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
             outcomes: parsed.outcomes,
             file_errors,
             timed_out: out.timed_out,
-            duration: out.duration,
+            past_deadline: out.past_deadline,
+            duration: spent,
             max_rss_bytes: out.max_rss_bytes,
             runner_error,
             compile_errors: Vec::new(),

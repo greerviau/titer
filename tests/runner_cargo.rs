@@ -125,6 +125,7 @@ fn run(
             selection,
             fail_fast: false,
             timeout,
+            deadline: titer::deadline::Deadline::NONE,
             scratch: &scratch,
         })
         .unwrap()
@@ -481,6 +482,7 @@ fn a_symlinked_build_dir_is_refused() {
             selection: Selection::Tests(std::slice::from_ref(&adds)),
             fail_fast: false,
             timeout: None,
+            deadline: titer::deadline::Deadline::NONE,
             scratch: &scratch,
         })
         .unwrap_err();
@@ -529,6 +531,7 @@ fn a_symlinked_lockfile_is_refused() {
             selection: Selection::Tests(std::slice::from_ref(&adds)),
             fail_fast: false,
             timeout: None,
+            deadline: titer::deadline::Deadline::NONE,
             scratch: &scratch,
         })
         .unwrap_err();
