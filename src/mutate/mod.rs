@@ -7,11 +7,12 @@ pub mod operators;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::bail;
 
 use crate::check::Context;
+use crate::deadline::Deadline;
 use crate::detect::{self, glob_set};
 use crate::diff::FileChange;
 use crate::lang::Lang;
@@ -109,6 +110,9 @@ pub fn plan(
             selection: Selection::Suite,
             fail_fast: false,
             timeout: Some(ctx.budget.max(Duration::from_secs(300))),
+            // Head must be green before any mutant means anything, so this head run is not
+            // cut short at the deadline.
+            deadline: Deadline::NONE,
             scratch: &ctx.session.run_dir.join("logs"),
         })?;
         let failed: Vec<String> = run
@@ -323,14 +327,15 @@ pub fn available_memory() -> Option<u64> {
     Some((pages("Pages free") + pages("Pages inactive") + pages("Pages speculative")) * page)
 }
 
-/// Runs `jobs` across the workers' worktrees, skipping jobs the deadline cannot fit.
-/// Results come back in job order; a skipped job is `NotRun`.
+/// Runs `jobs` across the workers' worktrees, skipping jobs the deadline cannot fit and
+/// killing a job still running at the deadline. Results come back in job order; a skipped or
+/// killed job is `NotRun`.
 pub fn run_jobs(
     ctx: &Context,
     workers: &[Worktree],
     plans: &BTreeMap<usize, RunnerPlan>,
     jobs: &[Job],
-    deadline: Option<Instant>,
+    deadline: Deadline,
 ) -> Vec<JobResult> {
     let queue: Mutex<VecDeque<usize>> = Mutex::new((0..jobs.len()).collect());
     let results: Mutex<Vec<Option<JobResult>>> = Mutex::new(vec![None; jobs.len()]);
@@ -349,9 +354,8 @@ pub fn run_jobs(
                     // Parallel runs are slower than the lone head run, so admit a job by
                     // the longer of the head run and the mean mutant run so far.
                     let expected = plan.head_duration.max(mean(&observed, job.runner));
-                    let fits = deadline.is_none_or(|d| Instant::now() + expected <= d);
-                    let (result, healthy) = if fits {
-                        run_job(ctx, worktree, plan, job)
+                    let (result, healthy) = if deadline.fits(expected) {
+                        run_job(ctx, worktree, plan, job, deadline)
                     } else {
                         let skipped = JobResult {
                             outcome: MutantOutcome::NotRun,
@@ -391,8 +395,6 @@ pub fn run_jobs(
         .collect()
 }
 
-/// Runs one job and restores the file. The flag is false when the original could not be
-/// restored, so the worktree must not take more jobs.
 fn mean(observed: &Mutex<BTreeMap<usize, (Duration, u32)>>, runner: usize) -> Duration {
     let observed = observed.lock().unwrap_or_else(|e| e.into_inner());
     match observed.get(&runner) {
@@ -401,7 +403,15 @@ fn mean(observed: &Mutex<BTreeMap<usize, (Duration, u32)>>, runner: usize) -> Du
     }
 }
 
-fn run_job(ctx: &Context, worktree: &Worktree, plan: &RunnerPlan, job: &Job) -> (JobResult, bool) {
+/// Runs one job and restores the file. The flag is false when the original could not be
+/// restored, so the worktree must not take more jobs.
+fn run_job(
+    ctx: &Context,
+    worktree: &Worktree,
+    plan: &RunnerPlan,
+    job: &Job,
+    deadline: Deadline,
+) -> (JobResult, bool) {
     let runner = &ctx.runners[job.runner];
     let selection = match &plan.plan {
         Plan::Tests(cases) => Selection::Tests(cases),
@@ -426,16 +436,18 @@ fn run_job(ctx: &Context, worktree: &Worktree, plan: &RunnerPlan, job: &Job) -> 
         selection,
         fail_fast: true,
         timeout: Some(plan.timeout()),
+        deadline,
         scratch: &ctx
             .session
             .run_dir
             .join(&format!("logs-{}", worktree_name(worktree))),
     });
     if let Err(e) = worktree.restore(&job.file, job.original.as_bytes()) {
-        return (
-            error_result(e.context("cannot restore the mutated file")),
-            false,
-        );
+        let mut result = error_result(e.context("cannot restore the mutated file"));
+        if run.as_ref().is_ok_and(|r| r.past_deadline) {
+            result.outcome = MutantOutcome::NotRun;
+        }
+        return (result, false);
     }
     let run = match run {
         Ok(run) => run,
@@ -445,7 +457,8 @@ fn run_job(ctx: &Context, worktree: &Worktree, plan: &RunnerPlan, job: &Job) -> 
     let result = JobResult {
         outcome,
         killed_by,
-        duration: Some(run.duration),
+        // A run the deadline cut short has no result, and no duration either.
+        duration: (!run.past_deadline).then_some(run.duration),
         compile_failed: !run.compile_errors.is_empty(),
     };
     (result, true)
@@ -474,6 +487,9 @@ fn error_result(e: anyhow::Error) -> JobResult {
 /// otherwise. A target that does not build ran none of its tests, so a pass elsewhere is
 /// not a survivor.
 pub fn classify(run: &TestRun, plan: &Plan, cwd: &str) -> (MutantOutcome, Option<String>) {
+    if run.past_deadline {
+        return (MutantOutcome::NotRun, None);
+    }
     if run.timed_out {
         return (MutantOutcome::TimedOut, None);
     }
@@ -533,15 +549,25 @@ pub fn classify(run: &TestRun, plan: &Plan, cwd: &str) -> (MutantOutcome, Option
     (MutantOutcome::NoResult, None)
 }
 
-/// Runs a canary in every mutated module. Returns the modules whose canary survived, or an
-/// error when every canary survived, which means the worktrees do not load the code. A
-/// Rust canary is a compile error, so a build that fails counts as killed.
+/// The modules whose canary did not confirm that the worktree loads them.
+#[derive(Debug, Default)]
+pub struct Canaries {
+    /// The canary survived: the selected tests never load the module.
+    pub unloaded: Vec<String>,
+    /// The deadline left no time for the canary, so the module's mutants are not run.
+    pub not_run: Vec<String>,
+}
+
+/// Runs a canary in every mutated module before the deadline. Returns the modules whose
+/// canary survived or did not run, or an error when every canary survived, which means the
+/// worktrees do not load the code. A Rust canary is a compile error, so a build that fails
+/// counts as killed.
 pub fn canaries(
     ctx: &Context,
     workers: &[Worktree],
     plans: &BTreeMap<usize, RunnerPlan>,
     files: &[(usize, String, String)],
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<Canaries> {
     let files: Vec<&(usize, String, String)> = files
         .iter()
         .filter(|(runner, _, _)| !matches!(plans[runner].plan, Plan::Nothing))
@@ -564,9 +590,9 @@ pub fn canaries(
         })
         .collect();
     if jobs.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Canaries::default());
     }
-    let mut results = run_jobs(ctx, workers, plans, &jobs, None);
+    let mut results = run_jobs(ctx, workers, plans, &jobs, ctx.deadline());
     for r in results.iter_mut().filter(|r| r.compile_failed) {
         r.outcome = MutantOutcome::Killed;
     }
@@ -580,7 +606,12 @@ pub fn canaries(
     let unconfirmed: Vec<&str> = jobs
         .iter()
         .zip(&results)
-        .filter(|(_, r)| !matches!(r.outcome, MutantOutcome::Killed | MutantOutcome::Survived))
+        .filter(|(_, r)| {
+            !matches!(
+                r.outcome,
+                MutantOutcome::Killed | MutantOutcome::Survived | MutantOutcome::NotRun
+            )
+        })
         .map(|(j, _)| j.file.as_str())
         .collect();
     if !unconfirmed.is_empty() {
@@ -589,12 +620,14 @@ pub fn canaries(
             unconfirmed.join(", ")
         );
     }
-    let survived: Vec<String> = jobs
-        .iter()
-        .zip(&results)
-        .filter(|(_, r)| r.outcome == MutantOutcome::Survived)
-        .map(|(j, _)| j.file.clone())
-        .collect();
+    let with = |outcome: MutantOutcome| -> Vec<String> {
+        jobs.iter()
+            .zip(&results)
+            .filter(|(_, r)| r.outcome == outcome)
+            .map(|(j, _)| j.file.clone())
+            .collect()
+    };
+    let survived = with(MutantOutcome::Survived);
     if survived.len() == jobs.len() {
         bail!(
             "the canary survived in every mutated module ({}): the worktree is not loading the code titer mutates. \
@@ -602,7 +635,10 @@ pub fn canaries(
             survived.join(", ")
         );
     }
-    Ok(survived)
+    Ok(Canaries {
+        unloaded: survived,
+        not_run: with(MutantOutcome::NotRun),
+    })
 }
 
 /// The mutate tier: plans, canaries, then mutants in budget order until the deadline.
@@ -650,7 +686,8 @@ pub fn run(
             modules.push((job.runner, job.file.clone(), job.original.clone()));
         }
     }
-    let unloaded = canaries(ctx, &worktrees, &plans, &modules)?;
+    let canaries = canaries(ctx, &worktrees, &plans, &modules)?;
+    let unloaded = canaries.unloaded;
     if !unloaded.is_empty() {
         warnings.push(format!(
             "the selected tests never load {}; its mutants are reported as not executed",
@@ -658,11 +695,13 @@ pub fn run(
         ));
     }
 
-    let (to_run, skipped): (Vec<usize>, Vec<usize>) =
-        (0..pairs.len()).partition(|i| !unloaded.contains(&pairs[*i].1.file));
+    // Mutants of a module whose canary did not run keep their not-run outcome.
+    let (to_run, skipped): (Vec<usize>, Vec<usize>) = (0..pairs.len())
+        .filter(|i| !canaries.not_run.contains(&pairs[*i].1.file))
+        .partition(|i| !unloaded.contains(&pairs[*i].1.file));
     let jobs: Vec<Job> = to_run.iter().map(|i| pairs[*i].1.clone()).collect();
-    let deadline = ctx.started + ctx.budget;
-    let results = run_jobs(ctx, &worktrees, &plans, &jobs, Some(deadline));
+    let deadline = ctx.deadline();
+    let results = run_jobs(ctx, &worktrees, &plans, &jobs, deadline);
     let mut mutants: Vec<Mutant> = pairs.iter().map(|(m, _)| m.clone()).collect();
     for (i, result) in to_run.iter().zip(results) {
         let m = &mut mutants[*i];
@@ -698,16 +737,18 @@ pub fn run(
 }
 
 /// Survivor follow-up. First the sentinel: a raise before the statement that encloses each
-/// surviving line, or inside an `elif` or `else if` condition. If the selected tests still pass, no green selected test runs that line,
-/// and its survivors are not executed. Then the other tests: the remaining survivors run
-/// against the whole changed test files, and a kill there is caught by other tests.
+/// surviving line, or inside an `elif` or `else if` condition. If the selected tests still
+/// pass, no green selected test runs that line, and its survivors are not executed. Then the
+/// other tests: the remaining survivors run against the whole changed test files, and a kill
+/// there is caught by other tests. A survivor whose sentinel or other-tests run the deadline
+/// does not reach is not run: without that run, titer cannot say what kind of survivor it is.
 fn follow_up(
     ctx: &Context,
     workers: &[Worktree],
     plans: &BTreeMap<usize, RunnerPlan>,
     pairs: &[(Mutant, Job)],
     mutants: &mut [Mutant],
-    deadline: Instant,
+    deadline: Deadline,
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<()> {
     let survivors = |mutants: &[Mutant]| -> Vec<usize> {
@@ -748,18 +789,24 @@ fn follow_up(
             job_lines.push((file.clone(), *line));
         }
     }
-    let results = run_jobs(ctx, workers, plans, &jobs, Some(deadline));
+    let results = run_jobs(ctx, workers, plans, &jobs, deadline);
     for ((file, line), result) in job_lines.iter().zip(&results) {
-        if result.outcome != MutantOutcome::Survived {
-            continue;
-        }
+        let outcome = match result.outcome {
+            MutantOutcome::Survived => MutantOutcome::NotExecuted,
+            MutantOutcome::NotRun => MutantOutcome::NotRun,
+            _ => continue,
+        };
         for m in mutants.iter_mut() {
             if &m.file == file
                 && m.line == *line
                 && m.end_line == *line
                 && m.outcome == MutantOutcome::Survived
             {
-                m.outcome = MutantOutcome::NotExecuted;
+                if outcome == MutantOutcome::NotRun {
+                    not_run(m);
+                } else {
+                    m.outcome = outcome;
+                }
             }
         }
     }
@@ -780,7 +827,18 @@ fn follow_up(
             .filter(|(r, _)| r == runner)
             .map(|(_, f)| f.clone())
             .collect();
-        if files.is_empty() || Instant::now() >= deadline {
+        if files.is_empty() {
+            continue;
+        }
+        let skip = |mutants: &mut [Mutant]| {
+            for i in &remaining {
+                if pairs[*i].1.runner == *runner {
+                    not_run(&mut mutants[*i]);
+                }
+            }
+        };
+        if !deadline.fits(plan.head_duration) {
+            skip(mutants);
             continue;
         }
         let r = &ctx.runners[*runner];
@@ -789,8 +847,13 @@ fn follow_up(
             selection: Selection::Files(&files),
             fail_fast: false,
             timeout: Some(plan.timeout()),
+            deadline,
             scratch: &ctx.session.run_dir.join("logs"),
         })?;
+        if head.past_deadline {
+            skip(mutants);
+            continue;
+        }
         let red = head.timed_out
             || head.runner_error.is_some()
             || !head.file_errors.is_empty()
@@ -819,14 +882,25 @@ fn follow_up(
         .filter(|i| file_plans.contains_key(&pairs[*i].1.runner))
         .collect();
     let jobs: Vec<Job> = rerun.iter().map(|i| pairs[*i].1.clone()).collect();
-    let results = run_jobs(ctx, workers, &file_plans, &jobs, Some(deadline));
+    let results = run_jobs(ctx, workers, &file_plans, &jobs, deadline);
     for (i, result) in rerun.iter().zip(results) {
-        if result.outcome == MutantOutcome::Killed {
-            mutants[*i].outcome = MutantOutcome::CaughtByOther;
-            mutants[*i].killed_by = result.killed_by;
+        match result.outcome {
+            MutantOutcome::Killed => {
+                mutants[*i].outcome = MutantOutcome::CaughtByOther;
+                mutants[*i].killed_by = result.killed_by;
+            }
+            MutantOutcome::NotRun => not_run(&mut mutants[*i]),
+            _ => {}
         }
     }
     Ok(())
+}
+
+/// Reports a survivor as not run when the deadline cut its follow-up short.
+fn not_run(m: &mut Mutant) {
+    m.outcome = MutantOutcome::NotRun;
+    m.killed_by = None;
+    m.duration_ms = None;
 }
 
 #[cfg(test)]

@@ -499,3 +499,53 @@ fn mutants_of_code_the_change_only_reformats_are_marked_unchanged_from_base() {
         "{text}"
     );
 }
+
+const PAUSE_BASE: &str = "import time\n\n\ndef pause(x):\n    return x\n";
+const PAUSE_HEAD: &str =
+    "import time\n\n\ndef pause(x):\n    if x < 0:\n        time.sleep(60)\n    return x\n";
+const PAUSE_TEST: &str = "from app import pause\n\n\ndef test_pause():\n    assert pause(1) == 1\n";
+
+#[test]
+fn the_budget_kills_a_running_mutant_and_its_follow_up() {
+    let repo = repo("8s");
+    repo.write("app.py", PAUSE_BASE);
+    repo.commit_all("pause");
+    repo.write("app.py", PAUSE_HEAD)
+        .write("test_app.py", PAUSE_TEST);
+
+    let output = repo.titer(&["check", "--json", "--only", "mutate", "--workers", "1"]);
+
+    let report = stdout_json(&output);
+    assert_schema_valid(&report);
+    let got = outcomes(&report);
+    // Negating the condition sleeps for 60 s, past its own 10 s timeout and the 8 s budget.
+    let hang = got
+        .iter()
+        .find(|o| o.1 == "negate_if")
+        .unwrap_or_else(|| panic!("{report:#}"));
+    assert_eq!(hang.3, "not_run", "{report:#}");
+    // The deadline passed during the hang, so no survivor had its sentinel or other-tests
+    // run, and none may be reported as a survivor.
+    assert!(
+        got.iter().all(|o| o.3 != "survived" && o.3 != "timed_out"),
+        "{report:#}"
+    );
+    let not_run = report["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["outcome"] == "not_run");
+    assert!(
+        not_run.into_iter().all(|m| m["duration_ms"].is_null()),
+        "{report:#}"
+    );
+    // The report's total counts from the start of the check, as the budget does.
+    let total = report["timing"]["total_ms"].as_u64().unwrap();
+    assert!(
+        total < 10_000,
+        "the check overran its 8 s budget: {total} ms"
+    );
+    // Only the hanging mutant can keep a run going until the deadline.
+    assert!(total > 7_500, "the hanging mutant never ran: {total} ms");
+    assert!(repo.leftover_tmp().is_empty(), "{:?}", repo.leftover_tmp());
+}

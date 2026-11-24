@@ -246,7 +246,8 @@ pub enum MutantOutcome {
     TimedOut,
     /// Zero tests executed or every test skipped.
     NoResult,
-    /// The budget ran out before the mutant ran.
+    /// The budget ran out before the mutant's run, its canary, or its survivor follow-up
+    /// finished.
     NotRun,
 }
 

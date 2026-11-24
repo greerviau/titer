@@ -2,6 +2,7 @@ mod common;
 
 use common::{Fixture, fixture_python};
 use titer::config::Config;
+use titer::deadline::Deadline;
 use titer::runner::{CaseResult, FailureKind, RunRequest, Runner, Selection, TestCase};
 
 const APP: &str = "def get(d):\n    return d[\"exclude\"]\n";
@@ -95,6 +96,7 @@ fn reports_green_red_skipped_and_not_run_per_test() {
             selection: Selection::Tests(&cases),
             fail_fast: false,
             timeout: None,
+            deadline: Deadline::NONE,
             scratch: &scratch,
         })
         .unwrap();
@@ -151,6 +153,7 @@ fn a_selection_that_matches_nothing_executes_zero_tests() {
             selection: Selection::Tests(&cases),
             fail_fast: false,
             timeout: None,
+            deadline: Deadline::NONE,
             scratch: &scratch,
         })
         .unwrap();
@@ -172,6 +175,7 @@ fn only_skips_count_as_zero_executed() {
             selection: Selection::Tests(&cases),
             fail_fast: false,
             timeout: None,
+            deadline: Deadline::NONE,
             scratch: &scratch,
         })
         .unwrap();
@@ -196,6 +200,7 @@ fn runs_in_a_subdirectory_cwd_and_stops_at_the_first_failure() {
             selection: Selection::Tests(&cases),
             fail_fast: true,
             timeout: None,
+            deadline: Deadline::NONE,
             scratch: &scratch,
         })
         .unwrap();
@@ -220,6 +225,7 @@ fn whole_files_and_the_suite_select_every_test() {
             selection: Selection::Files(&files),
             fail_fast: false,
             timeout: None,
+            deadline: Deadline::NONE,
             scratch: &scratch,
         })
         .unwrap();
@@ -229,6 +235,7 @@ fn whole_files_and_the_suite_select_every_test() {
             selection: Selection::Suite,
             fail_fast: false,
             timeout: None,
+            deadline: Deadline::NONE,
             scratch: &scratch,
         })
         .unwrap();
@@ -255,6 +262,7 @@ fn a_conftest_that_fails_to_load_fails_the_selected_tests() {
             selection: Selection::Tests(&cases),
             fail_fast: true,
             timeout: None,
+            deadline: Deadline::NONE,
             scratch: &scratch,
         })
         .unwrap();
@@ -263,4 +271,49 @@ fn a_conftest_that_fails_to_load_fails_the_selected_tests() {
         panic!("{run:?}")
     };
     assert_eq!(failure.exception_type.as_deref(), Some("RuntimeError"));
+}
+
+#[test]
+fn retries_share_one_timeout() {
+    let repo = repo("");
+    // Every attempt loads the conftest, so each takes over 1.5 s. The first fits the timeout
+    // and drops the missing test; a retry with a fresh timeout would fit too.
+    let loads = repo.scratch().join("loads");
+    repo.write(
+        "tests/conftest.py",
+        &format!(
+            "import time\n\nopen({:?}, 'a').write('x')\ntime.sleep(1.5)\n",
+            loads.display().to_string()
+        ),
+    );
+    let runner = runner(".");
+    let cases = vec![
+        case(&runner, "tests/test_a.py", &["TestX"], "test_ok"),
+        case(&runner, "tests/test_a.py", &[], "test_nope"),
+    ];
+    let scratch = repo.scratch().join("run");
+    let started = std::time::Instant::now();
+
+    let run = runner
+        .run(&RunRequest {
+            worktree: repo.path(),
+            selection: Selection::Tests(&cases),
+            fail_fast: false,
+            timeout: Some(std::time::Duration::from_millis(3000)),
+            deadline: Deadline::NONE,
+            scratch: &scratch,
+        })
+        .unwrap();
+
+    let elapsed = started.elapsed();
+    assert!(run.timed_out, "{run:?}");
+    assert_eq!(
+        std::fs::read_to_string(&loads).unwrap(),
+        "xx",
+        "the retry did not start"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(3800),
+        "the retry restarted the timeout: {elapsed:?}"
+    );
 }

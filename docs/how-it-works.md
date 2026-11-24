@@ -74,6 +74,8 @@ Each survivor gets two follow-up runs:
 
 Mutant outcomes are `killed`, `timed_out`, `survived`, `not_executed`, `caught_by_other`, `not_run` (the budget ran out first), and `no_result`.
 
+The budget is a hard deadline for mutation. titer starts a canary, mutant, or follow-up run only when the head run's duration still fits before the deadline, and kills the process group of any run still going at the deadline. A mutant whose run the deadline stops is `not_run`, never killed, timed out, or survived. So is a mutant whose canary the deadline stops, and a survivor whose follow-up runs it stops. A mutant that reaches its own timeout first is `timed_out`. A mutant's own timeout, 3x the head run plus 10 s, covers every attempt of its run: a runner that retries without a missing test does not restart it.
+
 A mutant survives only when every selected test ran and passed. A mutant that leaves any selected target unbuildable or unlistable, or a selected test missing, gets `no_result`, unless a selected test fails. A compile or link error is never a kill.
 
 Agents can add their own mutants with `--mutants`. See the [CLI reference](cli.md#agent-mutants).
@@ -106,7 +108,7 @@ Worktrees hold the tree without `.git`, so a build script that runs git fails th
 
 Doc tests run with the suite, but a changed doc test is not a changed test: libtest names a doc test by its line, which differs between base and head.
 
-Each worktree builds its own target dir, and the first build in each one is cold. The runner's timeouts and durations count only the test binaries, so a slow cold build does not stretch mutant timeouts. Builds are also outside the budget: on a large workspace, the head, base, and canary builds can take minutes each, and a check can run that long past `--budget`. `--workers` limits how many cold builds run at once.
+Each worktree builds its own target dir, and the first build in each one is cold. The runner's timeouts and durations count only the test binaries, so a slow cold build does not stretch mutant timeouts. The head and base builds are also outside the budget: on a large workspace, they can take minutes each, and a check can run that long past `--budget`. Canary and mutant builds stop at the deadline, so a slow cold build can leave every mutant `not_run`. `--workers` limits how many cold builds run at once.
 
 ## The gate
 

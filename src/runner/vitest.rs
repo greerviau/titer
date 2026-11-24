@@ -7,6 +7,7 @@
 //! static skips on the [`TestCase`](super::TestCase).
 
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 use regex::Regex;
 use serde_json::Value;
@@ -36,6 +37,8 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
         _ => None,
     };
     let mut attempt = 0;
+    // Parsing between attempts counts against the timeout too.
+    let started = Instant::now();
     loop {
         attempt += 1;
         let report = req.scratch.join(format!("vitest-{}.json", unique()));
@@ -54,7 +57,8 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
         args.extend(cache_flags(runner, req.worktree));
         args.extend(selectors.iter().cloned());
         let cmd = runner.command(req.worktree, &args);
-        let out = runner.exec(cmd, req)?;
+        let out = runner.exec(cmd, req, started.elapsed())?;
+        let spent = started.elapsed();
         let json = std::fs::read_to_string(&report).unwrap_or_default();
         let _ = std::fs::remove_file(&report);
         let text = strip_ansi(&format!("{}\n{}", out.stdout, out.stderr));
@@ -79,12 +83,13 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
             );
         }
         bad.retain(|b| selectors.contains(b));
-        if !bad.is_empty() && attempt <= selectors.len() {
+        // A run killed at its timeout has no time left for a retry.
+        if !out.timed_out && !bad.is_empty() && attempt <= selectors.len() {
             selectors.retain(|s| !bad.contains(s));
             if !selectors.is_empty() {
                 continue;
             }
-            return Ok(empty_run(&out));
+            return Ok(empty_run(&out, spent));
         }
         let runner_error =
             (json.trim().is_empty() && !out.timed_out && !out.success()).then(|| output_tail(&out));
@@ -128,7 +133,8 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
             outcomes: parsed.outcomes,
             file_errors,
             timed_out: out.timed_out,
-            duration: out.duration,
+            past_deadline: out.past_deadline,
+            duration: spent,
             max_rss_bytes: out.max_rss_bytes,
             runner_error,
             compile_errors: Vec::new(),
@@ -176,12 +182,13 @@ fn cache_flags(runner: &Runner, worktree: &std::path::Path) -> Vec<String> {
     flags
 }
 
-fn empty_run(out: &crate::process::RunOutput) -> TestRun {
+fn empty_run(out: &crate::process::RunOutput, spent: Duration) -> TestRun {
     TestRun {
         outcomes: Vec::new(),
         file_errors: Vec::new(),
         timed_out: out.timed_out,
-        duration: out.duration,
+        past_deadline: out.past_deadline,
+        duration: spent,
         max_rss_bytes: out.max_rss_bytes,
         runner_error: None,
         compile_errors: Vec::new(),

@@ -98,6 +98,8 @@ pub struct RunOutput {
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
     pub timed_out: bool,
+    /// The timeout was the check deadline. Set by the runner, which knows the deadline.
+    pub past_deadline: bool,
     pub duration: Duration,
     /// Peak resident set size of the process or its largest waited-for descendant.
     pub max_rss_bytes: u64,
@@ -186,6 +188,7 @@ pub fn run(
         exit_code,
         signal,
         timed_out,
+        past_deadline: false,
         duration,
         max_rss_bytes: max_rss_bytes(&rusage),
         stdout,

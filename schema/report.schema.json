@@ -254,7 +254,7 @@
         },
         {
           "const": "not_run",
-          "description": "The budget ran out before the mutant ran.",
+          "description": "The budget ran out before the mutant's run, its canary, or its survivor follow-up\nfinished.",
           "type": "string"
         }
       ]

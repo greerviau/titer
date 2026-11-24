@@ -76,6 +76,7 @@ pub fn run_head(
             selection: Selection::Tests(&cases),
             fail_fast: false,
             timeout: Some(timeout),
+            deadline: crate::deadline::Deadline::NONE,
             scratch: &session.run_dir.join("logs"),
         })?;
         let results = cases
@@ -226,6 +227,7 @@ fn run_base(
             selection: Selection::Tests(&selected),
             fail_fast: false,
             timeout: Some(timeout),
+            deadline: crate::deadline::Deadline::NONE,
             scratch: &session.run_dir.join("logs"),
         })?;
         if runner.config.kind != RunnerKind::Cargo || run.compile_errors.is_empty() {

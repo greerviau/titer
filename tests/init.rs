@@ -247,6 +247,7 @@ fn the_skill_says_what_budget_limits_and_when_crap_has_scores() {
     let run = skill_section(&skill, "## Run");
     assert!(run.contains("`--budget"), "{run}");
     assert!(run.contains("limits mutation only"), "{run}");
+    assert!(run.contains("hard deadline"), "{run}");
     assert!(run.contains("from the start of the check"), "{run}");
     assert!(run.contains("`--only scan,prove`"), "{run}");
     assert!(!run.contains("makes it shorter"), "{run}");
