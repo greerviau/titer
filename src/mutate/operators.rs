@@ -96,7 +96,8 @@ const LOG_METHODS: &[&str] = &[
 impl CallFilter {
     /// Logging calls and configured callees are never removed.
     pub fn skips(&self, callee: &str) -> bool {
-        let callee = callee.trim();
+        let dotted = dotted(callee.trim());
+        let callee = dotted.as_str();
         let root = callee
             .split(['.', '(', '['])
             .next()
@@ -115,6 +116,45 @@ impl CallFilter {
         }
         self.excluded.iter().any(|e| e == callee || e == last)
     }
+}
+
+/// Rewrites string-literal subscripts such as `logger['info']` as `logger.info`, so bracket
+/// notation matches the same logger and method names as dot notation.
+fn dotted(callee: &str) -> String {
+    let mut out = String::with_capacity(callee.len());
+    let mut rest = callee;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let key = after
+            .chars()
+            .next()
+            .filter(|q| matches!(q, '\'' | '"' | '`'))
+            .and_then(|q| {
+                let body = &after[1..];
+                let close = body.find(q)?;
+                let name = &body[..close];
+                let valid =
+                    !name.is_empty() && name.chars().all(|c| c == '_' || c.is_alphanumeric());
+                body[close + 1..]
+                    .strip_prefix(']')
+                    .filter(|_| valid)
+                    .map(|tail| (name, tail))
+            });
+        match key {
+            Some((name, tail)) => {
+                out.push('.');
+                out.push_str(name);
+                rest = tail;
+            }
+            None => {
+                out.push('[');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Generates mutants for the changed lines of `source`, in source order.
@@ -1136,22 +1176,55 @@ def g():
     }
 
     #[test]
+    fn remove_call_skips_bracket_notation_logger_calls() {
+        let ts = "class A {\n  run() {\n    this.logger['info'](\"x\");\n    this.store['put'](x);\n  }\n}\n";
+        let cands = generate(
+            Lang::TypeScript,
+            ts,
+            &lines(3..=4),
+            &CallFilter::default(),
+            &[],
+        );
+        assert_eq!(
+            summary(&cands),
+            vec!["4 RemoveCall this.store['put'](x); -> ;"]
+        );
+        let py = "def f():\n    logger[\"warning\"](\"x\")\n    handlers[\"info\"](x)\n";
+        let cands = generate(Lang::Python, py, &lines(2..=3), &CallFilter::default(), &[]);
+        assert_eq!(
+            summary(&cands),
+            vec!["3 RemoveCall handlers[\"info\"](x) -> pass"]
+        );
+    }
+
+    #[test]
     fn logging_and_configured_calls_are_never_removed() {
         let filter = CallFilter {
             excluded: vec!["metrics.incr".into(), "flush".into()],
         };
         for callee in [
             "console.log",
+            "log",
             "logger.info",
             "self.log.warning",
             "logging.debug",
             "print",
             "metrics.incr",
             "cache.flush",
+            "this.logger['info']",
+            "logger[\"warning\"]",
+            "self._log[\"debug\"]",
+            "this.logger[`warn`]",
         ] {
             assert!(filter.skips(callee), "{callee}");
         }
-        for callee in ["save", "self.store.put", "catalog.error_page"] {
+        for callee in [
+            "save",
+            "self.store.put",
+            "catalog.error_page",
+            "this.store['put']",
+            "handlers[\"info\"]",
+        ] {
             assert!(!filter.skips(callee), "{callee}");
         }
     }
