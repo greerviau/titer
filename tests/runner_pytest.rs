@@ -276,13 +276,14 @@ fn a_conftest_that_fails_to_load_fails_the_selected_tests() {
 #[test]
 fn retries_share_one_timeout() {
     let repo = repo("");
-    // Every attempt loads the conftest, so each takes over 1.5 s. The first fits the timeout
-    // and drops the missing test; a retry with a fresh timeout would fit too.
+    // The first attempt sleeps 1.5 s, which leaves room for a slow pytest startup on a loaded
+    // machine, and drops the missing test. The retry hangs, so only the timeout ends it: a
+    // shared timeout stops the run near 4 s, a fresh one only after attempt one plus 4 s.
     let loads = repo.scratch().join("loads");
     repo.write(
         "tests/conftest.py",
         &format!(
-            "import time\n\nopen({:?}, 'a').write('x')\ntime.sleep(1.5)\n",
+            "import os, time\n\npath = {:?}\nretry = os.path.exists(path)\nopen(path, 'a').write('x')\ntime.sleep(60 if retry else 1.5)\n",
             loads.display().to_string()
         ),
     );
@@ -299,7 +300,7 @@ fn retries_share_one_timeout() {
             worktree: repo.path(),
             selection: Selection::Tests(&cases),
             fail_fast: false,
-            timeout: Some(std::time::Duration::from_millis(3000)),
+            timeout: Some(std::time::Duration::from_millis(4000)),
             deadline: Deadline::NONE,
             scratch: &scratch,
         })
@@ -313,7 +314,7 @@ fn retries_share_one_timeout() {
         "the retry did not start"
     );
     assert!(
-        elapsed < std::time::Duration::from_millis(3800),
+        elapsed < std::time::Duration::from_millis(5500),
         "the retry restarted the timeout: {elapsed:?}"
     );
 }
