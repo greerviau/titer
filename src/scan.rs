@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
+use tree_sitter::Node;
 
 use crate::detect::{Classifier, Role, python_style};
 use crate::diff::FileStatus;
@@ -101,30 +102,81 @@ pub fn is_snapshot(path: &str) -> bool {
     path.contains("__snapshots__/") || path.ends_with(".snap") || path.ends_with(".ambr")
 }
 
-/// A test with the text of its span.
+/// A test with the text of its span and the assertions inside it.
 struct Test<'a> {
     def: TestDef,
     text: &'a str,
+    assertions: Vec<Assertion<'a>>,
 }
 
-fn tests_of<'a>(
-    lang: Lang,
-    source: &'a str,
-    style: lang::PythonStyle,
-) -> BTreeMap<String, Test<'a>> {
-    let mut out = BTreeMap::new();
-    for def in lang::find_tests(lang, source, style) {
-        let mut key = def.suite.clone();
-        key.push(def.name.clone());
-        let mut key = key.join(" > ");
-        // Two tests with one name: keep both, distinguished by order.
-        while out.contains_key(&key) {
-            key.push('\'');
+/// A test's suite path and name, joined with ` > `. Tests that share a key are told apart
+/// by matching, not by the key.
+fn key_of(def: &TestDef) -> String {
+    let mut key = def.suite.clone();
+    key.push(def.name.clone());
+    key.join(" > ")
+}
+
+fn tests_of<'a>(lang: Lang, source: &'a str, style: lang::PythonStyle) -> Vec<Test<'a>> {
+    let all = assertions_in(lang, source);
+    lang::find_tests(lang, source, style)
+        .into_iter()
+        .map(|def| {
+            let span = def.start_byte..def.end_byte;
+            let assertions = all
+                .iter()
+                .filter(|a| span.contains(&a.start))
+                .cloned()
+                .collect();
+            Test {
+                text: &source[span],
+                def,
+                assertions,
+            }
+        })
+        .collect()
+}
+
+/// Pairs each head test with the base test it continues, by index. Tests with distinct keys
+/// pair by key. Among tests that share a key, a head test first takes a base test with the
+/// same text, so reordering unchanged tests pairs each with itself, and the rest pair in
+/// order. Returns the head index paired with each base index.
+fn pair_tests(before: &[Test], after: &[Test]) -> Vec<Option<usize>> {
+    let keys: Vec<String> = before.iter().map(|t| key_of(&t.def)).collect();
+    let mut paired: Vec<Option<usize>> = vec![None; before.len()];
+    let mut unpaired: Vec<usize> = Vec::new();
+    for (j, new) in after.iter().enumerate() {
+        let key = key_of(&new.def);
+        let same = (0..before.len())
+            .find(|&i| paired[i].is_none() && keys[i] == key && before[i].text == new.text);
+        match same {
+            Some(i) => paired[i] = Some(j),
+            None => unpaired.push(j),
         }
-        let text = &source[def.start_byte..def.end_byte];
-        out.insert(key, Test { def, text });
     }
-    out
+    for j in unpaired {
+        let key = key_of(&after[j].def);
+        if let Some(i) = (0..before.len()).find(|&i| paired[i].is_none() && keys[i] == key) {
+            paired[i] = Some(j);
+        }
+    }
+    paired
+}
+
+/// The key each test is reported under: its key, with a `'` for each earlier test in the
+/// same file that shares it.
+fn report_keys(tests: &[Test]) -> Vec<String> {
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    tests
+        .iter()
+        .map(|t| {
+            let key = key_of(&t.def);
+            let n = seen.entry(key.clone()).or_default();
+            let out = format!("{key}{}", "'".repeat(*n));
+            *n += 1;
+            out
+        })
+        .collect()
 }
 
 /// Findings for one test file, from its base and head contents.
@@ -137,20 +189,26 @@ pub fn compare(
 ) -> Vec<Finding> {
     let before = tests_of(lang, base, style);
     let after = tests_of(lang, head, style);
+    let paired = pair_tests(&before, &after);
+    let mut old_of: Vec<Option<&Test>> = vec![None; after.len()];
+    for (i, j) in paired.iter().enumerate() {
+        if let Some(j) = j {
+            old_of[*j] = Some(&before[i]);
+        }
+    }
     let mut findings = Vec::new();
-    for (key, old) in &before {
-        if !after.contains_key(key) {
+    for ((old, key), pair) in before.iter().zip(report_keys(&before)).zip(&paired) {
+        if pair.is_none() {
             findings.push(Finding {
                 kind: FindingKind::TestDeleted,
                 file: file.to_string(),
                 line: old.def.line,
-                test: Some(key.clone()),
+                test: Some(key),
                 message: "the test exists in base and not in head".to_string(),
             });
         }
     }
-    for (key, new) in &after {
-        let old = before.get(key);
+    for ((new, key), old) in after.iter().zip(report_keys(&after)).zip(old_of) {
         let at = |kind, message: String| Finding {
             kind,
             file: file.to_string(),
@@ -172,37 +230,17 @@ pub fn compare(
         let Some(old) = old.filter(|o| o.text != new.text) else {
             continue;
         };
-        let (old_count, new_count) = (assertions(lang, old.text), assertions(lang, new.text));
+        let (old_count, new_count) = (old.assertions.len(), new.assertions.len());
         if new_count < old_count {
             findings.push(at(
                 FindingKind::AssertionRemoved,
                 format!("assertions drop from {old_count} to {new_count}"),
             ));
         }
-        let (old_m, new_m) = (matchers(lang, old.text), matchers(lang, new.text));
-        let strong = |m: &BTreeMap<String, usize>| {
-            m.iter()
-                .filter(|(k, _)| is_strong(k))
-                .map(|(_, n)| n)
-                .sum::<usize>()
-        };
-        let weak = |m: &BTreeMap<String, usize>| {
-            m.iter()
-                .filter(|(k, _)| is_weak(k))
-                .map(|(_, n)| n)
-                .sum::<usize>()
-        };
-        if strong(&new_m) < strong(&old_m) && weak(&new_m) > weak(&old_m) {
-            let lost: Vec<&str> = old_m
-                .keys()
-                .filter(|k| is_strong(k) && new_m.get(*k).copied().unwrap_or(0) < old_m[*k])
-                .map(String::as_str)
-                .collect();
-            let gained: Vec<&str> = new_m
-                .keys()
-                .filter(|k| is_weak(k) && new_m[*k] > old_m.get(*k).copied().unwrap_or(0))
-                .map(String::as_str)
-                .collect();
+        let (lost, gained) = loosened(&old.assertions, &new.assertions);
+        if !lost.is_empty() {
+            let lost: Vec<&str> = lost.into_iter().collect();
+            let gained: Vec<&str> = gained.into_iter().collect();
             findings.push(at(
                 FindingKind::MatcherLoosened,
                 format!("replaces {} with {}", lost.join(", "), gained.join(", ")),
@@ -302,77 +340,301 @@ fn markers(lang: Lang, test: &Test) -> BTreeSet<String> {
     out
 }
 
-static PY_ASSERT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?m)^\s*assert\b|\.assert\w*\(|\bassert_\w+\(|\bpytest\.(raises|warns)\(|\bself\.fail\(",
-    )
-    .unwrap()
-});
-static TS_ASSERT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\bexpect(\.soft)?\(|\bassert(\.\w+)?\(|\bexpectTypeOf\(").unwrap()
-});
-
 /// `#[cfg_attr(condition, ignore)]`, which ignores the test where the condition holds.
 static RS_CONDITIONAL_IGNORE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"#\s*\[\s*cfg_attr\s*\([^\]]*\bignore\b").unwrap());
-static RS_ASSERT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b(?:debug_|prop_)?assert(?:_\w+)?!|#\[should_panic").unwrap());
+static RS_ASSERT_NAME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:debug_|prop_)?(assert(?:_\w+)?)$").unwrap());
+static TS_MATCHER_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^to[A-Z]\w*$").unwrap());
 
-fn assertions(lang: Lang, text: &str) -> usize {
-    let text = code_of(lang, text);
-    let re = match lang {
-        Lang::Python => &PY_ASSERT,
-        Lang::TypeScript | Lang::Tsx => &TS_ASSERT,
-        Lang::Rust => &RS_ASSERT,
-    };
-    re.find_iter(&text).count()
+/// One assertion call, statement, macro, or `#[should_panic]`.
+#[derive(Clone, Debug)]
+struct Assertion<'a> {
+    /// Where it starts in the file, to place it in a test's span.
+    start: usize,
+    /// The matcher it checks with, such as `toEqual`, `assertTrue`, or `assert_eq`, or the
+    /// kinds `assert_compare` and `assert_bare` for a plain assert.
+    matcher: Option<String>,
+    /// The value under test, such as the argument to `expect`, used to pair an assertion
+    /// in base with its version in head.
+    subject: &'a str,
+    text: &'a str,
 }
 
-static PY_ASSERT_METHOD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\.(assert\w*)\(").unwrap());
-static PY_PLAIN_ASSERT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)^\s*assert\s+(.*)$").unwrap());
-static PY_COMPARISON: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"==|!=|<=|>=|<|>|\bin\b|\bis\b").unwrap());
-static RS_ASSERT_MACRO: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)\b(?:debug_|prop_)?(assert(?:_\w+)?)!\s*[(\[{](.*)$").unwrap()
-});
-static RS_COMPARISON: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"==|!=|<=|>=|\s<\s|\s>\s").unwrap());
-static TS_MATCHER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\.(?:not\.|resolves\.|rejects\.)*(to[A-Z]\w*)\(").unwrap());
+/// Every assertion in a file, from its syntax tree, so assertion-like text in a string or
+/// comment does not count.
+fn assertions_in(lang: Lang, source: &str) -> Vec<Assertion<'_>> {
+    let Some(tree) = lang.parse(source) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let found = match lang {
+            Lang::Python => python_assertion(node, source),
+            Lang::TypeScript | Lang::Tsx => ts_assertion(node, source),
+            Lang::Rust => {
+                if node.kind() == "token_tree" {
+                    out.extend(rust_token_tree_assertions(node, source));
+                }
+                rust_assertion(node, source)
+            }
+        };
+        out.extend(found);
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    out.sort_by_key(|a| a.start);
+    out
+}
 
-/// Matcher names and how often each occurs.
-fn matchers(lang: Lang, text: &str) -> BTreeMap<String, usize> {
-    let text = code_of(lang, text);
-    let mut out: BTreeMap<String, usize> = BTreeMap::new();
-    if lang.is_python() {
-        for caps in PY_ASSERT_METHOD.captures_iter(&text) {
-            *out.entry(caps[1].to_string()).or_default() += 1;
-        }
-        for caps in PY_PLAIN_ASSERT.captures_iter(&text) {
-            let kind = if PY_COMPARISON.is_match(&caps[1]) {
-                "assert_compare"
+fn assertion<'a>(
+    node: Node,
+    source: &'a str,
+    matcher: Option<String>,
+    subject: &'a str,
+) -> Assertion<'a> {
+    Assertion {
+        start: node.start_byte(),
+        matcher,
+        subject: subject.trim(),
+        text: lang::text(node, source),
+    }
+}
+
+fn first_argument<'a>(call: Node, source: &'a str) -> &'a str {
+    call.child_by_field_name("arguments")
+        .and_then(|args| lang::children(args).into_iter().next())
+        .map_or("", |a| lang::text(a, source))
+}
+
+fn has_descendant(node: Node, kind: &str) -> bool {
+    node.kind() == kind
+        || lang::children(node)
+            .into_iter()
+            .any(|c| has_descendant(c, kind))
+}
+
+/// An `assert` statement, an `assert*` method call, an `assert_*` function call,
+/// `pytest.raises`, `pytest.warns`, or `self.fail`.
+fn python_assertion<'a>(node: Node, source: &'a str) -> Option<Assertion<'a>> {
+    match node.kind() {
+        "assert_statement" => {
+            let checked = lang::children(node).into_iter().next()?;
+            let (kind, subject) = if checked.kind() == "comparison_operator" {
+                let left = lang::children(checked)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(checked);
+                ("assert_compare", lang::text(left, source))
+            } else if has_descendant(checked, "comparison_operator") {
+                ("assert_compare", lang::text(checked, source))
             } else {
-                "assert_bare"
+                ("assert_bare", lang::text(checked, source))
             };
-            *out.entry(kind.to_string()).or_default() += 1;
+            Some(assertion(node, source, Some(kind.to_string()), subject))
         }
-    } else if lang == Lang::Rust {
-        for caps in RS_ASSERT_MACRO.captures_iter(&text) {
-            let kind = match &caps[1] {
-                "assert" if RS_COMPARISON.is_match(&caps[2]) => "assert_compare",
-                "assert" => "assert_bare",
-                other => other,
+        "call" => {
+            let function = node.child_by_field_name("function")?;
+            let whole = lang::text(function, source);
+            let name = match function.kind() {
+                "attribute" => lang::text(function.child_by_field_name("attribute")?, source),
+                "identifier" => whole,
+                _ => return None,
             };
-            *out.entry(kind.to_string()).or_default() += 1;
+            let counts = (function.kind() == "attribute" && name.starts_with("assert"))
+                || name.starts_with("assert_")
+                || matches!(whole, "pytest.raises" | "pytest.warns" | "self.fail");
+            counts.then(|| {
+                assertion(
+                    node,
+                    source,
+                    Some(name.to_string()),
+                    first_argument(node, source),
+                )
+            })
         }
-    } else {
-        for caps in TS_MATCHER.captures_iter(&text) {
-            *out.entry(caps[1].to_string()).or_default() += 1;
+        _ => None,
+    }
+}
+
+/// An `expect`, `expect.soft`, `expectTypeOf`, `assert`, or `assert.*` call, with the
+/// matcher chained onto it, such as `toEqual` in `expect(x).not.toEqual(1)`.
+fn ts_assertion<'a>(node: Node, source: &'a str) -> Option<Assertion<'a>> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    let counts = match function.kind() {
+        "identifier" => matches!(
+            lang::text(function, source),
+            "expect" | "assert" | "expectTypeOf"
+        ),
+        "member_expression" => {
+            let object = function.child_by_field_name("object")?;
+            let property = function.child_by_field_name("property")?;
+            object.kind() == "identifier"
+                && match lang::text(object, source) {
+                    "expect" => lang::text(property, source) == "soft",
+                    "assert" => true,
+                    _ => false,
+                }
+        }
+        _ => false,
+    };
+    if !counts {
+        return None;
+    }
+    let mut matcher = None;
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        let continues = match parent.kind() {
+            "member_expression" => {
+                parent.child_by_field_name("object").map(|o| o.id()) == Some(current.id())
+            }
+            "call_expression" => {
+                parent.child_by_field_name("function").map(|f| f.id()) == Some(current.id())
+            }
+            _ => false,
+        };
+        if !continues {
+            break;
+        }
+        if parent.kind() == "call_expression" && current.kind() == "member_expression" {
+            let name = current
+                .child_by_field_name("property")
+                .map_or("", |p| lang::text(p, source));
+            if TS_MATCHER_NAME.is_match(name) {
+                matcher = Some(name.to_string());
+                current = parent;
+                break;
+            }
+        }
+        current = parent;
+    }
+    let mut found = assertion(node, source, matcher, first_argument(node, source));
+    // The whole chain, so a changed matcher or expected value changes the text.
+    found.text = lang::text(current, source);
+    Some(found)
+}
+
+/// An `assert*!` macro, or a `#[should_panic]` attribute.
+fn rust_assertion<'a>(node: Node, source: &'a str) -> Option<Assertion<'a>> {
+    match node.kind() {
+        "macro_invocation" => {
+            let path = lang::text(node.child_by_field_name("macro")?, source);
+            let name = path.rsplit("::").next().unwrap_or(path);
+            let args = lang::children(node)
+                .into_iter()
+                .find(|c| c.kind() == "token_tree")?;
+            rust_macro_assertion(node, name, args, source)
+        }
+        "attribute_item" => {
+            let (path, _) = lang::rust::attribute_parts(node, source)?;
+            (path == "should_panic").then(|| assertion(node, source, None, ""))
+        }
+        _ => None,
+    }
+}
+
+/// Assertions inside another macro's tokens, such as a test body inside `proptest!`, which
+/// the parser leaves as a token tree: a name, `!`, and a token tree.
+fn rust_token_tree_assertions<'a>(tree: Node, source: &'a str) -> Vec<Assertion<'a>> {
+    let mut cursor = tree.walk();
+    let tokens: Vec<Node> = tree.children(&mut cursor).collect();
+    tokens
+        .windows(3)
+        .filter(|w| {
+            w[0].kind() == "identifier" && w[1].kind() == "!" && w[2].kind() == "token_tree"
+        })
+        .filter_map(|w| rust_macro_assertion(w[0], lang::text(w[0], source), w[2], source))
+        .collect()
+}
+
+fn rust_macro_assertion<'a>(
+    start: Node,
+    name: &str,
+    args: Node,
+    source: &'a str,
+) -> Option<Assertion<'a>> {
+    let caps = RS_ASSERT_NAME.captures(name)?;
+    let mut cursor = args.walk();
+    let tokens: Vec<Node> = args.children(&mut cursor).collect();
+    // The direct children are the delimiters, the top-level tokens, and nested groups, so a
+    // top-level `,` ends the first argument.
+    let open = tokens.first()?;
+    let close = tokens.last()?;
+    let end = tokens[1..]
+        .iter()
+        .find(|t| t.kind() == ",")
+        .unwrap_or(close)
+        .start_byte();
+    let subject = source.get(open.end_byte()..end).unwrap_or_default();
+    let compares = tokens.iter().any(|t| match t.kind() {
+        "==" | "!=" | "<=" | ">=" => true,
+        // `<` and `>` also delimit generics; spaced ones compare.
+        "<" | ">" => {
+            let spaced = |i: usize| {
+                source
+                    .as_bytes()
+                    .get(i)
+                    .is_some_and(u8::is_ascii_whitespace)
+            };
+            t.start_byte() > 0 && spaced(t.start_byte() - 1) && spaced(t.end_byte())
+        }
+        _ => false,
+    });
+    let matcher = match &caps[1] {
+        "assert" if compares => "assert_compare",
+        "assert" => "assert_bare",
+        other => other,
+    };
+    let mut found = assertion(start, source, Some(matcher.to_string()), subject);
+    found.text = &source[start.start_byte()..args.end_byte()];
+    Some(found)
+}
+
+/// Pairs each base assertion with its version in head, and returns the strong matchers
+/// that paired with weak ones and those weak ones. Assertions pair by identical text, then
+/// by subject, then in order, so weakening one assertion while strengthening another still
+/// counts.
+fn loosened<'a>(
+    old: &'a [Assertion],
+    new: &'a [Assertion],
+) -> (BTreeSet<&'a str>, BTreeSet<&'a str>) {
+    let mut taken = vec![false; old.len()];
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    let mut rest: Vec<usize> = (0..new.len()).collect();
+    let same = |round: usize, o: &Assertion, n: &Assertion| match round {
+        0 => o.text == n.text,
+        1 => !o.subject.is_empty() && o.subject == n.subject,
+        _ => true,
+    };
+    for round in 0..3 {
+        rest.retain(|&j| {
+            match (0..old.len()).find(|&i| !taken[i] && same(round, &old[i], &new[j])) {
+                Some(i) => {
+                    taken[i] = true;
+                    if round > 0 {
+                        pairs.push((i, j));
+                    }
+                    false
+                }
+                None => true,
+            }
+        });
+    }
+    let (mut lost, mut gained) = (BTreeSet::new(), BTreeSet::new());
+    for (i, j) in pairs {
+        if let (Some(was), Some(now)) = (&old[i].matcher, &new[j].matcher)
+            && is_strong(was)
+            && is_weak(now)
+        {
+            lost.insert(was.as_str());
+            gained.insert(now.as_str());
         }
     }
-    out
+    (lost, gained)
 }
 
 /// Matchers that pin a value.
@@ -481,49 +743,25 @@ fn inline_snapshots(lang: Lang, text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The text that assertions and matchers are counted in: comments dropped, and for Rust
-/// the contents of string literals too, so a quoted `assert!` does not count.
-fn code_of(lang: Lang, text: &str) -> String {
-    if lang == Lang::Rust {
-        strip_rust_nodes(
-            text,
-            &["line_comment", "block_comment"],
-            &["string_literal", "raw_string_literal"],
-        )
-    } else {
-        strip_comments(lang, text)
-    }
-}
-
 /// Drops Rust comments as the parser finds them, so `//` inside a string stays.
 fn strip_rust_comments(text: &str) -> String {
-    strip_rust_nodes(text, &["line_comment", "block_comment"], &[])
-}
-
-/// `text` without the nodes of the `dropped` kinds, and with the nodes of the `emptied`
-/// kinds replaced by an empty string literal.
-fn strip_rust_nodes(text: &str, dropped: &[&str], emptied: &[&str]) -> String {
     let Some(tree) = Lang::Rust.parse(text) else {
         return TS_COMMENT.replace_all(text, "").into_owned();
     };
-    let mut cuts: Vec<(std::ops::Range<usize>, &str)> = Vec::new();
+    let mut cuts: Vec<std::ops::Range<usize>> = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
-        if dropped.contains(&node.kind()) {
-            cuts.push((node.byte_range(), ""));
-            continue;
-        }
-        if emptied.contains(&node.kind()) {
-            cuts.push((node.byte_range(), "\"\""));
+        if matches!(node.kind(), "line_comment" | "block_comment") {
+            cuts.push(node.byte_range());
             continue;
         }
         let mut cursor = node.walk();
         stack.extend(node.children(&mut cursor));
     }
-    cuts.sort_by_key(|(r, _)| r.start);
+    cuts.sort_by_key(|r| r.start);
     let mut out = text.to_string();
-    for (range, with) in cuts.into_iter().rev() {
-        out.replace_range(range, with);
+    for range in cuts.into_iter().rev() {
+        out.replace_range(range, "");
     }
     out
 }
@@ -723,10 +961,10 @@ mod tests {
     fn rust_comments_come_from_the_parser_so_urls_in_strings_stay() {
         let base = "#[test]\nfn t() {\n    assert_eq!(f(1), 1); assert_eq!(f(2), 2);\n}\n";
         let head = "#[test]\nfn t() {\n    let s = \"http://example\"; assert_eq!(f(1), 1); assert_eq!(f(2), 2);\n    // assert_eq!(f(3), 3);\n}\n";
-        assert_eq!(assertions(Lang::Rust, head), 2);
+        assert_eq!(assertions_in(Lang::Rust, head).len(), 2);
         assert!(compare(Lang::Rust, PythonStyle::Pytest, "tests/a.rs", base, head).is_empty());
         let quoted = "#[test]\nfn t() {\n    let _ = \"assert!(true)\"; assert_eq!(f(2), 2);\n}\n";
-        assert_eq!(assertions(Lang::Rust, quoted), 1);
+        assert_eq!(assertions_in(Lang::Rust, quoted).len(), 1);
     }
 
     #[test]
@@ -836,6 +1074,99 @@ mod tests {
             vec![(FindingKind::SnapshotChanged, "s".into())]
         );
         assert_eq!(kinds_of(commented), vec![]);
+    }
+
+    #[test]
+    fn reordered_duplicate_titles_match_by_text_then_position() {
+        let base = r#"describe("s", () => {
+  it("dup", () => { expect(a()).toBe(1); expect(b()).toBe(2); });
+  it.skip("dup", () => { expect(c()).toBe(3); });
+});
+"#;
+        let reordered = r#"describe("s", () => {
+  it.skip("dup", () => { expect(c()).toBe(3); });
+  it("dup", () => { expect(a()).toBe(1); expect(b()).toBe(2); });
+});
+"#;
+        let weakened = r#"describe("s", () => {
+  it.skip("dup", () => { expect(c()).toBe(3); });
+  it("dup", () => { expect(a()).toBe(1); });
+});
+"#;
+        let run = |head| {
+            compare(
+                Lang::TypeScript,
+                PythonStyle::Pytest,
+                "a.test.ts",
+                base,
+                head,
+            )
+        };
+        assert_eq!(kinds(&run(reordered)), vec![]);
+        let findings = run(weakened);
+        assert_eq!(
+            kinds(&findings),
+            vec![(FindingKind::AssertionRemoved, "s > dup'".into())]
+        );
+        assert_eq!(findings[0].line, 3);
+    }
+
+    #[test]
+    fn offsetting_matcher_changes_still_loosen_an_assertion() {
+        let ts = compare(
+            Lang::TypeScript,
+            PythonStyle::Pytest,
+            "a.test.ts",
+            "it(\"t\", () => {\n  expect(a()).toEqual(1);\n  expect(b()).toBeTruthy();\n});\n",
+            "it(\"t\", () => {\n  expect(a()).toBeTruthy();\n  expect(b()).toEqual(2);\n});\n",
+        );
+        assert_eq!(kinds(&ts), vec![(FindingKind::MatcherLoosened, "t".into())]);
+        assert_eq!(ts[0].message, "replaces toEqual with toBeTruthy");
+        let py = compare(
+            Lang::Python,
+            PythonStyle::Pytest,
+            "test_a.py",
+            "def test_t(self):\n    self.assertEqual(a(), 1)\n    self.assertTrue(b())\n",
+            "def test_t(self):\n    self.assertTrue(a())\n    self.assertEqual(b(), 2)\n",
+        );
+        assert_eq!(
+            kinds(&py),
+            vec![(FindingKind::MatcherLoosened, "test_t".into())]
+        );
+        let swapped = compare(
+            Lang::TypeScript,
+            PythonStyle::Pytest,
+            "a.test.ts",
+            "it(\"t\", () => {\n  expect(a()).toEqual(1);\n  expect(b()).toBeTruthy();\n});\n",
+            "it(\"t\", () => {\n  expect(b()).toBeTruthy();\n  expect(a()).toEqual(1);\n});\n",
+        );
+        assert_eq!(kinds(&swapped), vec![]);
+    }
+
+    #[test]
+    fn assertion_like_strings_are_not_assertions() {
+        let py = compare(
+            Lang::Python,
+            PythonStyle::Pytest,
+            "test_a.py",
+            "def test_t(self):\n    self.assertEqual(f(1), 2)\n    self.assertEqual(f(2), 3)\n",
+            "def test_t(self):\n    self.assertEqual(f(1), 2)\n    text = \"self.assertEqual(1, 1)\"\n",
+        );
+        assert_eq!(
+            kinds(&py),
+            vec![(FindingKind::AssertionRemoved, "test_t".into())]
+        );
+        let ts = compare(
+            Lang::TypeScript,
+            PythonStyle::Pytest,
+            "a.test.ts",
+            "it(\"t\", () => {\n  expect(f(1)).toBe(2);\n  expect(f(2)).toBe(3);\n});\n",
+            "it(\"t\", () => {\n  expect(f(1)).toBe(2);\n  const s = \"expect(f(2)).toBe(3)\";\n});\n",
+        );
+        assert_eq!(
+            kinds(&ts),
+            vec![(FindingKind::AssertionRemoved, "t".into())]
+        );
     }
 
     #[test]
