@@ -8,7 +8,7 @@ Code, docs, the report, and the repo skill use these terms with these meanings.
 - Test file: a file that matches a runner's `test_globs`.
 - Test path: a test file or a file that matches a runner's `support_globs`. titer copies changed test paths onto base and never mutates them.
 - Source file: a file in a supported language that is not a test path. A Rust source file can also hold unit tests in `#[cfg(test)]` items.
-- Changed test: a test function or `it`/`test` call whose span intersects a changed line in a test file, or a Rust test function in a source file whose span intersects a changed line.
+- Changed test: a test function or `it`/`test` call whose span intersects a changed line in a test file, or a Rust test function in a source file whose span intersects a changed line. A test also counts when it reads changed test data: a declaration in the same file, such as a table of cases or a helper, that holds a changed line outside every test span, or that reads another such declaration. In a Rust source file only declarations in test code count.
 - Head-green: every selected test passes on head. Skipped tests do not count as passing.
 - Proven test: a changed test that fails on base with an assertion, or with an exception from the code under test. It shows that the test detects a difference from base, not that the difference is the intended one.
 - Missing symbol: a failure on base caused by a name that exists only in head, or a Rust test that does not compile against base. Such a test is not proven.

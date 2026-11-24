@@ -27,7 +27,7 @@ titer compares the working tree, including untracked files, with the merge-base 
 
 ## Read the report
 
-`tests` has one entry per changed test. Its `verdict` says what the test did on the base code:
+`tests` has one entry per changed test: a test the change edits, or a test that reads data the change edits outside any test in the same file, such as a new row in a table of cases. Its `verdict` says what the test did on the base code:
 
 - `assertion` or `exception`: the test fails on base, so it detects a difference between base and head. The gate counts this as proof. Read `message` and check that the failure is the behavior the change targets; a test can also fail on base for an unrelated reason.
 - `missing_symbol`: the test fails on base only because it imports or calls something new. It shows nothing about behavior. Add a test that exercises the behavior through code that exists in base, or rely on mutation results.

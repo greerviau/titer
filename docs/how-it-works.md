@@ -21,6 +21,16 @@ titer runs tests through the repo's own command and the runner's native selectio
 
 The checkout's status, index, stash, and worktree list never change. titer kills its own process groups on exit, on timeout, and on SIGINT.
 
+## Changed tests
+
+A changed test is a test whose span holds a changed line. Table-driven tests often get a new case as data outside any test, such as a row in a `tests` array that a `for` loop runs, a list passed to `@pytest.mark.parametrize`, or a `const CASES` slice in a Rust test module. So a test also counts as changed when it reads a declaration in the same file that holds a changed line outside every test span:
+
+- TypeScript and JavaScript: `const`, `let`, and `var` declarations, functions, classes, and enums.
+- Python: assignments, functions (including fixtures), and classes.
+- Rust: `const`, `static`, functions, types, `impl` blocks of a type, traits, and `macro_rules!`. In a source file, only declarations in test code count.
+
+A test reads a declaration when its own span names it, including decorators such as `parametrize`, or when an enclosing construct names it outside the statements it holds, such as the iterable of a `for` loop, the receiver of `cases.forEach`, or the table of `describe.each`. Python tests also read `self.name` and `cls.name`, and a fixture by its parameter name. A declaration that reads a changed declaration, such as a table that spreads another, also counts as changed. The declaration must be visible where the test is, so a table in one `describe` callback does not change the tests in another. Imports are not test data, and titer does not resolve shadowing: a name that an inner block binds again still counts.
+
 ## Tiers
 
 | Tier | What it does |
