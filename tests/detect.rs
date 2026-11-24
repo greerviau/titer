@@ -192,3 +192,39 @@ fn warns_only_about_changed_tests_that_share_a_selector() {
         ]
     );
 }
+
+#[test]
+fn lockfiles_record_the_path_that_pins_linked_dependencies() {
+    let repo = Fixture::new();
+    repo.write("titer.toml", CONFIG)
+        .write("api/app.py", PY_BASE)
+        .write(
+            "api/uv.lock",
+            "version = 1\nrevision = 1\n[[package]]\nname = \"a\"\n",
+        )
+        .write("api/poetry.lock", "untouched\n")
+        .write("web/src/clamp.ts", TS_BASE);
+    repo.commit_all("base");
+    repo.git(&["checkout", "-q", "-b", "feat"]);
+    // Git sees a rename, which moves the pins out of a lockfile name.
+    repo.git(&["mv", "api/uv.lock", "api/pins.txt"]);
+    repo.write("web/package-lock.json", "{}\n");
+
+    let session = Session::open(repo.path(), None).unwrap();
+    let runners: Vec<Runner> = session
+        .config
+        .runners
+        .iter()
+        .cloned()
+        .map(Runner::new)
+        .collect();
+    let detection = detect(&session, &runners).unwrap();
+
+    assert_eq!(
+        detection.lockfiles,
+        vec![
+            "api/uv.lock".to_string(),
+            "web/package-lock.json".to_string()
+        ]
+    );
+}
