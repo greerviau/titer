@@ -21,6 +21,16 @@ titer runs tests through the repo's own command and the runner's native selectio
 
 The checkout's status, index, stash, and worktree list never change. titer kills its own process groups on exit, on timeout, and on SIGINT.
 
+## Changed tests
+
+A changed test is a test whose span holds a changed line. Table-driven tests often get a new case as data outside any test, such as a row in a `tests` array that a `for` loop runs, a list passed to `@pytest.mark.parametrize`, or a `const CASES` slice in a Rust test module. So a test also counts as changed when it reads a declaration in the same file that holds a changed line outside every test span:
+
+- TypeScript and JavaScript: each declarator of `const`, `let`, and `var`, and functions, classes, and enums.
+- Python: assignments, including `self.name` and `cls.name` in a method such as `setUp`, and functions (including fixtures) and classes.
+- Rust: `const`, `static`, functions, types, traits, and `macro_rules!`, each method of an `impl`, and the rest of an `impl`, which stands for its type. In a source file, only declarations in test code count, and a changed line that test code shares with other code does not.
+
+A test reads a declaration when its own span names it, including decorators such as `parametrize`, or when an enclosing construct names it beside the test, such as the iterable of a `for` loop, the receiver of `cases.forEach`, or the table of `describe.each`. Other statements and branches around the test do not count, so a table that only an `if` branch reads does not change a test in the `else` branch. Python tests also read `self.name` and `cls.name`, and a fixture by its parameter name; a parameter reads nothing else. A declaration that reads a changed declaration, such as a table that spreads another, also counts as changed. The declaration must be visible where the test is, so a table in one `describe` callback does not change the tests in another. Imports are not test data. titer matches names by text within that scope, so it does not resolve shadowing or Rust paths through another module.
+
 ## Tiers
 
 | Tier | What it does |
@@ -102,7 +112,7 @@ titer asks `cargo metadata` for packages and targets, and maps each file to the 
 
 titer skips a target whose `required-features` the runner's command does not enable, as cargo does. Two files that can fill one module path, such as `#[cfg]` variants under `#[path]`, give their tests the same libtest name, so titer selects neither and they get `no_result`. titer reads a test binary's results only when they agree with its own `test result:` counts; a test that prints result lines of its own leaves the run without a result.
 
-A test that uses a name only head has stops its whole target from compiling on base. `prove` gives such a test the `missing_symbol` verdict, removes it and the import of that exact path from base, and builds again, so the other changed tests in that target still run.
+A test that uses a name only head has stops its whole target from compiling on base. `prove` gives such a test the `missing_symbol` verdict, removes it and the import of that exact path from base, and builds again, so the other changed tests in that target still run. Test data that uses such a name, such as a table row, gets the same treatment: the tests that read it get `missing_symbol`, and the data goes with them.
 
 Worktrees hold the tree without `.git`, so a build script that runs git fails there, and the check exits 2.
 

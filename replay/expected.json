@@ -26,30 +26,39 @@
   "click#3678": {
     "gate": "pass",
     "verdicts": {
-      "assertion": 3,
+      "assertion": 5,
       "passes_on_base": 2
     }
   },
   "ufo#242": {
     "gate": "pass",
-    "verdicts": {}
+    "verdicts": {
+      "assertion": 1
+    }
   },
   "ufo#284": {
     "gate": "pass",
     "verdicts": {
-      "exception": 1
+      "exception": 1,
+      "passes_on_base": 1
     }
   },
   "ufo#286": {
     "gate": "pass",
-    "verdicts": {}
+    "verdicts": {
+      "assertion": 1
+    }
   },
   "ufo#313": {
     "gate": "pass",
-    "verdicts": {}
+    "verdicts": {
+      "assertion": 2
+    }
   },
   "ufo#335": {
     "gate": "pass",
-    "verdicts": {}
+    "verdicts": {
+      "assertion": 1
+    }
   }
 }

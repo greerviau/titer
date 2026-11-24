@@ -274,3 +274,151 @@ fn scan_reads_tests_inside_rust_source_files() {
         "{report:#}"
     );
 }
+
+const TABLE_BASE: &str = r#"pub fn clamp(x: i32, _hi: i32) -> i32 {
+    x
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CASES: &[(i32, i32)] = &[
+        (1, 1),
+    ];
+
+    #[test]
+    fn clamps_each_case() {
+        for (x, out) in CASES {
+            assert_eq!(clamp(*x, 3), *out);
+        }
+    }
+
+    #[test]
+    fn keeps_zero() {
+        assert_eq!(clamp(0, 3), 0);
+    }
+}
+"#;
+
+#[test]
+fn a_new_row_in_a_test_table_makes_the_test_that_reads_it_changed() {
+    let repo = Fixture::new();
+    repo.write(
+        "titer.toml",
+        "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\"]\n",
+    )
+    .write(".gitignore", "target\n")
+    .write("Cargo.toml", CARGO_TOML)
+    .write("src/lib.rs", TABLE_BASE);
+    repo.commit_all("base");
+    repo.git(&["checkout", "-q", "-b", "fix"]);
+    repo.write(
+        "src/lib.rs",
+        &TABLE_BASE
+            .replacen("    x\n}", "    x.min(hi)\n}", 1)
+            .replacen("_hi: i32", "hi: i32", 1)
+            .replacen("        (1, 1),\n", "        (1, 1),\n        (5, 3),\n", 1),
+    );
+
+    let output = repo.titer(&["check", "--json", "--only", "prove"]);
+
+    let report = stdout_json(&output);
+    assert_schema_valid(&report);
+    assert_eq!(output.status.code(), Some(0), "{report:#}");
+    assert_eq!(
+        strings(&report, "tests", &["id", "head", "verdict"]),
+        vec!["src/lib.rs::tests::clamps_each_case green assertion"],
+        "{report:#}"
+    );
+}
+
+const TABLE_API_BASE: &str = r#"pub fn clamp(x: i32, _hi: i32) -> i32 {
+    x
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CASES: &[(i32, i32)] = &[
+        (1, 1),
+    ];
+
+    #[test]
+    fn rows() {
+        for (x, out) in CASES {
+            assert_eq!(*x, *out);
+        }
+    }
+}
+"#;
+
+// Head fixes clamp, adds twice, puts a call to twice in the table, and adds a test of
+// clamp. On base the table does not compile, which must not stop the test of clamp.
+const TABLE_API_HEAD: &str = r#"pub fn clamp(x: i32, hi: i32) -> i32 {
+    x.min(hi)
+}
+
+pub const fn twice(x: i32) -> i32 {
+    x * 2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CASES: &[(i32, i32)] = &[
+        (1, 1),
+        (twice(1), 2),
+    ];
+
+    #[test]
+    fn rows() {
+        for (x, out) in CASES {
+            assert_eq!(*x, *out);
+        }
+    }
+
+    #[test]
+    fn independent() {
+        assert_eq!(clamp(5, 3), 3);
+    }
+}
+"#;
+
+#[test]
+fn a_table_that_does_not_compile_on_base_sets_aside_only_its_readers() {
+    let repo = Fixture::new();
+    repo.write(
+        "titer.toml",
+        "[[runner]]\nkind = \"cargo\"\ncommand = [\"cargo\", \"test\"]\n",
+    )
+    .write(".gitignore", "target\n")
+    .write("Cargo.toml", CARGO_TOML)
+    .write("src/lib.rs", TABLE_API_BASE);
+    repo.commit_all("base");
+    repo.git(&["checkout", "-q", "-b", "fix"]);
+    repo.write("src/lib.rs", TABLE_API_HEAD);
+
+    let output = repo.titer(&["check", "--json", "--only", "prove"]);
+
+    let report = stdout_json(&output);
+    assert_schema_valid(&report);
+    assert_eq!(output.status.code(), Some(0), "{report:#}");
+    assert_eq!(
+        strings(&report, "tests", &["id", "head", "verdict"]),
+        vec![
+            "src/lib.rs::tests::rows green missing_symbol",
+            "src/lib.rs::tests::independent green assertion",
+        ],
+        "{report:#}"
+    );
+    assert!(
+        report["tests"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("twice"),
+        "{report:#}"
+    );
+}

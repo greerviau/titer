@@ -221,6 +221,8 @@ fn run_base(
     let mut set_aside: Vec<TestCase> = Vec::new();
     // Names that base lacks, imported outside any test, by file.
     let mut unresolved: Vec<(String, String)> = Vec::new();
+    // Test data that does not compile against base, by file.
+    let mut broken_data: Vec<(String, String)> = Vec::new();
     loop {
         let run = runner.run(&RunRequest {
             worktree: &base.path,
@@ -233,11 +235,16 @@ fn run_base(
         if runner.config.kind != RunnerKind::Cargo || run.compile_errors.is_empty() {
             return Ok(run);
         }
-        let (blamed, names) = blame(&run.compile_errors, &selected, base, session)?;
+        let Blame {
+            tests: blamed,
+            imports,
+            data,
+        } = blame(&run.compile_errors, &selected, base, session, detection)?;
         if blamed.is_empty() {
             return Ok(run);
         }
-        unresolved.extend(names);
+        unresolved.extend(imports);
+        broken_data.extend(data);
         for (case, message) in &blamed {
             if let Some(i) = head.cases.iter().position(|c| c == case) {
                 statics[i] = Some(message.clone());
@@ -257,6 +264,14 @@ fn run_base(
                 .map(|(_, n)| n.as_str())
                 .collect();
             let without = lang::rust::remove_imports(&without, &names);
+            let texts: Vec<String> = broken_data
+                .iter()
+                .filter(|(f, _)| f == file)
+                .map(|(_, t)| t.clone())
+                .collect();
+            let rust_source = detection.rust_sources.iter().any(|f| f == file);
+            let without =
+                lang::refs::without_declarations(Lang::Rust, &without, &texts, rust_source);
             write_base_copy(session, detection, base, file, &without)?;
         }
         if selected.is_empty() {
@@ -265,19 +280,29 @@ fn run_base(
     }
 }
 
-/// The selected tests that compile errors fall in, each with its first error. An error
-/// inside a test blames that test. An error outside every test, such as in a `use`, blames
-/// the tests in its file that name what it reports missing; the paths of unresolved
-/// imports also come back by file, so the import can go with the tests.
-#[allow(clippy::type_complexity)]
+/// What a round of compile errors blames on base.
+#[derive(Default)]
+struct Blame {
+    /// The selected tests that compile errors fall in, each with its first error.
+    tests: Vec<(TestCase, String)>,
+    /// Unresolved import paths outside every test, by file, to remove with the tests.
+    imports: Vec<(String, String)>,
+    /// The text of test data that does not compile, by file, to remove with its readers.
+    data: Vec<(String, String)>,
+}
+
+/// An error inside a test blames that test. An error in test data outside every test, such
+/// as a table row that calls what only head has, blames the tests that read the data, and
+/// the data goes with them. Any other error outside every test, such as in a `use`, blames
+/// the tests in its file that name what it reports missing.
 fn blame(
     errors: &[CompileError],
     selected: &[TestCase],
     base: &Worktree,
     session: &Session,
-) -> anyhow::Result<(Vec<(TestCase, String)>, Vec<(String, String)>)> {
-    let mut out: Vec<(TestCase, String)> = Vec::new();
-    let mut names: Vec<(String, String)> = Vec::new();
+    detection: &Detection,
+) -> anyhow::Result<Blame> {
+    let mut blame = Blame::default();
     let mut files: Vec<&str> = selected.iter().map(|c| c.file.as_str()).collect();
     files.sort();
     files.dedup();
@@ -291,6 +316,25 @@ fn blame(
         let defs = lang::find_tests(Lang::Rust, &compiled, PythonStyle::Pytest);
         let head_text = read_head(session, file)?;
         let head_defs = lang::find_tests(Lang::Rust, &head_text, PythonStyle::Pytest);
+        let rust_source = detection.rust_sources.iter().any(|f| f == file);
+        let outside =
+            |e: &CompileError| !defs.iter().any(|d| (d.line..=d.end_line).contains(&e.line));
+        // For each error in test data, the tests that read the data and its text.
+        let data: Vec<(&CompileError, Vec<&lang::TestDef>, Vec<String>)> = errors
+            .iter()
+            .filter(|e| outside(e))
+            .filter_map(|e| {
+                let (readers, texts) = lang::refs::readers_of_data_at(
+                    Lang::Rust,
+                    &compiled,
+                    &defs,
+                    e.line,
+                    rust_source,
+                );
+                let readers: Vec<&lang::TestDef> = readers.into_iter().map(|i| &defs[i]).collect();
+                (!readers.is_empty() && !texts.is_empty()).then_some((*e, readers, texts))
+            })
+            .collect();
         for case in selected.iter().filter(|c| c.file == file) {
             let inside = errors.iter().find(|e| {
                 defs.iter().any(|d| {
@@ -304,11 +348,7 @@ fn blame(
                     .iter()
                     .find(|d| d.report_line == case.line)
                     .map_or("", |d| &head_text[d.start_byte..d.end_byte]);
-                errors.iter().find_map(|e| {
-                    let outside = !defs.iter().any(|d| (d.line..=d.end_line).contains(&e.line));
-                    if !outside {
-                        return None;
-                    }
+                errors.iter().filter(|e| outside(e)).find_map(|e| {
                     // An unresolved import names a path; the test uses it by the name or
                     // alias the file imports it as.
                     let (locals, import) = match unresolved_import(&e.message) {
@@ -321,15 +361,30 @@ fn blame(
                         .then_some((e, import))
                 })
             };
+            let reads = data.iter().find(|(_, readers, _)| {
+                readers
+                    .iter()
+                    .any(|d| d.name == case.name && d.suite == case.suite)
+            });
             if let Some(error) = inside {
-                out.push((case.clone(), error.message.clone()));
+                blame.tests.push((case.clone(), error.message.clone()));
+            } else if let Some((error, _, texts)) = reads {
+                blame.tests.push((case.clone(), error.message.clone()));
+                for text in texts {
+                    let entry = (file.to_string(), text.clone());
+                    if !blame.data.contains(&entry) {
+                        blame.data.push(entry);
+                    }
+                }
             } else if let Some((error, import)) = named() {
-                out.push((case.clone(), error.message.clone()));
-                names.extend(import.map(|path| (file.to_string(), path)));
+                blame.tests.push((case.clone(), error.message.clone()));
+                blame
+                    .imports
+                    .extend(import.map(|path| (file.to_string(), path)));
             }
         }
     }
-    Ok((out, names))
+    Ok(blame)
 }
 
 static BACKTICKED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`]+)`").unwrap());

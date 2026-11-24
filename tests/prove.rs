@@ -507,3 +507,126 @@ fn an_untouched_lockfile_gives_no_dependency_warning() {
         "{report:#}"
     );
 }
+
+const TABLE_TEST_BASE: &str = r#"import { describe, it, expect } from "vitest";
+import { clampZero } from "./m";
+
+describe("clampZero", () => {
+  const cases = [
+    { input: 1, out: 1 },
+  ];
+  for (const c of cases) {
+    it(`maps ${c.input}`, () => {
+      expect(clampZero(c.input)).toBe(c.out);
+    });
+  }
+});
+
+describe("other", () => {
+  const cases = [{ input: 2, out: 2 }];
+  for (const c of cases) {
+    it(`keeps ${c.input}`, () => {
+      expect(clampZero(c.input)).toBe(c.out);
+    });
+  }
+});
+"#;
+
+#[test]
+fn a_new_case_in_a_vitest_table_makes_the_tests_that_loop_over_it_changed() {
+    let repo = Fixture::new();
+    let vitest = fixture_node_modules().join(".bin/vitest");
+    repo.write(
+        "titer.toml",
+        &format!(
+            "[[runner]]\nkind = \"vitest\"\ncommand = [\"{}\", \"run\"]\n",
+            vitest.display()
+        ),
+    )
+    .write(".gitignore", "node_modules\n")
+    .write("package.json", "{\"type\": \"module\"}\n")
+    .write("src/m.ts", "export const clampZero = (x: number) => x;\n")
+    .write("src/m.test.ts", TABLE_TEST_BASE);
+    std::os::unix::fs::symlink(fixture_node_modules(), repo.path().join("node_modules")).unwrap();
+    repo.commit_all("base");
+    repo.git(&["checkout", "-q", "-b", "fix"]);
+    repo.write(
+        "src/m.ts",
+        "export const clampZero = (x: number) => Math.max(0, x);\n",
+    )
+    .write(
+        "src/m.test.ts",
+        &TABLE_TEST_BASE.replacen(
+            "{ input: 1, out: 1 },\n",
+            "{ input: 1, out: 1 },\n    { input: -1, out: 0 },\n",
+            1,
+        ),
+    );
+
+    let output = repo.titer(&["check", "--json", "--only", "prove"]);
+
+    let report = stdout_json(&output);
+    assert_schema_valid(&report);
+    assert_eq!(output.status.code(), Some(0), "{report:#}");
+    assert_eq!(
+        verdicts(&report),
+        vec![(
+            "clampZero > maps ${c.input}".into(),
+            "green".into(),
+            "assertion".into()
+        )],
+        "{report:#}"
+    );
+}
+
+const TABLE_PY_BASE: &str = r#"import pytest
+
+from app import clamp_zero
+
+CASES = [
+    (1, 1),
+]
+OTHER = [(2, 2)]
+
+
+@pytest.mark.parametrize("x,out", CASES)
+def test_maps(x, out):
+    assert clamp_zero(x) == out
+
+
+@pytest.mark.parametrize("x,out", OTHER)
+def test_keeps(x, out):
+    assert clamp_zero(x) == out
+"#;
+
+#[test]
+fn a_new_row_in_a_module_level_parametrize_table_makes_its_test_changed() {
+    let repo = Fixture::new();
+    repo.write(
+        "titer.toml",
+        &format!(
+            "[[runner]]\nkind = \"pytest\"\ncommand = [\"{}\", \"-m\", \"pytest\"]\n",
+            fixture_python()
+        ),
+    )
+    .write("app.py", "def clamp_zero(x):\n    return x\n")
+    .write("test_app.py", TABLE_PY_BASE);
+    repo.commit_all("base");
+    repo.git(&["checkout", "-q", "-b", "fix"]);
+    repo.write("app.py", "def clamp_zero(x):\n    return max(0, x)\n")
+        .write(
+            "test_app.py",
+            &TABLE_PY_BASE.replacen("    (1, 1),\n", "    (1, 1),\n    (-1, 0),\n", 1),
+        );
+
+    let output = repo.titer(&["check", "--json", "--only", "prove"]);
+
+    let report = stdout_json(&output);
+    assert_schema_valid(&report);
+    assert_eq!(output.status.code(), Some(0), "{report:#}");
+    assert_eq!(
+        verdicts(&report),
+        vec![("test_maps".into(), "green".into(), "assertion".into())],
+        "{report:#}"
+    );
+}

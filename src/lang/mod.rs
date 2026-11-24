@@ -2,6 +2,7 @@
 //! JavaScript and JSX).
 
 pub mod python;
+pub mod refs;
 pub mod rust;
 pub mod ts;
 

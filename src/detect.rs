@@ -245,7 +245,8 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
                 detection.test_files.push((runner, path.clone()));
                 let source = read_head(session, &path)?;
                 let lang = Lang::of(&path).expect("test files have a language");
-                let found = changed_tests(&runners[runner], &path, lang, &source, &change.added);
+                let found =
+                    changed_tests(&runners[runner], &path, lang, &source, &change.added, false);
                 detection.tests.extend(found.tests);
                 detection.warnings.extend(found.warnings);
             }
@@ -260,7 +261,7 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
                 if lang == Lang::Rust {
                     detection.rust_sources.push(path.clone());
                     let found =
-                        changed_tests(&runners[runner], &path, lang, &source, &change.added);
+                        changed_tests(&runners[runner], &path, lang, &source, &change.added, true);
                     if !found.tests.is_empty() {
                         detection.test_files.push((runner, path.clone()));
                     }
@@ -326,7 +327,9 @@ struct ChangedTests {
     warnings: Vec<String>,
 }
 
-/// The tests in `source` whose spans intersect a changed line. A changed test whose id it
+/// The tests in `source` whose spans intersect a changed line, and the tests that read a
+/// declaration changed outside every test span, such as a table of cases. With
+/// `rust_source`, only the file's test code counts as data. A changed test whose id it
 /// shares with another test, such as two vitest calls on one line, gets a warning: the
 /// runner selects them together and titer reports their combined result for each.
 fn changed_tests(
@@ -335,31 +338,38 @@ fn changed_tests(
     lang: Lang,
     source: &str,
     added: &BTreeSet<u32>,
+    rust_source: bool,
 ) -> ChangedTests {
-    let all: Vec<(String, lang::TestDef)> =
-        lang::find_tests(lang, source, python_style(runner.config.kind))
-            .into_iter()
-            .map(|def| {
-                (
-                    runner.test_id(path, &def.suite, &def.name, def.report_line),
-                    def,
-                )
-            })
-            .collect();
-    let changed = |def: &lang::TestDef| added.iter().any(|l| (def.line..=def.end_line).contains(l));
+    let defs = lang::find_tests(lang, source, python_style(runner.config.kind));
+    let reads_data =
+        lang::refs::tests_reading_changed_data(lang, source, &defs, added, rust_source);
+    let all: Vec<(String, lang::TestDef, bool)> = defs
+        .into_iter()
+        .enumerate()
+        .map(|(i, def)| {
+            let changed = reads_data.contains(&i)
+                || added.iter().any(|l| (def.line..=def.end_line).contains(l));
+            (
+                runner.test_id(path, &def.suite, &def.name, def.report_line),
+                def,
+                changed,
+            )
+        })
+        .collect();
     // Groups in the order their first test appears, so warnings follow the source.
-    let mut by_id: Vec<(&str, Vec<&lang::TestDef>)> = Vec::new();
-    for (id, def) in &all {
+    let mut by_id: Vec<(&str, Vec<(&lang::TestDef, bool)>)> = Vec::new();
+    for (id, def, changed) in &all {
         match by_id.iter_mut().find(|(i, _)| *i == id.as_str()) {
-            Some((_, defs)) => defs.push(def),
-            None => by_id.push((id.as_str(), vec![def])),
+            Some((_, defs)) => defs.push((def, *changed)),
+            None => by_id.push((id.as_str(), vec![(def, *changed)])),
         }
     }
     let mut warnings = Vec::new();
-    for (id, defs) in by_id {
-        if defs.len() < 2 || !defs.iter().any(|d| changed(d)) {
+    for (id, group) in by_id {
+        if group.len() < 2 || !group.iter().any(|(_, changed)| *changed) {
             continue;
         }
+        let defs: Vec<&lang::TestDef> = group.into_iter().map(|(d, _)| d).collect();
         let same_name = defs
             .iter()
             .all(|d| (&d.suite, &d.name) == (&defs[0].suite, &defs[0].name));
@@ -383,8 +393,8 @@ fn changed_tests(
     }
     let tests = all
         .into_iter()
-        .filter(|(_, def)| changed(def))
-        .map(|(id, def)| TestCase {
+        .filter(|(_, _, changed)| *changed)
+        .map(|(id, def, _)| TestCase {
             runner: runner.name().to_string(),
             file: path.to_string(),
             line: def.report_line,
