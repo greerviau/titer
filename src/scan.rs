@@ -139,16 +139,20 @@ fn tests_of<'a>(lang: Lang, source: &'a str, style: lang::PythonStyle) -> Vec<Te
 
 /// Pairs each head test with the base test it continues, by index. Tests with distinct keys
 /// pair by key. Among tests that share a key, a head test first takes a base test with the
-/// same text, so reordering unchanged tests pairs each with itself, and the rest pair in
-/// order. Returns the head index paired with each base index.
+/// same text and skip state, so reordering unchanged tests pairs each with itself, and the
+/// rest pair in order. The skip state can come from an enclosing suite outside the text. Returns the head index paired with each base index.
 fn pair_tests(before: &[Test], after: &[Test]) -> Vec<Option<usize>> {
     let keys: Vec<String> = before.iter().map(|t| key_of(&t.def)).collect();
     let mut paired: Vec<Option<usize>> = vec![None; before.len()];
     let mut unpaired: Vec<usize> = Vec::new();
     for (j, new) in after.iter().enumerate() {
         let key = key_of(&new.def);
-        let same = (0..before.len())
-            .find(|&i| paired[i].is_none() && keys[i] == key && before[i].text == new.text);
+        let same = (0..before.len()).find(|&i| {
+            paired[i].is_none()
+                && keys[i] == key
+                && before[i].text == new.text
+                && before[i].def.skip == new.def.skip
+        });
         match same {
             Some(i) => paired[i] = Some(j),
             None => unpaired.push(j),
@@ -345,6 +349,12 @@ static RS_CONDITIONAL_IGNORE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"#\s*\[\s*cfg_attr\s*\([^\]]*\bignore\b").unwrap());
 static RS_ASSERT_NAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:debug_|prop_)?(assert(?:_\w+)?)$").unwrap());
+/// `expect`, `expect.soft`, `expect.poll`, `expectTypeOf`, `assert`, and `assert.*`, also
+/// through a namespace such as `vitest.expect`.
+static TS_ASSERT_CALLEE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:[\w$]+\.)*(?:expect(?:\.soft|\.poll)?|expectTypeOf|assert(?:\.[\w$]+)?)$")
+        .unwrap()
+});
 static TS_MATCHER_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^to[A-Z]\w*$").unwrap());
 
 /// One assertion call, statement, macro, or `#[should_panic]`.
@@ -445,44 +455,29 @@ fn python_assertion<'a>(node: Node, source: &'a str) -> Option<Assertion<'a>> {
             let counts = (function.kind() == "attribute" && name.starts_with("assert"))
                 || name.starts_with("assert_")
                 || matches!(whole, "pytest.raises" | "pytest.warns" | "self.fail");
-            counts.then(|| {
-                assertion(
-                    node,
-                    source,
-                    Some(name.to_string()),
-                    first_argument(node, source),
-                )
-            })
+            // A mock assertion checks its receiver; `self.assert*` checks its first argument.
+            let receiver = function
+                .child_by_field_name("object")
+                .map(|o| lang::text(o, source))
+                .filter(|o| *o != "self" && name.starts_with("assert_"));
+            let subject = receiver.unwrap_or_else(|| first_argument(node, source));
+            counts.then(|| assertion(node, source, Some(name.to_string()), subject))
         }
         _ => None,
     }
 }
 
-/// An `expect`, `expect.soft`, `expectTypeOf`, `assert`, or `assert.*` call, with the
-/// matcher chained onto it, such as `toEqual` in `expect(x).not.toEqual(1)`.
+/// A call that `TS_ASSERT_CALLEE` names, with the matcher chained onto it, such as `toEqual` in `expect(x).not.toEqual(1)`.
 fn ts_assertion<'a>(node: Node, source: &'a str) -> Option<Assertion<'a>> {
     if node.kind() != "call_expression" {
         return None;
     }
     let function = node.child_by_field_name("function")?;
-    let counts = match function.kind() {
-        "identifier" => matches!(
-            lang::text(function, source),
-            "expect" | "assert" | "expectTypeOf"
-        ),
-        "member_expression" => {
-            let object = function.child_by_field_name("object")?;
-            let property = function.child_by_field_name("property")?;
-            object.kind() == "identifier"
-                && match lang::text(object, source) {
-                    "expect" => lang::text(property, source) == "soft",
-                    "assert" => true,
-                    _ => false,
-                }
-        }
-        _ => false,
-    };
-    if !counts {
+    let callee: String = lang::text(function, source)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if !TS_ASSERT_CALLEE.is_match(&callee) {
         return None;
     }
     let mut matcher = None;
@@ -495,6 +490,7 @@ fn ts_assertion<'a>(node: Node, source: &'a str) -> Option<Assertion<'a>> {
             "call_expression" => {
                 parent.child_by_field_name("function").map(|f| f.id()) == Some(current.id())
             }
+            "parenthesized_expression" => true,
             _ => false,
         };
         if !continues {
@@ -523,7 +519,7 @@ fn rust_assertion<'a>(node: Node, source: &'a str) -> Option<Assertion<'a>> {
     match node.kind() {
         "macro_invocation" => {
             let path = lang::text(node.child_by_field_name("macro")?, source);
-            let name = path.rsplit("::").next().unwrap_or(path);
+            let name = path.rsplit("::").next().unwrap_or(path).trim();
             let args = lang::children(node)
                 .into_iter()
                 .find(|c| c.kind() == "token_tree")?;
@@ -540,8 +536,7 @@ fn rust_assertion<'a>(node: Node, source: &'a str) -> Option<Assertion<'a>> {
 /// Assertions inside another macro's tokens, such as a test body inside `proptest!`, which
 /// the parser leaves as a token tree: a name, `!`, and a token tree.
 fn rust_token_tree_assertions<'a>(tree: Node, source: &'a str) -> Vec<Assertion<'a>> {
-    let mut cursor = tree.walk();
-    let tokens: Vec<Node> = tree.children(&mut cursor).collect();
+    let tokens = tokens_of(tree);
     tokens
         .windows(3)
         .filter(|w| {
@@ -558,8 +553,7 @@ fn rust_macro_assertion<'a>(
     source: &'a str,
 ) -> Option<Assertion<'a>> {
     let caps = RS_ASSERT_NAME.captures(name)?;
-    let mut cursor = args.walk();
-    let tokens: Vec<Node> = args.children(&mut cursor).collect();
+    let tokens = tokens_of(args);
     // The direct children are the delimiters, the top-level tokens, and nested groups, so a
     // top-level `,` ends the first argument.
     let open = tokens.first()?;
@@ -570,7 +564,29 @@ fn rust_macro_assertion<'a>(
         .unwrap_or(close)
         .start_byte();
     let subject = source.get(open.end_byte()..end).unwrap_or_default();
-    let compares = tokens.iter().any(|t| match t.kind() {
+    let compares = compares(&tokens, source);
+    let matcher = match &caps[1] {
+        "assert" if compares => "assert_compare",
+        "assert" => "assert_bare",
+        other => other,
+    };
+    let mut found = assertion(start, source, Some(matcher.to_string()), subject);
+    found.text = &source[start.start_byte()..args.end_byte()];
+    Some(found)
+}
+
+/// A token tree's children without comments.
+fn tokens_of(tree: Node) -> Vec<Node> {
+    let mut cursor = tree.walk();
+    tree.children(&mut cursor)
+        .filter(|t| !matches!(t.kind(), "line_comment" | "block_comment"))
+        .collect()
+}
+
+/// Whether the tokens hold a comparison, also inside nested groups such as `((a == b))`.
+fn compares(tokens: &[Node], source: &str) -> bool {
+    tokens.iter().any(|t| match t.kind() {
+        "token_tree" => compares(&tokens_of(*t), source),
         "==" | "!=" | "<=" | ">=" => true,
         // `<` and `>` also delimit generics; spaced ones compare.
         "<" | ">" => {
@@ -583,15 +599,7 @@ fn rust_macro_assertion<'a>(
             t.start_byte() > 0 && spaced(t.start_byte() - 1) && spaced(t.end_byte())
         }
         _ => false,
-    });
-    let matcher = match &caps[1] {
-        "assert" if compares => "assert_compare",
-        "assert" => "assert_bare",
-        other => other,
-    };
-    let mut found = assertion(start, source, Some(matcher.to_string()), subject);
-    found.text = &source[start.start_byte()..args.end_byte()];
-    Some(found)
+    })
 }
 
 /// Pairs each base assertion with its version in head, and returns the strong matchers
@@ -1166,6 +1174,66 @@ mod tests {
         assert_eq!(
             kinds(&ts),
             vec![(FindingKind::AssertionRemoved, "t".into())]
+        );
+    }
+
+    #[test]
+    fn identical_tests_in_reordered_duplicate_suites_keep_their_skip_context() {
+        let base = "describe(\"dup\", () => {\n  it(\"same\", () => { expect(1).toBe(1); });\n});\ndescribe.skip(\"dup\", () => {\n  it(\"same\", () => { expect(1).toBe(1); });\n});\n";
+        let head = "describe.skip(\"dup\", () => {\n  it(\"same\", () => { expect(1).toBe(1); });\n});\ndescribe(\"dup\", () => {\n  it(\"same\", () => { expect(1).toBe(1); });\n});\n";
+        let findings = compare(
+            Lang::TypeScript,
+            PythonStyle::Pytest,
+            "a.test.ts",
+            base,
+            head,
+        );
+        assert_eq!(kinds(&findings), vec![]);
+    }
+
+    #[test]
+    fn assertions_are_found_in_every_form() {
+        let ts = |body: &str| {
+            assertions_in(
+                Lang::TypeScript,
+                &format!("it(\"t\", async () => {{\n{body}\n}});\n"),
+            )
+            .into_iter()
+            .map(|a| a.matcher.unwrap_or_default())
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(ts("vitest.expect(value).toBe(1);"), vec!["toBe"]);
+        assert_eq!(ts("(expect(value)).toEqual(1);"), vec!["toEqual"]);
+        assert_eq!(
+            ts("await expect.poll(() => value).toEqual(1);"),
+            vec!["toEqual"]
+        );
+        let rs = |body: &str| {
+            assertions_in(Lang::Rust, &format!("#[test]\nfn t() {{\n{body}\n}}\n"))
+                .into_iter()
+                .map(|a| a.matcher.unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rs("let _ = vec![assert_eq! /* c */ (1, 1)];"),
+            vec!["assert_eq"]
+        );
+        assert_eq!(rs("std:: assert_eq!(1, 1);"), vec!["assert_eq"]);
+        assert_eq!(rs("assert!((value == 1));"), vec!["assert_compare"]);
+    }
+
+    #[test]
+    fn mock_assertions_pair_by_their_receiver() {
+        let py = compare(
+            Lang::Python,
+            PythonStyle::Pytest,
+            "test_a.py",
+            "def test_t():\n    a.assert_called_once_with(1)\n    b.assert_called_once()\n",
+            "def test_t():\n    b.assert_called_once_with(1)\n    a.assert_called_once()\n",
+        );
+        assert_eq!(
+            kinds(&py),
+            vec![(FindingKind::MatcherLoosened, "test_t".into())]
         );
     }
 
