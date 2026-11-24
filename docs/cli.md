@@ -8,7 +8,7 @@ titer init [--dry-run] [--update]
 
 `init` opts a repo in. It detects the repo's runners and writes:
 
-- `titer.toml`, with one `[[runner]]` per project
+- `titer.toml`, with one `[[runner]]` per project. A runner's `support_globs` gets the kind's defaults plus the test helpers that they miss (see below)
 - a pinned dev dependency: `@greerviau/titer` in `package.json`, or `titer` in `pyproject.toml`
 - the repo skill in `.agents/skills/titer/SKILL.md` (Codex, Cursor, OpenCode) and `.claude/skills/titer/SKILL.md` (Claude Code)
 
@@ -16,6 +16,15 @@ titer init [--dry-run] [--update]
 |---|---|
 | `--dry-run` | Prints the config and the file list without writing. |
 | `--update` | Rewrites the repo skill and the pin for the installed titer version. |
+
+A test helper is a file in the runner's dir that is one of these:
+
+- a file that the vitest config names in `setupFiles` or `globalSetup`. `init` reads the config that vitest loads: the `--config` file in the runner's command, else the first `vitest.config.*` or `vite.config.*`, plus any `vitest.workspace.*`. It resolves paths against the config's `root`. It reads string literals only, so a computed path is missed.
+- a file that test paths import, directly or through other helpers, and that imports a test framework or testing library or has a helper name such as `testing`, `mocks`, or `fixtures`.
+
+A file stays source when any other file in the repo imports it, when the package publishes it (`main`, `module`, `browser`, `bin`, or `exports` in `package.json`; `[project.scripts]` in `pyproject.toml`), or when a test named after it imports it, such as `testing.test.ts` for `testing.ts`. A module that only its tests import and that has no helper name or framework import also stays source. Add such a helper to `support_globs` by hand.
+
+`init` prints what it could not decide for you. It lists the test helpers it added, the `scripts/` or `tools/` dirs you may want to exclude from mutation, and the test scripts it found (`package.json`'s `test` script and `scripts/test*.sh`). titer runs the runner's `command`, not those scripts, so copy any environment variable they set that the suite needs into the runner's `env`.
 
 You can run `init` before you install titer:
 

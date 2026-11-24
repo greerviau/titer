@@ -8,6 +8,8 @@ use anyhow::{Context, bail};
 use crate::config::{self, Config};
 use crate::git::Git;
 
+mod support;
+
 const SKILL: &str = include_str!("SKILL.md");
 pub const SKILL_PATHS: [&str; 2] = [
     ".agents/skills/titer/SKILL.md",
@@ -42,6 +44,8 @@ pub struct DetectedRunner {
     pub cwd: String,
     pub command: Vec<String>,
     pub start_dir: Option<String>,
+    /// The full `support_globs` to write, when the kind's defaults miss the repo's helpers.
+    pub support_globs: Option<Vec<String>>,
 }
 
 /// Every file `init` writes, with its new contents.
@@ -70,15 +74,48 @@ pub fn run(cwd: &Path, dry_run: bool, update: bool) -> anyhow::Result<Plan> {
                 config::FILE_NAME
             );
         }
-        let runners = detect_runners(&root)?;
+        let mut runners = detect_runners(&root)?;
         if runners.is_empty() {
             bail!(
                 "found no pytest, unittest, vitest, or cargo project; write titer.toml by hand (see docs/configuration.md)"
             );
         }
+        let defaults = Config::parse(&render_config(&runners))
+            .context("the generated titer.toml does not parse")?;
+        let files = repo_files(&git, &root)?;
+        let read = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+        for (runner, config) in runners.iter_mut().zip(&defaults.runners) {
+            let helpers = support::helpers(config, &files, &read)?;
+            if !helpers.unwritable.is_empty() {
+                plan.notes.push(format!(
+                    "these look like test helpers of {}, but no glob can name them, so titer will mutate them: {}",
+                    config.name,
+                    helpers.unwritable.join(", ")
+                ));
+            }
+            if helpers.globs.is_empty() {
+                continue;
+            }
+            plan.notes.push(format!(
+                "check the test helpers added to {}'s support_globs, which titer copies onto base and never mutates: {}",
+                config.name,
+                helpers.globs.join(", ")
+            ));
+            let mut globs = config.support_globs.clone();
+            globs.extend(helpers.globs);
+            runner.support_globs = Some(globs);
+        }
         let text = render_config(&runners);
         Config::parse(&text).context("the generated titer.toml does not parse")?;
         plan.writes.push((config_path, text));
+        let runner_dirs: Vec<String> = runners.iter().map(|r| r.cwd.clone()).collect();
+        let scripts = support::test_scripts(&root, &runner_dirs);
+        if !scripts.is_empty() {
+            plan.notes.push(format!(
+                "found these test scripts: {}; if they set environment variables the suite needs, copy them into the runner's `env` in titer.toml",
+                scripts.join(", ")
+            ));
+        }
         for dir in script_dirs(&root, &runners) {
             plan.notes.push(format!(
                 "if `{dir}/` holds only build or tooling scripts, add \"{dir}/**\" to [mutate] exclude_globs in titer.toml, so titer does not mutate them"
@@ -375,6 +412,24 @@ fn collect_dirs(root: &Path, dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The repo's files as head sees them: tracked and untracked files that are not ignored.
+fn repo_files(git: &Git, root: &Path) -> anyhow::Result<std::collections::HashSet<String>> {
+    let bytes = git.run_bytes([
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+    ])?;
+    Ok(bytes
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        // A file deleted from the working tree but still in the index is not in head.
+        .filter(|p| root.join(p).symlink_metadata().is_ok())
+        .collect())
+}
+
 fn rel_dir(root: &Path, dir: &Path) -> String {
     let rel = dir
         .strip_prefix(root)
@@ -406,6 +461,7 @@ fn detect_vitest(dir: &Path, rel: &str) -> Option<DetectedRunner> {
             "run".into(),
         ],
         start_dir: None,
+        support_globs: None,
     })
 }
 
@@ -439,6 +495,7 @@ fn detect_cargo(dir: &Path, rel: &str) -> Option<DetectedRunner> {
         cwd: rel.to_string(),
         command: vec!["cargo".into(), "test".into()],
         start_dir: None,
+        support_globs: None,
     })
 }
 
@@ -480,6 +537,7 @@ fn detect_python(dir: &Path, rel: &str) -> Option<DetectedRunner> {
         cwd: rel.to_string(),
         command,
         start_dir: unittest.then(|| tests_dir.unwrap_or(".").to_string()),
+        support_globs: None,
     })
 }
 
@@ -589,6 +647,15 @@ pub fn render_config(runners: &[DetectedRunner]) -> String {
         out.push_str(&format!("command = [{}]\n", command.join(", ")));
         if let Some(start) = &r.start_dir {
             out.push_str(&format!("start_dir = {}\n", quote(start)));
+        }
+        if let Some(globs) = &r.support_globs {
+            out.push_str(
+                "# The kind's defaults, then test helpers that init found.\nsupport_globs = [\n",
+            );
+            for glob in globs {
+                out.push_str(&format!("    {},\n", quote(glob)));
+            }
+            out.push_str("]\n");
         }
         out.push('\n');
     }
@@ -912,6 +979,7 @@ mod tests {
             cwd: cwd.into(),
             command: vec!["x".into()],
             start_dir: None,
+            support_globs: None,
         };
         for (cwd, prefix) in [("clients/web", "clients/web/"), (".", "")] {
             let config = Config::parse(&render_config(&[runner(cwd)])).unwrap();
@@ -938,6 +1006,7 @@ mod tests {
             cwd: "web[1]".into(),
             command: vec!["x".into()],
             start_dir: None,
+            support_globs: None,
         };
         let config = Config::parse(&render_config(&[runner])).unwrap();
         assert!(config.mutate.exclude_globs.is_empty());
