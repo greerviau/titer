@@ -194,6 +194,8 @@ pub struct Detection {
     pub not_analyzed: Vec<String>,
     /// Changed tests that the runner cannot select apart from other tests.
     pub warnings: Vec<String>,
+    /// Changed lockfiles under a runner that links dependency dirs from the checkout.
+    pub lockfiles: Vec<String>,
 }
 
 impl Detection {
@@ -217,6 +219,14 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
     let classifier = Classifier::in_checkout(runners, session.git.root())?;
     let mut detection = Detection::default();
     for change in &session.changes.files {
+        let paths = [change.old_path.as_deref(), change.new_path.as_deref()];
+        if paths
+            .into_iter()
+            .flatten()
+            .any(|p| is_linked_lockfile(runners, p))
+        {
+            detection.lockfiles.push(change.path().to_string());
+        }
         if change.status == FileStatus::Deleted {
             continue;
         }
@@ -289,6 +299,21 @@ pub fn detect(session: &Session, runners: &[Runner]) -> anyhow::Result<Detection
         }
     }
     Ok(detection)
+}
+
+/// Whether `path` pins the dependencies in a dir that worktrees link from the checkout.
+/// Base then runs with head's dependencies, so a change to it can skew results on base.
+/// Cargo runners link nothing, so base builds from its own Cargo.lock.
+fn is_linked_lockfile(runners: &[Runner], path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let lockfile = matches!(
+        name,
+        "uv.lock" | "poetry.lock" | "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock"
+    ) || (name.starts_with("requirements") && name.ends_with(".txt"));
+    lockfile
+        && runners
+            .iter()
+            .any(|r| !r.config.deps.is_empty() && under(path, &r.config.cwd))
 }
 
 struct ChangedTests {
@@ -396,6 +421,40 @@ mod tests {
             .map(Runner::new)
             .collect();
         Classifier::new(&runners).unwrap()
+    }
+
+    #[test]
+    fn lockfiles_count_only_under_a_runner_that_links_dependency_dirs() {
+        let runners: Vec<Runner> = Config::parse(
+            r#"
+            [[runner]]
+            kind = "pytest"
+            cwd = "api"
+            command = ["python", "-m", "pytest"]
+
+            [[runner]]
+            kind = "cargo"
+            command = ["cargo", "test"]
+            "#,
+        )
+        .unwrap()
+        .runners
+        .into_iter()
+        .map(Runner::new)
+        .collect();
+        for path in [
+            "api/uv.lock",
+            "api/requirements-dev.txt",
+            "api/pkg/poetry.lock",
+            "api/package-lock.json",
+            "api/pnpm-lock.yaml",
+            "api/yarn.lock",
+        ] {
+            assert!(is_linked_lockfile(&runners, path), "{path}");
+        }
+        for path in ["uv.lock", "Cargo.lock", "api/Cargo.lock", "api/notes.txt"] {
+            assert!(!is_linked_lockfile(&runners, path), "{path}");
+        }
     }
 
     #[test]

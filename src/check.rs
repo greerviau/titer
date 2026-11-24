@@ -77,6 +77,13 @@ pub fn run(cwd: &Path, options: &CheckOptions) -> anyhow::Result<Report> {
     if ctx.wants(Tier::Prove) || ctx.wants(Tier::Mutate) {
         report.warnings.extend(ctx.detection.warnings.clone());
     }
+    // Only prove runs base, and base's worktree links head's dependency dirs.
+    if ctx.wants(Tier::Prove) && !ctx.detection.lockfiles.is_empty() {
+        report.warnings.push(format!(
+            "the change edits {}, but base runs with head's dependencies, so verdicts on base may be wrong",
+            ctx.detection.lockfiles.join(", ")
+        ));
+    }
     report
         .warnings
         .extend(crate::init::stamp_warning(ctx.session.git.root()));
