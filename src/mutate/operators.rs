@@ -96,14 +96,15 @@ const LOG_METHODS: &[&str] = &[
 impl CallFilter {
     /// Logging calls and configured callees are never removed.
     pub fn skips(&self, callee: &str) -> bool {
-        let dotted = dotted(callee.trim());
-        let callee = dotted.as_str();
+        let raw = callee.trim();
+        let dotted = dotted(raw);
+        let callee = dotted.as_deref().unwrap_or(raw);
         let root = callee
+            .trim_start_matches("self.")
+            .trim_start_matches("this.")
             .split(['.', '(', '['])
             .next()
-            .unwrap_or(callee)
-            .trim_start_matches("self.")
-            .trim_start_matches("this.");
+            .unwrap_or(callee);
         let last = callee.rsplit('.').next().unwrap_or(callee);
         if LOGGER_ROOTS.contains(&root) {
             return true;
@@ -114,47 +115,38 @@ impl CallFilter {
         if receiver_is_logger && LOG_METHODS.contains(&last) {
             return true;
         }
-        self.excluded.iter().any(|e| e == callee || e == last)
+        self.excluded
+            .iter()
+            .any(|e| e == raw || e == callee || e == last)
     }
 }
 
 /// Rewrites string-literal subscripts such as `logger['info']` as `logger.info`, so bracket
-/// notation matches the same logger and method names as dot notation.
-fn dotted(callee: &str) -> String {
+/// notation matches the same logger and method names as dot notation. Returns `None` when
+/// any other subscript remains, because a computed index such as `handlers[labels.login]`
+/// would otherwise put arbitrary text into the receiver that the logger check reads.
+fn dotted(callee: &str) -> Option<String> {
     let mut out = String::with_capacity(callee.len());
     let mut rest = callee;
     while let Some(open) = rest.find('[') {
         out.push_str(&rest[..open]);
-        let after = &rest[open + 1..];
-        let key = after
+        let after = rest[open + 1..].trim_start();
+        let quote = after
             .chars()
             .next()
-            .filter(|q| matches!(q, '\'' | '"' | '`'))
-            .and_then(|q| {
-                let body = &after[1..];
-                let close = body.find(q)?;
-                let name = &body[..close];
-                let valid =
-                    !name.is_empty() && name.chars().all(|c| c == '_' || c.is_alphanumeric());
-                body[close + 1..]
-                    .strip_prefix(']')
-                    .filter(|_| valid)
-                    .map(|tail| (name, tail))
-            });
-        match key {
-            Some((name, tail)) => {
-                out.push('.');
-                out.push_str(name);
-                rest = tail;
-            }
-            None => {
-                out.push('[');
-                rest = after;
-            }
+            .filter(|q| matches!(q, '\'' | '"' | '`'))?;
+        let body = &after[1..];
+        let close = body.find(quote)?;
+        let name = &body[..close];
+        if name.is_empty() || !name.chars().all(|c| c == '_' || c.is_alphanumeric()) {
+            return None;
         }
+        rest = body[close + 1..].trim_start().strip_prefix(']')?;
+        out.push('.');
+        out.push_str(name);
     }
     out.push_str(rest);
-    out
+    Some(out)
 }
 
 /// Generates mutants for the changed lines of `source`, in source order.
@@ -1189,7 +1181,7 @@ def g():
             summary(&cands),
             vec!["4 RemoveCall this.store['put'](x); -> ;"]
         );
-        let py = "def f():\n    logger[\"warning\"](\"x\")\n    handlers[\"info\"](x)\n";
+        let py = "def f():\n    self.logger[\"warning\"](\"x\")\n    handlers[\"info\"](x)\n";
         let cands = generate(Lang::Python, py, &lines(2..=3), &CallFilter::default(), &[]);
         assert_eq!(
             summary(&cands),
@@ -1215,6 +1207,8 @@ def g():
             "logger[\"warning\"]",
             "self._log[\"debug\"]",
             "this.logger[`warn`]",
+            "this.logger[ \"info\" ]",
+            "this.console[\"log\"]",
         ] {
             assert!(filter.skips(callee), "{callee}");
         }
@@ -1224,8 +1218,13 @@ def g():
             "catalog.error_page",
             "this.store['put']",
             "handlers[\"info\"]",
+            "handlers[labels[\"login\"]][\"info\"]",
         ] {
             assert!(!filter.skips(callee), "{callee}");
         }
+        let bracketed = CallFilter {
+            excluded: vec!["this.store['put']".into()],
+        };
+        assert!(bracketed.skips("this.store['put']"));
     }
 }
