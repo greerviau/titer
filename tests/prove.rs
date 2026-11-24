@@ -82,6 +82,7 @@ fn pytest_repo() -> Fixture {
         ),
     )
     .write("app.py", APP_BASE)
+    .write("uv.lock", "version = 1\n")
     .write(
         "test_app.py",
         "from app import double\n\n\ndef test_double():\n    assert double(1) == 2\n",
@@ -325,6 +326,47 @@ fn two_vitest_tests_on_one_line_are_reported_as_sharing_a_selector() {
         warnings
             .iter()
             .any(|w| w.contains("src/f.test.ts:4") && w.contains("\"a\"") && w.contains("\"b\"")),
+        "{report:#}"
+    );
+}
+
+fn warnings(report: &Value) -> Vec<String> {
+    report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn a_changed_lockfile_warns_that_base_runs_with_heads_dependencies() {
+    let repo = pytest_repo();
+    repo.write("uv.lock", "version = 2\n");
+
+    let output = repo.titer(&["check", "--json", "--only", "prove"]);
+
+    let report = stdout_json(&output);
+    assert_schema_valid(&report);
+    assert!(
+        warnings(&report)
+            .iter()
+            .any(|w| w.contains("uv.lock") && w.contains("base runs with head's dependencies")),
+        "{report:#}"
+    );
+}
+
+#[test]
+fn an_untouched_lockfile_gives_no_dependency_warning() {
+    let repo = pytest_repo();
+
+    let output = repo.titer(&["check", "--json", "--only", "prove"]);
+
+    let report = stdout_json(&output);
+    assert!(
+        !warnings(&report)
+            .iter()
+            .any(|w| w.contains("head's dependencies")),
         "{report:#}"
     );
 }
