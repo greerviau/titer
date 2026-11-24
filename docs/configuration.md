@@ -60,9 +60,9 @@ Add one `[[runner]]` table per test project. A monorepo lists several.
 | `command` | required | The repo's own command prefix. titer appends the runner's selection arguments. |
 | `start_dir` | none | unittest only: the top-level dir that dotted ids are relative to. |
 | `test_globs` | per kind | Files that contain tests. |
-| `support_globs` | per kind | Other test-only files, such as fixtures and helpers. titer copies them onto base with the tests and never mutates them. |
+| `support_globs` | per kind | Other test-only files, such as fixtures and helpers. titer copies them onto base with the tests and never mutates them. Setting the key replaces the defaults. `init` writes the defaults plus the test helpers they miss, such as vitest `setupFiles`. |
 | `deps` | per kind | Ignored dependency dirs that titer links from the checkout into each worktree. |
-| `env` | `{}` | Extra environment variables for the command. |
+| `env` | `{}` | Extra environment variables for the command. Copy here any variable that the repo's own test script sets and the suite needs; `init` lists the test scripts it finds. |
 
 Defaults per kind:
 

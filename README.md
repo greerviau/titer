@@ -48,7 +48,7 @@ uv run titer init    # uv
 
 `init` detects your test runners and writes these files:
 
-- `titer.toml`, with one `[[runner]]` per project. A monorepo gets several. It excludes tool configs such as `vite.config.ts` from mutation, and `init` names any `scripts/` or `tools/` dir you may want to exclude too.
+- `titer.toml`, with one `[[runner]]` per project. A monorepo gets several. It excludes tool configs such as `vite.config.ts` from mutation and adds test helpers outside the default globs, such as vitest setup files and a `testing.ts` that only tests import, to `support_globs`. `init` also names any `scripts/` or `tools/` dir you may want to exclude, and the repo's test scripts, whose environment variables you may need to copy into `env`.
 - A pinned dev dependency in `package.json` or `pyproject.toml`.
 - A repo skill in `.agents/skills/titer/SKILL.md` and `.claude/skills/titer/SKILL.md`. It tells agents when to run titer, how to read the report, and never to weaken a test to make it pass.
 

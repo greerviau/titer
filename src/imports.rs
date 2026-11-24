@@ -366,7 +366,7 @@ fn typescript(file: &str, root: Node, source: &str, trees: &Trees) -> Vec<Missin
             continue;
         };
         let spec = crate::lang::ts::title(spec_node, source);
-        let Some(path) = resolve_ts(&spec, &dir, trees) else {
+        let Some(path) = resolve_ts(&spec, &dir, trees.head, trees.aliases) else {
             continue;
         };
         if !trees.base.contains(&path) {
@@ -517,7 +517,8 @@ fn is_mocked(root: Node, source: &str, spec: &str, path: &str, dir: &str, trees:
         match first {
             Some(arg) if arg.kind() == "string" => {
                 let target = crate::lang::ts::title(arg, source);
-                target == spec || resolve_ts(&target, dir, trees).as_deref() == Some(path)
+                target == spec
+                    || resolve_ts(&target, dir, trees.head, trees.aliases).as_deref() == Some(path)
             }
             _ => true,
         }
@@ -1347,12 +1348,17 @@ fn collect_ts_identifiers(node: Node, source: &str, out: &mut HashSet<String>) {
     }
 }
 
-fn resolve_ts(spec: &str, dir: &str, trees: &Trees) -> Option<String> {
+fn resolve_ts(
+    spec: &str,
+    dir: &str,
+    files: &HashSet<String>,
+    aliases: &[(String, Vec<String>)],
+) -> Option<String> {
     let mut bases: Vec<String> = Vec::new();
     if spec.starts_with("./") || spec.starts_with("../") || spec == "." || spec == ".." {
         bases.push(normalize(&join(dir, spec)));
     } else {
-        for (prefix, targets) in trees.aliases {
+        for (prefix, targets) in aliases {
             if let Some(rest) = spec.strip_prefix(prefix.as_str()) {
                 for target in targets {
                     bases.push(normalize(&format!("{target}{rest}")));
@@ -1373,7 +1379,7 @@ fn resolve_ts(spec: &str, dir: &str, trees: &Trees) -> Option<String> {
         for ext in TS_EXTENSIONS {
             candidates.push(format!("{base}/index.{ext}"));
         }
-        if let Some(found) = candidates.into_iter().find(|c| trees.head.contains(c)) {
+        if let Some(found) = candidates.into_iter().find(|c| files.contains(c)) {
             return Some(found);
         }
     }
@@ -1426,6 +1432,115 @@ pub fn ts_aliases(cwd: &str, read: &dyn Fn(&str) -> Option<String>) -> Vec<(Stri
         }
     }
     out.into_iter().collect()
+}
+
+// ---------------------------------------------------------------------------------------
+// Import graph
+
+/// What one file imports.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct FileImports {
+    /// Repo-relative files in `files` that the imports resolve to.
+    pub local: Vec<String>,
+    /// The specifiers of imports that resolve to no file, such as packages.
+    pub external: Vec<String>,
+}
+
+/// Every module that `file` imports, resolved the way the static import check resolves
+/// them. A TypeScript file's top-level imports and re-exports count, type-only ones too;
+/// a Python file's imports count at any depth, so a guarded or lazy import still counts.
+pub fn file_imports(
+    runner: &RunnerConfig,
+    file: &str,
+    source: &str,
+    files: &HashSet<String>,
+    aliases: &[(String, Vec<String>)],
+) -> FileImports {
+    let mut out = FileImports::default();
+    let Some(lang) = Lang::of(file) else {
+        return out;
+    };
+    let Some(tree) = lang.parse(source) else {
+        return out;
+    };
+    let dir = parent(file);
+    let mut add = |resolved: Option<String>, spec: &str| match resolved {
+        Some(path) => out.local.push(path),
+        None => out.external.push(spec.to_string()),
+    };
+    match lang {
+        Lang::TypeScript | Lang::Tsx => {
+            for node in children(tree.root_node()) {
+                if !matches!(node.kind(), "import_statement" | "export_statement") {
+                    continue;
+                }
+                let Some(spec_node) = node.child_by_field_name("source") else {
+                    continue;
+                };
+                let spec = crate::lang::ts::title(spec_node, source);
+                add(resolve_ts(&spec, &dir, files, aliases), &spec);
+            }
+        }
+        Lang::Python => {
+            let cwd = if runner.cwd == "." {
+                ""
+            } else {
+                runner.cwd.as_str()
+            };
+            let mut roots = vec![cwd.to_string(), join(cwd, "src"), dir.clone()];
+            if runner.kind == RunnerKind::Unittest {
+                roots.insert(1, join(cwd, &runner.start_dir));
+            }
+            for node in descendants(tree.root_node()) {
+                match node.kind() {
+                    "import_from_statement" => {
+                        let Some(module_node) = node.child_by_field_name("module_name") else {
+                            continue;
+                        };
+                        let module = text(module_node, source);
+                        let resolved = if module_node.kind() == "relative_import" {
+                            resolve_relative_py(module, &dir, files)
+                        } else {
+                            resolve_py(module, &roots, files)
+                        };
+                        let package_dir = resolved.as_ref().and_then(|(_, d)| d.clone());
+                        add(resolved.map(|(path, _)| path), module);
+                        // `from pkg import mod` imports the submodule file too.
+                        let Some(package_dir) = package_dir else {
+                            continue;
+                        };
+                        let mut cursor = node.walk();
+                        for name_node in node.children_by_field_name("name", &mut cursor) {
+                            let (name, _) = imported_name(name_node, source);
+                            let base = join(&package_dir, &name);
+                            let found = [format!("{base}.py"), join(&base, "__init__.py")]
+                                .into_iter()
+                                .find(|p| files.contains(p));
+                            if let Some(path) = found {
+                                add(Some(path), "");
+                            }
+                        }
+                    }
+                    "import_statement" => {
+                        let mut cursor = node.walk();
+                        for name_node in node.children_by_field_name("name", &mut cursor) {
+                            let dotted = match name_node.kind() {
+                                "aliased_import" => name_node
+                                    .child_by_field_name("name")
+                                    .map(|n| text(n, source))
+                                    .unwrap_or_default(),
+                                _ => text(name_node, source),
+                            };
+                            add(resolve_py(dotted, &roots, files).map(|(p, _)| p), dotted);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Lang::Rust => {}
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------------------

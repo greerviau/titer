@@ -8,7 +8,7 @@ titer init [--dry-run] [--update]
 
 `init` opts a repo in. It detects the repo's runners and writes:
 
-- `titer.toml`, with one `[[runner]]` per project
+- `titer.toml`, with one `[[runner]]` per project. A runner's `support_globs` gets the kind's defaults plus the test helpers that they miss: vitest `setupFiles` and `globalSetup` files, and any file that test paths import, that no other file imports, and that imports a test framework or has a helper name such as `testing`, `mocks`, or `fixtures`
 - a pinned dev dependency: `@greerviau/titer` in `package.json`, or `titer` in `pyproject.toml`
 - the repo skill in `.agents/skills/titer/SKILL.md` (Codex, Cursor, OpenCode) and `.claude/skills/titer/SKILL.md` (Claude Code)
 
@@ -16,6 +16,8 @@ titer init [--dry-run] [--update]
 |---|---|
 | `--dry-run` | Prints the config and the file list without writing. |
 | `--update` | Rewrites the repo skill and the pin for the installed titer version. |
+
+`init` prints what it could not decide for you. It lists the test helpers it added, the `scripts/` or `tools/` dirs you may want to exclude from mutation, and the test scripts it found (`package.json`'s `test` script and `scripts/test*.sh`). titer runs the runner's `command`, not those scripts, so copy any environment variable they set that the suite needs into the runner's `env`.
 
 You can run `init` before you install titer:
 

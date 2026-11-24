@@ -632,3 +632,124 @@ fn init_refuses_a_file_on_the_skill_path_and_a_git_dir_at_the_skill_dir() {
     assert!(String::from_utf8_lossy(&into_git.stderr).contains("git's files"));
     assert!(!repo.path().join(".claude/skills/titer").exists());
 }
+
+/// A vitest package whose test helper and setup file sit beside the source, outside the
+/// default support globs.
+fn web_with_helpers() -> Fixture {
+    let repo = Fixture::new();
+    repo.write(".gitignore", "node_modules\n")
+        .write("web/package.json", "{\n  \"name\": \"web\",\n  \"type\": \"module\",\n  \"scripts\": {\n    \"test\": \"DOTENV_CONFIG_QUIET=1 vitest run\"\n  },\n  \"devDependencies\": {\n    \"vitest\": \"5.1.0\"\n  }\n}\n")
+        .write("web/vitest.config.ts", "import { defineConfig } from \"vitest/config\";\n\nexport default defineConfig({\n  test: { setupFiles: [\"./src/setup.ts\"] },\n});\n")
+        .write("web/src/setup.ts", "globalThis.READY = true;\n")
+        .write("web/src/testing.ts", "import { vi } from \"vitest\";\nimport { half } from \"./half\";\n\nexport const spyHalf = () => vi.fn(half);\n")
+        .write("web/src/half.ts", "export const half = (x: number) => x / 2;\n")
+        .write("web/src/main.ts", "import { half } from \"./half\";\n\nexport const quarter = (x: number) => half(half(x));\n")
+        .write("web/src/half.test.ts", "import { it, expect } from \"vitest\";\nimport { half } from \"./half\";\nimport { spyHalf } from \"./testing\";\n\nit(\"halves\", () => {\n  expect(half(4)).toBe(2);\n  expect(spyHalf()(2)).toBe(1);\n});\n")
+        .write("web/src/main.test.ts", "import { it, expect } from \"vitest\";\nimport { quarter } from \"./main\";\n\nit(\"quarters\", () => {\n  expect(quarter(8)).toBe(2);\n});\n")
+        .write("scripts/test-web.sh", "#!/bin/sh\ncd web && DOTENV_CONFIG_QUIET=1 npx vitest run\n");
+    std::os::unix::fs::symlink(fixture_node_modules(), repo.path().join("web/node_modules"))
+        .unwrap();
+    repo.commit_all("base");
+    repo
+}
+
+fn support_globs(repo: &Fixture) -> Vec<String> {
+    let text = std::fs::read_to_string(repo.path().join("titer.toml")).unwrap();
+    let config: toml::Table = text.parse().unwrap();
+    config["runner"][0]["support_globs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{text}"))
+        .iter()
+        .map(|g| g.as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn init_adds_test_helpers_and_setup_files_to_support_globs() {
+    let repo = web_with_helpers();
+
+    let init = repo.titer(&["init"]);
+
+    assert_eq!(
+        init.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let globs = support_globs(&repo);
+    assert!(globs.contains(&"src/testing.ts".to_string()), "{globs:?}");
+    assert!(globs.contains(&"src/setup.ts".to_string()), "{globs:?}");
+    // The defaults stay, and a module only the tests import is still source.
+    assert!(globs.contains(&"**/__mocks__/**".to_string()), "{globs:?}");
+    assert!(
+        !globs
+            .iter()
+            .any(|g| g.contains("half") || g.contains("main")),
+        "{globs:?}"
+    );
+
+    // A change to the helper is a test path: titer copies it and never mutates it.
+    repo.commit_all("opt in to titer");
+    repo.git(&["checkout", "-q", "-b", "change"]);
+    repo.write("web/src/testing.ts", "import { vi } from \"vitest\";\nimport { half } from \"./half\";\n\nexport const spyHalf = () => vi.fn((x: number) => half(x) + 0);\n")
+        .write("web/src/half.ts", "export const half = (x: number) => x * 0.5;\n");
+    let check = repo.titer(&["check", "--json", "--only", "mutate"]);
+    let report = stdout_json(&check);
+    assert_ne!(report["gate"]["status"], "error", "{report:#}");
+    let files: Vec<&str> = report["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["file"].as_str().unwrap())
+        .collect();
+    assert!(!files.is_empty(), "{report:#}");
+    assert!(files.iter().all(|f| *f == "web/src/half.ts"), "{report:#}");
+}
+
+#[test]
+fn init_lists_the_test_scripts_it_found_so_their_env_can_be_copied() {
+    let repo = web_with_helpers();
+
+    let init = repo.titer(&["init", "--dry-run"]);
+
+    let stdout = String::from_utf8_lossy(&init.stdout);
+    assert_eq!(init.status.code(), Some(0), "{stdout}");
+    let note = stdout
+        .lines()
+        .find(|l| l.contains("test scripts"))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(
+        note.contains("web/package.json") && note.contains("DOTENV_CONFIG_QUIET=1 vitest run"),
+        "{note}"
+    );
+    assert!(note.contains("scripts/test-web.sh"), "{note}");
+    assert!(note.contains("env"), "{note}");
+}
+
+#[test]
+fn init_adds_a_python_test_helper_outside_tests_to_support_globs() {
+    let repo = Fixture::new();
+    repo.write("pyproject.toml", "[project]\nname = \"api\"\nversion = \"0.1.0\"\n\n[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n")
+        .write("src/api/__init__.py", "")
+        .write("src/api/app.py", "def double(x):\n    return x * 2\n")
+        .write("src/api/cli.py", "from api.app import double\n\n\ndef main():\n    print(double(2))\n")
+        .write("src/api/testing.py", "import pytest\n\nfrom api.app import double\n\n\n@pytest.fixture\ndef doubler():\n    return double\n")
+        .write("tests/test_app.py", "from api.app import double\nfrom api.testing import doubler\n\n\ndef test_double():\n    assert double(2) == 4\n");
+    repo.commit_all("base");
+
+    let init = repo.titer(&["init"]);
+
+    assert_eq!(
+        init.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let globs = support_globs(&repo);
+    assert!(
+        globs.contains(&"src/api/testing.py".to_string()),
+        "{globs:?}"
+    );
+    assert!(globs.contains(&"**/conftest.py".to_string()), "{globs:?}");
+    assert!(!globs.iter().any(|g| g.contains("app.py")), "{globs:?}");
+}
