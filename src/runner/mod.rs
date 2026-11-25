@@ -141,19 +141,7 @@ impl TestRun {
             return CaseResult::Skipped;
         }
         let rel = cwd_relative(&case.file, cwd);
-        // A reported line (vitest) identifies the test by itself, which also covers `.each`
-        // tables whose titles are formatted at run time and tests that share a full name.
-        let matched: Vec<&TestOutcome> = self
-            .outcomes
-            .iter()
-            .filter(|o| match (&o.id, o.line) {
-                (Some(id), _) => id == &case.id,
-                (None, Some(line)) => line == case.line && same_file(&o.file, &rel),
-                (None, None) => {
-                    o.name == case.name && o.suite == case.suite && same_file(&o.file, &rel)
-                }
-            })
-            .collect();
+        let matched = self.outcomes_for(case, cwd);
         if let Some(failure) = matched.iter().find_map(|o| match &o.status {
             Status::Failed(f) => Some(f),
             _ => None,
@@ -170,6 +158,26 @@ impl TestRun {
             return CaseResult::Failed(error.failure.clone());
         }
         CaseResult::NotRun
+    }
+}
+
+impl TestRun {
+    /// The reported outcomes of one selected test: one per parameter of a parametrized
+    /// test.
+    pub fn outcomes_for(&self, case: &TestCase, cwd: &str) -> Vec<&TestOutcome> {
+        let rel = cwd_relative(&case.file, cwd);
+        // A reported line (vitest) identifies the test by itself, which also covers `.each`
+        // tables whose titles are formatted at run time and tests that share a full name.
+        self.outcomes
+            .iter()
+            .filter(|o| match (&o.id, o.line) {
+                (Some(id), _) => id == &case.id,
+                (None, Some(line)) => line == case.line && same_file(&o.file, &rel),
+                (None, None) => {
+                    o.name == case.name && o.suite == case.suite && same_file(&o.file, &rel)
+                }
+            })
+            .collect()
     }
 }
 
@@ -245,17 +253,24 @@ impl Runner {
 
     /// The repo's command, run in the runner's cwd inside the worktree, with `args` appended.
     pub(crate) fn command(&self, worktree: &Path, args: &[String]) -> Command {
+        let mut cmd = self.program(worktree, &self.config.command);
+        cmd.args(args);
+        cmd
+    }
+
+    /// `argv` run the way the repo's command runs: in the runner's cwd inside the worktree,
+    /// with the runner's environment.
+    pub(crate) fn program(&self, worktree: &Path, argv: &[String]) -> Command {
         // A relative program with a slash, such as `.venv/bin/python`, is relative to the
         // runner's cwd in the worktree.
-        let program = Path::new(&self.config.command[0]);
+        let program = Path::new(&argv[0]);
         let program = if program.is_relative() && program.components().count() > 1 {
             self.cwd_in(worktree).join(program)
         } else {
             program.to_path_buf()
         };
         let mut cmd = Command::new(program);
-        cmd.args(&self.config.command[1..])
-            .args(args)
+        cmd.args(&argv[1..])
             .current_dir(self.cwd_in(worktree))
             // Runners must not cache bytecode: a mutant and its original can share a size
             // and an mtime second, and a stale .pyc would run the wrong code.

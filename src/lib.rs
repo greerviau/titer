@@ -3,6 +3,7 @@
 pub mod check;
 pub mod cli;
 pub mod config;
+pub mod coverage;
 pub mod crap;
 pub mod deadline;
 pub mod detect;

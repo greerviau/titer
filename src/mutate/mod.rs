@@ -12,6 +12,8 @@ use std::time::Duration;
 use anyhow::bail;
 
 use crate::check::Context;
+use crate::config::RunnerKind;
+use crate::coverage::{Collected, Cover, TestCoverage};
 use crate::deadline::Deadline;
 use crate::detect::{self, glob_set};
 use crate::diff::FileChange;
@@ -42,6 +44,8 @@ pub struct RunnerPlan {
     /// How long the selection took on head; mutants time out at 3x this plus 10 s.
     pub head_duration: Duration,
     pub peak_rss: u64,
+    /// Per-test coverage of the plan's tests, when the runner's tooling records it.
+    pub coverage: Option<TestCoverage>,
 }
 
 impl RunnerPlan {
@@ -57,6 +61,8 @@ pub struct Job {
     pub file: String,
     pub original: String,
     pub mutated: String,
+    /// The changed tests that coverage shows run the mutant's code. None runs the plan.
+    pub tests: Option<Vec<TestCase>>,
 }
 
 /// The outcome of one job.
@@ -100,6 +106,7 @@ pub fn plan(
                     },
                     head_duration: h.run.duration,
                     peak_rss: h.run.max_rss_bytes,
+                    coverage: None,
                 },
             );
             continue;
@@ -143,6 +150,7 @@ pub fn plan(
                 },
                 head_duration: run.duration,
                 peak_rss: run.max_rss_bytes,
+                coverage: None,
             },
         );
     }
@@ -197,6 +205,7 @@ pub fn generate(ctx: &Context) -> anyhow::Result<Vec<(Mutant, Job)>> {
                     file: source.file.clone(),
                     original: text.clone(),
                     mutated,
+                    tests: None,
                 },
             ));
         }
@@ -413,7 +422,9 @@ fn run_job(
     deadline: Deadline,
 ) -> (JobResult, bool) {
     let runner = &ctx.runners[job.runner];
-    let selection = match &plan.plan {
+    let covering = job.tests.clone().map(Plan::Tests);
+    let tests = covering.as_ref().unwrap_or(&plan.plan);
+    let selection = match tests {
         Plan::Tests(cases) => Selection::Tests(cases),
         Plan::Files(files) => Selection::Files(files),
         Plan::Suite => Selection::Suite,
@@ -453,7 +464,7 @@ fn run_job(
         Ok(run) => run,
         Err(e) => return (error_result(e), true),
     };
-    let (outcome, killed_by) = classify(&run, &plan.plan, &runner.config.cwd);
+    let (outcome, killed_by) = classify(&run, tests, &runner.config.cwd);
     let result = JobResult {
         outcome,
         killed_by,
@@ -587,6 +598,7 @@ pub fn canaries(
                 original,
                 marker,
             ),
+            tests: None,
         })
         .collect();
     if jobs.is_empty() {
@@ -651,7 +663,7 @@ pub fn run(
     let mut warnings = Vec::new();
     let mut pairs = generate(ctx)?;
     pairs.extend(extra);
-    let pairs = operators::budget_order(pairs, |(m, _)| (m.file.clone(), m.line));
+    let mut pairs = operators::budget_order(pairs, |(m, _)| (m.file.clone(), m.line));
     if pairs.is_empty() {
         // Still confirm that head is green where the suite stands in for changed tests.
         let runners: Vec<usize> = ctx.detection.sources.iter().map(|s| s.runner).collect();
@@ -663,7 +675,7 @@ pub fn run(
         });
     }
     let runners: Vec<usize> = pairs.iter().map(|(_, j)| j.runner).collect();
-    let plans = plan(ctx, heads, &head, &runners)?;
+    let mut plans = plan(ctx, heads, &head, &runners)?;
     let peak = plans.values().map(|p| p.peak_rss).max().unwrap_or(0);
     let workers = ctx
         .options
@@ -686,6 +698,8 @@ pub fn run(
             modules.push((job.runner, job.file.clone(), job.original.clone()));
         }
     }
+    let deadline = ctx.deadline();
+    collect_coverage(ctx, heads, &worktrees, &mut plans, deadline, &mut warnings);
     let canaries = canaries(ctx, &worktrees, &plans, &modules)?;
     let unloaded = canaries.unloaded;
     if !unloaded.is_empty() {
@@ -696,11 +710,20 @@ pub fn run(
     }
 
     // Mutants of a module whose canary did not run keep their not-run outcome.
-    let (to_run, skipped): (Vec<usize>, Vec<usize>) = (0..pairs.len())
+    let (loaded, skipped): (Vec<usize>, Vec<usize>) = (0..pairs.len())
         .filter(|i| !canaries.not_run.contains(&pairs[*i].1.file))
         .partition(|i| !unloaded.contains(&pairs[*i].1.file));
+    // Coverage that names the tests that run a mutant's code narrows its run to them.
+    // A mutant whose code the changed tests never run still runs every changed test: a
+    // process that coverage missed, or an edit that changes how unexecuted code compiles,
+    // such as removing a `yield`, can still kill it.
+    let covers: Vec<Cover> = pairs.iter().map(|(m, j)| cover_of(&plans, m, j)).collect();
+    let to_run = loaded;
+    for i in &to_run {
+        pairs[*i].1.tests = narrowed(&plans, &pairs[*i].1, &covers[*i]);
+    }
+    validate_narrowed(ctx, &worktrees, &plans, &mut pairs, &to_run, deadline);
     let jobs: Vec<Job> = to_run.iter().map(|i| pairs[*i].1.clone()).collect();
-    let deadline = ctx.deadline();
     let results = run_jobs(ctx, &worktrees, &plans, &jobs, deadline);
     let mut mutants: Vec<Mutant> = pairs.iter().map(|(m, _)| m.clone()).collect();
     for (i, result) in to_run.iter().zip(results) {
@@ -709,14 +732,58 @@ pub fn run(
         m.killed_by = result.killed_by;
         m.duration_ms = result.duration.map(|d| d.as_millis() as u64);
     }
+    // A narrowed run that kills nothing, or times out, may have left out a test that kills
+    // the mutant, for example one whose effect on shared state the coverage does not show,
+    // so it runs again with every changed test.
+    let confirm: Vec<usize> = to_run
+        .iter()
+        .copied()
+        .filter(|i| {
+            pairs[*i].1.tests.is_some()
+                && matches!(
+                    mutants[*i].outcome,
+                    MutantOutcome::Survived | MutantOutcome::NoResult | MutantOutcome::TimedOut
+                )
+        })
+        .collect();
+    let jobs: Vec<Job> = confirm
+        .iter()
+        .map(|i| Job {
+            tests: None,
+            ..pairs[*i].1.clone()
+        })
+        .collect();
+    for (i, result) in confirm
+        .iter()
+        .zip(run_jobs(ctx, &worktrees, &plans, &jobs, deadline))
+    {
+        // A confirmation the budget did not reach leaves the mutant not run, since the
+        // narrowed run alone cannot show that it survives.
+        let m = &mut mutants[*i];
+        m.outcome = result.outcome;
+        m.killed_by = result.killed_by;
+        m.duration_ms = result.duration.map(|d| d.as_millis() as u64);
+    }
     for i in skipped {
         mutants[i].outcome = MutantOutcome::NotExecuted;
+    }
+    // A survivor that the changed tests never run is not executed. Where a sentinel could
+    // not probe its line, it first reruns against the whole changed test files, as it would
+    // without coverage, so a kill there is still caught by other tests.
+    for (i, m) in mutants.iter_mut().enumerate() {
+        if m.outcome == MutantOutcome::Survived
+            && covers[i] == Cover::NotRun
+            && probeable(&pairs[i].1, m)
+        {
+            m.outcome = MutantOutcome::NotExecuted;
+        }
     }
     follow_up(
         ctx,
         &worktrees,
         &plans,
         &pairs,
+        &covers,
         &mut mutants,
         deadline,
         &mut warnings,
@@ -736,17 +803,173 @@ pub fn run(
     })
 }
 
+/// What the runner's coverage says about a mutant's code. An agent edit can change code
+/// past where it starts, so coverage cannot speak for it.
+fn cover_of(plans: &BTreeMap<usize, RunnerPlan>, mutant: &Mutant, job: &Job) -> Cover {
+    let plan = &plans[&job.runner];
+    let (Plan::Tests(_), Some(coverage)) = (&plan.plan, &plan.coverage) else {
+        return Cover::Unknown;
+    };
+    if mutant.source == MutantSource::Agent {
+        return Cover::Unknown;
+    }
+    let column = edit_column(&job.original, &job.mutated, mutant.line);
+    coverage.cover(&job.file, mutant.line, column, mutant.end_line)
+}
+
+/// The plan's tests that coverage names as running the mutant's code, when they are fewer
+/// than the plan's.
+fn narrowed(
+    plans: &BTreeMap<usize, RunnerPlan>,
+    job: &Job,
+    cover: &Cover,
+) -> Option<Vec<TestCase>> {
+    let (Plan::Tests(cases), Cover::Ran(Some(ids))) = (&plans[&job.runner].plan, cover) else {
+        return None;
+    };
+    let tests: Vec<TestCase> = cases
+        .iter()
+        .filter(|c| ids.contains(&c.id))
+        .cloned()
+        .collect();
+    // A covering test outside the plan, such as one skipped on head, leaves the data unsure.
+    (tests.len() == ids.len() && tests.len() < cases.len()).then_some(tests)
+}
+
+/// Runs each distinct narrowed selection once on unmutated head. A selection that is not
+/// green there, for example because a test needs state that a left-out test module sets,
+/// cannot kill anything, so its mutants run every changed test instead.
+fn validate_narrowed(
+    ctx: &Context,
+    workers: &[Worktree],
+    plans: &BTreeMap<usize, RunnerPlan>,
+    pairs: &mut [(Mutant, Job)],
+    to_run: &[usize],
+    deadline: Deadline,
+) {
+    let mut selections: Vec<(usize, Vec<TestCase>)> = Vec::new();
+    let mut jobs = Vec::new();
+    for i in to_run {
+        let job = &pairs[*i].1;
+        let Some(tests) = &job.tests else { continue };
+        if selections
+            .iter()
+            .any(|(r, t)| *r == job.runner && t == tests)
+        {
+            continue;
+        }
+        selections.push((job.runner, tests.clone()));
+        jobs.push(Job {
+            mutated: job.original.clone(),
+            ..job.clone()
+        });
+    }
+    let results = run_jobs(ctx, workers, plans, &jobs, deadline);
+    for ((runner, tests), result) in selections.iter().zip(results) {
+        if result.outcome == MutantOutcome::Survived {
+            continue;
+        }
+        for i in to_run {
+            let job = &mut pairs[*i].1;
+            if job.runner == *runner && job.tests.as_ref() == Some(tests) {
+                job.tests = None;
+            }
+        }
+    }
+}
+
+/// The 0-based UTF-16 column on `line` where `mutated` first differs from `original`, as
+/// istanbul counts columns. 0 when the edit starts on another line.
+fn edit_column(original: &str, mutated: &str, line: u32) -> u32 {
+    let at = original
+        .bytes()
+        .zip(mutated.bytes())
+        .position(|(a, b)| a != b)
+        .unwrap_or(original.len().min(mutated.len()));
+    let mut at = at;
+    while !original.is_char_boundary(at) {
+        at -= 1;
+    }
+    let before = &original[..at];
+    let start = before.rfind('\n').map_or(0, |i| i + 1);
+    if before.matches('\n').count() as u32 + 1 != line {
+        return 0;
+    }
+    before[start..].encode_utf16().count() as u32
+}
+
+/// Whether a sentinel can probe the mutant's line.
+fn probeable(job: &Job, mutant: &Mutant) -> bool {
+    mutant.end_line == mutant.line
+        && Lang::of(&job.file)
+            .and_then(|lang| operators::sentinel(lang, &job.original, mutant.line))
+            .is_some()
+}
+
+/// Collects coverage for runners whose mutants run changed tests. The head run stays
+/// uninstrumented and decides which tests are green; coverage comes from runs of its own.
+fn collect_coverage(
+    ctx: &Context,
+    heads: &[HeadRun],
+    worktrees: &[Worktree],
+    plans: &mut BTreeMap<usize, RunnerPlan>,
+    deadline: Deadline,
+    warnings: &mut Vec<String>,
+) {
+    let paths: Vec<PathBuf> = worktrees.iter().map(|w| w.path.clone()).collect();
+    for (runner, plan) in plans.iter_mut() {
+        let r = &ctx.runners[*runner];
+        let Plan::Tests(cases) = &plan.plan else {
+            continue;
+        };
+        let dir = ctx.session.run_dir.join(&format!("coverage-{runner}"));
+        let budget = crate::coverage::Budget {
+            deadline,
+            expected: plan.head_duration,
+            timeout: plan.timeout(),
+        };
+        let collected = match r.config.kind {
+            RunnerKind::Pytest | RunnerKind::Unittest => {
+                match heads.iter().find(|h| h.runner == *runner) {
+                    Some(h) => crate::coverage::collect_python(
+                        r,
+                        &worktrees[0].path,
+                        &dir,
+                        cases,
+                        &h.run,
+                        budget,
+                    ),
+                    None => Collected::Missing,
+                }
+            }
+            RunnerKind::Vitest
+                if crate::coverage::vitest_provider_installed(r, &worktrees[0].path) =>
+            {
+                crate::coverage::collect_vitest(r, &paths, &dir, cases, budget, warnings)
+            }
+            _ => Collected::Missing,
+        };
+        match collected {
+            Collected::Ready(c) => plan.coverage = Some(c),
+            Collected::Unusable(why) => warnings.push(format!("runner {:?}: {why}", r.name())),
+            Collected::Missing => {}
+        }
+    }
+}
+
 /// Survivor follow-up. First the sentinel: a raise before the statement that encloses each
 /// surviving line, or inside an `elif` or `else if` condition. If the selected tests still
 /// pass, no green selected test runs that line, and its survivors are not executed. Then the
 /// other tests: the remaining survivors run against the whole changed test files, and a kill
 /// there is caught by other tests. A survivor whose sentinel or other-tests run the deadline
 /// does not reach is not run: without that run, titer cannot say what kind of survivor it is.
+#[allow(clippy::too_many_arguments)]
 fn follow_up(
     ctx: &Context,
     workers: &[Worktree],
     plans: &BTreeMap<usize, RunnerPlan>,
     pairs: &[(Mutant, Job)],
+    covers: &[Cover],
     mutants: &mut [Mutant],
     deadline: Deadline,
     warnings: &mut Vec<String>,
@@ -761,7 +984,9 @@ fn follow_up(
     // A sentinel probes one line, so a mutant that spans lines, such as a multi-line agent
     // mutant, skips this step and stays a survivor.
     for i in survivors(mutants) {
-        if mutants[i].end_line != mutants[i].line {
+        // Coverage already showed that the changed tests run a covered mutant's code, and a
+        // sentinel that a test swallows would say otherwise.
+        if mutants[i].end_line != mutants[i].line || covers[i] != Cover::Unknown {
             continue;
         }
         let key = (pairs[i].1.runner, mutants[i].file.clone(), mutants[i].line);
@@ -785,6 +1010,7 @@ fn follow_up(
                 file: file.clone(),
                 original: original.clone(),
                 mutated,
+                tests: None,
             });
             job_lines.push((file.clone(), *line));
         }
@@ -796,11 +1022,12 @@ fn follow_up(
             MutantOutcome::NotRun => MutantOutcome::NotRun,
             _ => continue,
         };
-        for m in mutants.iter_mut() {
+        for (m, cover) in mutants.iter_mut().zip(covers) {
             if &m.file == file
                 && m.line == *line
                 && m.end_line == *line
                 && m.outcome == MutantOutcome::Survived
+                && *cover == Cover::Unknown
             {
                 if outcome == MutantOutcome::NotRun {
                     not_run(m);
@@ -874,6 +1101,7 @@ fn follow_up(
                 plan: Plan::Files(files),
                 head_duration: head.duration,
                 peak_rss: head.max_rss_bytes,
+                coverage: None,
             },
         );
     }
@@ -881,7 +1109,13 @@ fn follow_up(
         .into_iter()
         .filter(|i| file_plans.contains_key(&pairs[*i].1.runner))
         .collect();
-    let jobs: Vec<Job> = rerun.iter().map(|i| pairs[*i].1.clone()).collect();
+    let jobs: Vec<Job> = rerun
+        .iter()
+        .map(|i| Job {
+            tests: None,
+            ..pairs[*i].1.clone()
+        })
+        .collect();
     let results = run_jobs(ctx, workers, &file_plans, &jobs, deadline);
     for (i, result) in rerun.iter().zip(results) {
         match result.outcome {
@@ -891,6 +1125,11 @@ fn follow_up(
             }
             MutantOutcome::NotRun => not_run(&mut mutants[*i]),
             _ => {}
+        }
+    }
+    for (m, cover) in mutants.iter_mut().zip(covers) {
+        if m.outcome == MutantOutcome::Survived && *cover == Cover::NotRun {
+            m.outcome = MutantOutcome::NotExecuted;
         }
     }
     Ok(())
@@ -988,6 +1227,18 @@ mod tests {
                 "{head}: {got:?}"
             );
         }
+    }
+
+    #[test]
+    fn edit_columns_count_utf16_units_from_the_line_start() {
+        assert_eq!(edit_column("a\n  x > 1\n", "a\n  x >= 1\n", 2), 5);
+        assert_eq!(
+            edit_column("\u{00e9} = x > 1\n", "\u{00e9} = x >= 1\n", 1),
+            7
+        );
+        assert_eq!(edit_column("a\nb\n", "a\nc\n", 1), 0);
+        // An astral character is two UTF-16 units.
+        assert_eq!(edit_column("\u{1F600} x > 1\n", "\u{1F600} x >= 1\n", 1), 6);
     }
 
     #[test]

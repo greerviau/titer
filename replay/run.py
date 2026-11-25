@@ -4,8 +4,9 @@
 Usage: replay/run.py TITER_BIN [--work DIR] [--check] [titer check args...]
 
 Each PR runs as `titer check --base MERGE^1` with head at the merge commit, so the diff is
-exactly the PR. pytest 9.2.0 and vitest 5.1.0 are pinned for every commit; both corpora are
-pure libraries whose tests need nothing else. With --check, the run fails when a PR's
+exactly the PR. pytest 9.2.0 with coverage.py 7.17.5, and vitest 5.1.0 with
+@vitest/coverage-v8, are pinned for every commit, so mutants run with per-test coverage;
+both corpora are pure libraries whose tests need nothing else. With --check, the run fails when a PR's
 verdict counts or gate differ from replay/expected.json.
 """
 import argparse, json, os, subprocess, sys, time
@@ -28,12 +29,13 @@ def run(cmd, **kw):
 python = work / "venv/bin/python"
 if not python.exists():
     run(["uv", "venv", "--quiet", "--python", "3.12", str(work / "venv")])
-run(["uv", "pip", "install", "--quiet", "--python", str(python), "pytest==9.2.0"])
+run(["uv", "pip", "install", "--quiet", "--python", str(python), "pytest==9.2.0", "coverage==7.17.5"])
 node = work / "node"
-if not (node / "node_modules/.bin/vitest").exists():
+if not (node / "node_modules/@vitest/coverage-v8").exists():
     node.mkdir(exist_ok=True)
     (node / "package.json").write_text('{"private": true}\n')
-    run(["npm", "install", "--silent", "--no-audit", "--no-fund", "--prefix", str(node), "vitest@5.1.0"])
+    run(["npm", "install", "--silent", "--no-audit", "--no-fund", "--prefix", str(node), "vitest@5.1.0",
+         "@vitest/coverage-v8@5.1.0"])
 
 for name, repo in corpus["repos"].items():
     clone = work / name

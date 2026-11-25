@@ -202,3 +202,26 @@ pub fn fixture_node_modules() -> PathBuf {
     );
     dir
 }
+
+/// The Python with pytest and coverage.py that `scripts/setup-fixture-deps.sh` installs.
+pub fn fixture_python_with_coverage() -> String {
+    let python = repo_root().join(".fixture-deps/venv-cov/bin/python");
+    assert!(
+        python.exists(),
+        "missing {}; run scripts/setup-fixture-deps.sh",
+        python.display()
+    );
+    python.to_string_lossy().into_owned()
+}
+
+/// The node_modules with vitest and @vitest/coverage-v8 that `scripts/setup-fixture-deps.sh`
+/// installs.
+pub fn fixture_node_modules_with_coverage() -> PathBuf {
+    let dir = repo_root().join(".fixture-deps/node-cov/node_modules");
+    assert!(
+        dir.join("@vitest/coverage-v8").exists(),
+        "missing {}; run scripts/setup-fixture-deps.sh",
+        dir.display()
+    );
+    dir
+}

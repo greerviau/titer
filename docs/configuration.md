@@ -110,3 +110,5 @@ By default the gate fails only on an unproven change. Each key below adds a fail
 | `threshold` | `30` | The CRAP score above which titer flags a function. |
 
 `--coverage FILE` on the command line takes a coverage file directly instead.
+
+These settings feed only the CRAP score. The mutate tier records its own per-test coverage when coverage.py 7.13 or later, or a vitest coverage provider, is installed, and needs no setting. See [how it works](how-it-works.md#mutate).

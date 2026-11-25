@@ -73,13 +73,30 @@ Read the failure message of each proven test and check that it is the behavior t
 
 The head-green changed tests run against each mutant in parallel workers. If the change has no changed tests, the whole suite runs instead.
 
+With per-test coverage, each mutant runs first against only the changed tests that cover its line, and a survivor on a line that no changed test runs is `not_executed` without a sentinel. titer gathers the coverage itself, with the repo's own test command:
+
+- pytest and unittest: when coverage.py 7.13 or later is installed in the environment of the interpreter the runner's command names (or, for `uv run`, its `.venv`), the head-green changed tests run once more with `COVERAGE_PROCESS_START` set, so coverage.py starts in the test process, its subprocesses, and its forked children, and records which test function ran each line. The uninstrumented head run still decides which tests are green. Without coverage.py, titer sets nothing and skips the run. If a changed test, or any of its parameters, has another result under coverage, for example one that checks `sys.gettrace()`, titer warns and mutants run every changed test.
+- vitest: when `@vitest/coverage-v8` or `@vitest/coverage-istanbul` is installed, the head-green changed tests run once more together with `--coverage.enabled`, which shows the code they never run, and each test runs alone, which shows the tests that run each statement and each arm of a ternary or `&&`/`||`/`??` operand. The runs spread across the workers and stop at the budget.
+- cargo: no per-test coverage. Every mutant runs every changed test.
+
+Narrowing assumes that a changed test behaves the same alone as after the other changed tests, as any per-test selection does. Coverage only narrows a selection when it is sure, and a narrowed run decides only a kill:
+
+- A line that ran outside any changed test, such as at import or in a fixture or `setUp`, runs every changed test. So does a vitest statement that the tests reach together but none reaches alone.
+- A line the data does not measure, such as the continuation of a multi-line statement, a multi-line vitest mutant, and an agent mutant run every changed test, as without coverage.
+- A mutant on a line no changed test runs still runs every changed test, since a process coverage missed, or an edit that changes how unexecuted code compiles, such as removing a `yield`, can still kill it. Its survivors are `not_executed`. Where no sentinel could probe the line, they first rerun against the whole changed test files, as without coverage.
+- Each distinct narrowed selection first runs on unmutated head. A selection that is not green there, for example because a test needs state that a left-out test module sets, is dropped, and its mutants run every changed test.
+- A narrowed run that kills nothing or times out runs again with every changed test, and that run decides the outcome. If the budget runs out first, the mutant is `not_run`.
+- If coverage.py's data has no record of a changed test that passed, titer does not trust it, warns, and runs every changed test. A vitest report without statement counters is not used either.
+
+These extra runs count against the budget. The `crap` tier's coverage sums every test, so it cannot say which test ran a line, and mutate does not use it.
+
 Before any mutant, a canary raises at the top of a changed module. Just before it raises, it writes a marker file. The canary must be killed, or leave its marker: a test that imports the module inside `try` and falls back on failure swallows the raise, but the marker shows the module loaded. A canary that survives without a marker shows that the selected tests never load that module, so its mutants are `not_executed`. When that holds for every module, the worktree is not loading the code titer mutates, for example because of an editable install, and the check exits 2. Code that runs outside Node, such as vitest browser mode, cannot write the marker. A Rust module runs no code when it loads, so its canary is a `compile_error!` instead, and a build that fails counts as killed.
 
 A mutant whose code also appears in the base lines its hunk replaces gets `unchanged_from_base: true`. The change may only have moved or reformatted that code.
 
 Each survivor gets two follow-up runs:
 
-1. titer inserts a sentinel raise before the line's statement. On a line of an `elif` or `else if` condition that shares its lines with no other code, the sentinel goes inside the condition instead, so it raises only when a test evaluates that condition. A condition line that cannot take the probe gets no sentinel, such as a Rust `else if let` or a line that also holds an earlier branch, and neither does a line that starts with `}`, since a sentinel there would land in the previous arm. In Rust the sentinel is `std::process::abort()`, which `#[should_panic]` and `catch_unwind` cannot catch. If no test fails, the outcome is `not_executed`: nothing runs the line.
+1. Unless coverage showed whether the changed tests run the line, titer inserts a sentinel raise before the line's statement. On a line of an `elif` or `else if` condition that shares its lines with no other code, the sentinel goes inside the condition instead, so it raises only when a test evaluates that condition. A condition line that cannot take the probe gets no sentinel, such as a Rust `else if let` or a line that also holds an earlier branch, and neither does a line that starts with `}`, since a sentinel there would land in the previous arm. In Rust the sentinel is `std::process::abort()`, which `#[should_panic]` and `catch_unwind` cannot catch. If no test fails, the outcome is `not_executed`: nothing runs the line.
 2. titer reruns the whole changed test files. If another test kills the mutant, the outcome is `caught_by_other`.
 
 Mutant outcomes are `killed`, `timed_out`, `survived`, `not_executed`, `caught_by_other`, `not_run` (the budget ran out first), and `no_result`.

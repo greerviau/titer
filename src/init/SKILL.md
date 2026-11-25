@@ -38,7 +38,7 @@ titer compares the working tree, including untracked files, with the merge-base 
 
 - `killed` or `timed_out`: the changed tests detect this edit.
 - `survived`: the changed tests run the line but miss the change. Triage it (see below).
-- `not_executed`: no green changed test runs the line. If the line matters, add a test that runs it.
+- `not_executed`: no green changed test runs the line. With coverage.py 7.13 or later, or a vitest coverage provider, installed, titer knows this from coverage, and each mutant runs first against only the changed tests that cover its line. Without coverage, a sentinel raise on the line shows it. If the line matters, add a test that runs it.
 - `caught_by_other`: an older test in the changed test files catches it, but the change's own tests do not.
 - `no_result` or `not_run`: nothing ran, or the budget ran out. Not a verdict.
 

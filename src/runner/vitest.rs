@@ -23,6 +23,28 @@ pub fn test_id(rel: &str, line: u32) -> String {
 }
 
 pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
+    run_with(runner, req, &["--coverage.enabled=false".to_string()])
+}
+
+/// Runs the selection with the repo's coverage provider, writing istanbul JSON to
+/// `coverage-final.json` in `reports`.
+pub fn run_with_coverage(
+    runner: &Runner,
+    req: &RunRequest,
+    reports: &std::path::Path,
+) -> anyhow::Result<TestRun> {
+    run_with(
+        runner,
+        req,
+        &[
+            "--coverage.enabled=true".to_string(),
+            "--coverage.reporter=json".to_string(),
+            format!("--coverage.reportsDirectory={}", reports.display()),
+        ],
+    )
+}
+
+fn run_with(runner: &Runner, req: &RunRequest, coverage: &[String]) -> anyhow::Result<TestRun> {
     let mut selectors: Vec<String> = match req.selection {
         Selection::Tests(cases) => cases.iter().map(|c| c.id.clone()).collect(),
         Selection::Files(files) => files
@@ -46,9 +68,9 @@ pub fn run(runner: &Runner, req: &RunRequest) -> anyhow::Result<TestRun> {
             "--reporter=json".to_string(),
             format!("--outputFile={}", report.display()),
             "--includeTaskLocation".to_string(),
-            "--coverage.enabled=false".to_string(),
             "--passWithNoTests".to_string(),
         ];
+        args.extend(coverage.iter().cloned());
         if req.fail_fast {
             args.push("--bail=1".to_string());
         }

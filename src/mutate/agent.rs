@@ -125,6 +125,7 @@ pub fn load(ctx: &Context, path: &Path) -> anyhow::Result<Loaded> {
                 file: spec.file,
                 original,
                 mutated,
+                tests: None,
             },
         ));
     }
