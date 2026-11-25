@@ -28,7 +28,7 @@ jobs:
           # The pull request head, so annotations land on the right diff lines.
           ref: ${{ github.event.pull_request.head.sha }}
       # Install the repo's dependencies here.
-      - uses: greerviau/titer@v0.1
+      - uses: greerviau/titer@v0.2
         with:
           comment: true
 ```

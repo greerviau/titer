@@ -944,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "titer"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
