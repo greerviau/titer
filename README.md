@@ -111,7 +111,7 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
       # Install your repo's dependencies here.
-      - uses: greerviau/titer@v0.1
+      - uses: greerviau/titer@v0.2
         with:
           comment: true
 ```
